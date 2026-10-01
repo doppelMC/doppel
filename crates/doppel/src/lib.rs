@@ -154,18 +154,9 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
         }
     }
 
-    // --- play state: join + spawn chunks, then idle ---
+    // --- play state: replay the full captured join sequence in order ---
     if let Some(b) = blobs {
-        if let Some((id, body)) = &b.join {
-            conn.write_packet(*id, body)?;
-        }
-        if let Some((id, body)) = &b.batch_start {
-            conn.write_packet(*id, body)?;
-        }
-        for (id, body) in &b.chunks {
-            conn.write_packet(*id, body)?;
-        }
-        if let Some((id, body)) = &b.batch_finished {
+        for (id, body) in &b.play {
             conn.write_packet(*id, body)?;
         }
     }
@@ -242,9 +233,9 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
         Ok(dir) => {
             let b = blobs::load(std::path::Path::new(&dir))?;
             println!(
-                "[doppel] loaded blobs: {} registries, {} chunks",
+                "[doppel] loaded blobs: {} registries, {} play packets",
                 b.registries.len(),
-                b.chunks.len()
+                b.play.len()
             );
             Some(Arc::new(b))
         }

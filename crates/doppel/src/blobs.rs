@@ -21,12 +21,10 @@ pub struct Blobs {
     pub registries: Vec<Vec<u8>>,
     /// Configuration-state update_tags body.
     pub update_tags: Option<Vec<u8>>,
-    /// Play-state join packet (id + body).
-    pub join: Option<(i32, Vec<u8>)>,
-    /// Play-state chunk batch: start marker, chunks, finished marker.
-    pub batch_start: Option<(i32, Vec<u8>)>,
-    pub chunks: Vec<(i32, Vec<u8>)>,
-    pub batch_finished: Option<(i32, Vec<u8>)>,
+    /// Every play-state packet from the capture, in vanilla's send order —
+    /// join packet, the pre-batch set (commands, recipes, player info,
+    /// inventory, time…), the chunk batch, and the post-batch snapshot.
+    pub play: Vec<(i32, Vec<u8>)>,
 }
 
 pub fn load(dir: &Path) -> Result<Blobs> {
@@ -40,10 +38,7 @@ pub fn load(dir: &Path) -> Result<Blobs> {
     let mut blobs = Blobs {
         registries: Vec::new(),
         update_tags: None,
-        join: None,
-        batch_start: None,
-        chunks: Vec::new(),
-        batch_finished: None,
+        play: Vec::new(),
     };
     for entry in &manifest {
         let body = std::fs::read(dir.join(&entry.file))
@@ -51,12 +46,7 @@ pub fn load(dir: &Path) -> Result<Blobs> {
         match (entry.phase.as_str(), entry.id) {
             ("config", 0x07) => blobs.registries.push(body),
             ("config", 0x0e) => blobs.update_tags = Some(body),
-            ("play", 0x32) => blobs.join = Some((entry.id, body)),
-            ("play", 0x0c) => blobs.batch_start = Some((entry.id, body)),
-            ("play", 0x2e) => blobs.chunks.push((entry.id, body)),
-            ("play", 0x0b) => blobs.batch_finished = Some((entry.id, body)),
-            // Everything else (time updates, entity traffic after the join
-            // burst) is live content, not replayed.
+            ("play", _) => blobs.play.push((entry.id, body)),
             _ => {}
         }
     }
