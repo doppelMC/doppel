@@ -84,6 +84,7 @@ pub fn status_ping_retry(
 #[derive(Serialize)]
 pub struct CapturedPacket {
     pub id: i32,
+    pub t_ms: u128,
     pub body_len: usize,
     pub head_hex: String,
     pub note: Option<String>,
@@ -143,6 +144,7 @@ pub fn login_capture(
     let mut packets = Vec::new();
     let mut compression_on = false;
     let mut config_started = false;
+    let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
@@ -151,6 +153,7 @@ pub fn login_capture(
                 // waiting on us) reads very differently from a framing error.
                 packets.push(CapturedPacket {
                     id: -1,
+                    t_ms: started.elapsed().as_millis(),
                     body_len: 0,
                     head_hex: String::new(),
                     note: Some(format!("transcript ended: {e:#}")),
@@ -186,6 +189,7 @@ pub fn login_capture(
         let head = &body[..body.len().min(4096)];
         packets.push(CapturedPacket {
             id,
+            t_ms: started.elapsed().as_millis(),
             body_len: body.len(),
             head_hex: hex::encode(head),
             note,

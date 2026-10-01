@@ -36,29 +36,29 @@ pub fn run(out_path: &Path) -> Result<()> {
     let jar = vanilla::ensure_jar(&pin)?;
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
 
-    // Probe the serverbound configuration state: same Client Information
-    // body sent under each candidate packet id on a fresh connection.
-    // A valid id either continues the handshake or errors with the packet's
-    // name; an invalid id closes the connection silently.
+    // Probe the Login Acknowledged theory: after Login Success the client
+    // must confirm the configuration-state transition with an EMPTY packet
+    // before anything else. Empty body under each candidate id: the true
+    // ack id survives (idle-wait or a registry burst), everything else
+    // closes silently.
     struct Probe {
         label: String,
         login: Vec<u8>,
         config: (i32, Vec<u8>),
     }
     let login_body = login_start_c("Doppel");
-    let info = bot::client_information_body();
     let mut variants: Vec<Probe> = (0x00..=0x0a)
         .map(|id| Probe {
-            label: format!("cfg0x{id:02x}"),
+            label: format!("ack0x{id:02x}"),
             login: login_body.clone(),
-            config: (id, info.clone()),
+            config: (id, Vec::new()),
         })
         .collect();
-    // Control: no config probe at all (documented silent wait).
+    // Control: garbage id, still empty body.
     variants.push(Probe {
-        label: "no-probe".into(),
+        label: "ctrl-garbage-id".into(),
         login: login_body.clone(),
-        config: (0x63, info.clone()),
+        config: (0x63, Vec::new()),
     });
 
     let mut lines: Vec<String> = Vec::new();
