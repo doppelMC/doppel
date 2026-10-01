@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 
+pub mod anvil_to_wire;
 pub mod chunk_codec;
 
+pub use anvil_to_wire::WorldDir;
 pub use chunk_codec::WireChunk;
 
 /// Minecraft protocol VarInt writer (shared with the codec module).
@@ -37,6 +39,16 @@ pub struct Section {
     pub y: i8,
     #[serde(rename = "block_states", default)]
     pub block_states: Option<BlockStates>,
+    #[serde(rename = "biomes", default)]
+    pub biomes: Option<Biomes>,
+}
+
+/// Paletted biome storage for one section (quart positions).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Biomes {
+    pub palette: Vec<String>,
+    #[serde(default)]
+    pub data: Option<Vec<i64>>,
 }
 
 /// Paletted block state storage for one section.
@@ -69,6 +81,8 @@ pub struct Chunk {
     pub status: String,
     #[serde(rename = "sections", default)]
     pub sections: Vec<Section>,
+    #[serde(rename = "Heightmaps", default)]
+    pub heightmaps: Option<fastnbt::Value>,
 }
 
 /// An open region file.
@@ -177,7 +191,9 @@ mod tests {
                     }],
                     data: None,
                 }),
+                biomes: None,
             }],
+            heightmaps: None,
         };
         let nbt = fastnbt::to_bytes(&chunk).expect("serialize chunk nbt");
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());

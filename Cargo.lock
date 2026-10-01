@@ -124,6 +124,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "doppel-protocol",
+ "doppel-world",
  "hex",
  "md-5",
  "serde",

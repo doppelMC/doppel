@@ -72,6 +72,22 @@ pub fn diff_report(vanilla: &Value, doppel: &Value) -> Vec<String> {
     report
 }
 
+/// Play-phase (id, file) entries from a blobs manifest.
+fn manifest_play_entries(dir: &std::path::Path) -> Result<Vec<(i32, String)>> {
+    let manifest: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
+    Ok(manifest
+        .iter()
+        .filter_map(|e| {
+            if e["phase"].as_str() == Some("play") {
+                Some((e["id"].as_i64()? as i32, e["file"].as_str()?.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
 fn default_doppel_bin() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("DOPPEL_BIN") {
         let path = PathBuf::from(path);
@@ -246,7 +262,52 @@ pub fn parity_login() -> Result<bool> {
     let entries = capture::write_manifest(&v, &blobs_dir)?;
     anyhow::ensure!(entries > 0, "no blobs captured from vanilla");
 
-    // 2. Spawn Doppel with the blobs.
+    // Pre-verify the Anvil -> wire pipeline against every captured chunk:
+    // learn the palette maps from (wire, anvil) pairs, rebuild each chunk
+    // from storage, and require byte-identical output BEFORE the live test.
+    let world_dir = root
+        .join("target")
+        .join("vanilla")
+        .join("run")
+        .join("world");
+    let mut anvil_ok = 0usize;
+    let mut anvil_total = 0usize;
+    if world_dir.is_dir() {
+        let mut world = doppel_world::WorldDir::open(&world_dir)?;
+        let mut boot = doppel_world::anvil_to_wire::PaletteBootstrap::default();
+        let mut refs = Vec::new();
+        for (id, file) in manifest_play_entries(&blobs_dir)? {
+            if id != 0x2e {
+                continue;
+            }
+            let body = std::fs::read(blobs_dir.join(file))?;
+            let wire = doppel_world::WireChunk::decode(&body)?;
+            if let Some(anvil) = world.chunk(wire.x, wire.z)? {
+                boot.learn(&wire, &anvil);
+                refs.push((wire, anvil));
+            }
+        }
+        for (wire, anvil) in &refs {
+            anvil_total += 1;
+            let rebuilt = doppel_world::anvil_to_wire::convert(anvil, wire, &boot)?;
+            if rebuilt.encode() == wire.encode() {
+                anvil_ok += 1;
+            } else {
+                println!(
+                    "[oracle] anvil rebuild differs for chunk ({}, {})",
+                    wire.x, wire.z
+                );
+            }
+        }
+        println!(
+            "[oracle] anvil->wire rebuild: {anvil_ok}/{anvil_total} chunks byte-identical, {} block + {} biome mappings learned",
+            boot.blocks.len(),
+            boot.biomes.len()
+        );
+        anyhow::ensure!(anvil_ok == anvil_total, "anvil rebuild failed parity");
+    }
+
+    // 2. Spawn Doppel with the blobs (and the world for anvil-backed chunks).
     let bin = default_doppel_bin()?;
     let pin_path = doppel_protocol::pin_path()?;
     let mut doppel_child = Command::new(&bin)
@@ -254,6 +315,7 @@ pub fn parity_login() -> Result<bool> {
         .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &world_dir)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

@@ -7,6 +7,7 @@ pub mod blobs;
 use anyhow::{bail, Context, Result};
 use blobs::Blobs;
 use doppel_protocol::{frame_packet, read_packet, write_string, write_varint, Conn, Pin, Reader};
+use doppel_world::WireChunk;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +37,31 @@ struct PlayState {
     yaw: f32,
     pitch: f32,
     pending_keep_alive: Option<(i64, std::time::Instant)>,
+}
+
+/// Shared world state: Anvil regions plus the learned palette maps.
+pub struct WorldState {
+    pub dir: doppel_world::WorldDir,
+    pub boot: doppel_world::anvil_to_wire::PaletteBootstrap,
+}
+
+type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
+
+/// Rebuilds a chunk from Anvil storage when the world has it; the wire
+/// capture bootstraps palette maps and supplies light. Falls back to the
+/// capture itself for chunks missing on disk.
+fn build_chunk(world: Option<&SharedWorld>, reference: &WireChunk) -> Result<WireChunk> {
+    let Some(world) = world else {
+        return Ok(reference.clone());
+    };
+    let mut w = world.lock().expect("world lock");
+    match w.dir.chunk(reference.x, reference.z)? {
+        Some(anvil) => {
+            w.boot.learn(reference, &anvil);
+            doppel_world::anvil_to_wire::convert(&anvil, reference, &w.boot)
+        }
+        None => Ok(reference.clone()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +121,12 @@ fn handle_status(stream: &mut TcpStream, pin: &Pin, client_protocol: i32) -> Res
 // Login -> configuration -> play
 // ---------------------------------------------------------------------------
 
-fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<()> {
+fn handle_login(
+    stream: TcpStream,
+    pin: &Pin,
+    blobs: Option<&Blobs>,
+    world: Option<&SharedWorld>,
+) -> Result<()> {
     let mut conn = Conn::new(stream);
 
     // --- login state: hello (String name + bare UUID) ---
@@ -176,16 +207,16 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
     }
 
     // --- play state: replay the full captured join sequence in order ---
-    // Chunk packets round-trip through the codec: decode to our data
-    // structures, re-encode, send. The parity harness therefore proves the
-    // codec byte-exact against live vanilla on every push — and the world
-    // is one step from being backed by real storage instead of blobs.
+    // Chunk packets round-trip through the codec, and when a world
+    // directory is configured, chunks are REBUILT from Anvil storage (the
+    // capture only bootstraps the name->id palette maps and supplies light
+    // data). Parity proves the Anvil-built bytes identical to vanilla's.
     if let Some(b) = blobs {
         for (id, body) in &b.play {
             let body = if *id == 0x2e {
-                let chunk = doppel_world::WireChunk::decode(body)
-                    .with_context(|| format!("decoding chunk ({}, {})", 0, 0))?;
-                chunk.encode()
+                let chunk =
+                    doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
+                build_chunk(world, &chunk)?.encode()
             } else {
                 body.clone()
             };
@@ -314,7 +345,7 @@ fn handle_play_packet(
 // Connection dispatch
 // ---------------------------------------------------------------------------
 
-fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>) {
+fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>, world: Option<SharedWorld>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -338,7 +369,7 @@ fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>) {
         let next_state = r.read_varint().context("next state")?;
         match next_state {
             1 => handle_status(&mut stream, &pin, client_protocol),
-            2 => handle_login(stream, &pin, blobs.as_deref()),
+            2 => handle_login(stream, &pin, blobs.as_deref(), world.as_ref()),
             n => bail!("invalid next state {n}"),
         }
     })();
@@ -349,13 +380,19 @@ fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>) {
 }
 
 /// Accept loop. Binds nothing itself so tests can hand us an ephemeral port.
-pub fn serve_on(listener: TcpListener, pin: Pin, blobs: Option<Arc<Blobs>>) -> Result<()> {
+pub fn serve_on(
+    listener: TcpListener,
+    pin: Pin,
+    blobs: Option<Arc<Blobs>>,
+    world: Option<SharedWorld>,
+) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let pin = pin.clone();
                 let blobs = blobs.clone();
-                std::thread::spawn(move || handle_conn(stream, pin, blobs));
+                let world = world.clone();
+                std::thread::spawn(move || handle_conn(stream, pin, blobs, world));
             }
             Err(e) => eprintln!("[doppel] accept error: {e}"),
         }
@@ -390,7 +427,18 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
             None
         }
     };
+    let world = match std::env::var("DOPPEL_WORLD") {
+        Ok(dir) => {
+            let state = WorldState {
+                dir: doppel_world::WorldDir::open(std::path::Path::new(&dir))?,
+                boot: Default::default(),
+            };
+            println!("[doppel] world storage: {dir}");
+            Some(Arc::new(std::sync::Mutex::new(state)))
+        }
+        Err(_) => None,
+    };
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     println!("[doppel] listening on {addr} (vanilla target: {})", pin.id);
-    serve_on(listener, pin, blobs)
+    serve_on(listener, pin, blobs, world)
 }
