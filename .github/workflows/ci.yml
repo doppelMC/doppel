@@ -43,6 +43,8 @@ jobs:
         run: cargo run --release -p doppel-oracle -- parity-status
       - name: Differential login test
         run: cargo run --release -p doppel-oracle -- parity-login
+      - name: Differential walk test
+        run: cargo run --release -p doppel-oracle -- parity-walk
 
   capture-vanilla:
     name: capture - vanilla login transcript
