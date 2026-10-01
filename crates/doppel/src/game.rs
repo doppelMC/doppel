@@ -528,7 +528,7 @@ impl Game {
     // ------------------------------------------------------------------
 
     /// Reads the block state at world coords via the registry.
-    fn get_block(&self, x: i32, y: i32, z: i32) -> Option<(String, String)> {
+    pub(crate) fn get_block(&self, x: i32, y: i32, z: i32) -> Option<(String, String)> {
         let state = self.get_state_id(x, y, z)?;
         let reg = self.registry.as_ref()?;
         let (name, props) = reg.state_of(state)?;

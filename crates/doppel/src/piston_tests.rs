@@ -377,4 +377,11 @@ fn circuit_trace() {
         g.tick_once_for_test();
     }
     std::env::remove_var("WIRE_TRACE");
+    // Final lever state: 8439 = powered true, 8440 = false.
+    let lever = g.get_block(10, 100, 10).expect("lever present");
+    eprintln!("[trace] final lever state: {lever:?}");
+    assert!(
+        lever.1.contains("powered=true"),
+        "lever should end ON (vanilla parity), got {lever:?}"
+    );
 }
