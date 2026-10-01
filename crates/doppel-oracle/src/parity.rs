@@ -234,9 +234,12 @@ pub fn parity_login() -> Result<bool> {
         VANILLA_PORT,
         protocol,
         &login_body,
-        Duration::from_secs(22),
-        220,
-        Some(&blobs_dir),
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(22)),
+            max_packets: Some(220),
+            dump_dir: Some(&blobs_dir),
+            commands: &[],
+        },
     )
     .context("capturing vanilla transcript")?;
     drop(server);
@@ -263,9 +266,10 @@ pub fn parity_login() -> Result<bool> {
         DOPPEL_PORT,
         protocol,
         &login_body,
-        Duration::from_secs(8),
-        160,
-        Some(&doppel_dump),
+        &bot::CaptureOpts {
+            dump_dir: Some(&doppel_dump),
+            ..Default::default()
+        },
     )
     .context("capturing doppel transcript")?;
     let _ = doppel_child.kill();

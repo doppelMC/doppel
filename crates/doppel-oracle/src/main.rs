@@ -3,6 +3,7 @@
 mod bot;
 mod capture;
 mod parity;
+mod scenario;
 mod vanilla;
 
 use anyhow::{Context, Result};
@@ -65,6 +66,13 @@ fn run() -> Result<()> {
                 std::path::Path::new(&out),
                 blobs.as_deref().map(std::path::Path::new),
             )?
+        }
+        Some("scenario") => {
+            let out = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "captures/scenario.jsonl".into());
+            scenario::run(std::path::Path::new(&out))?
         }
         _ => usage(),
     };

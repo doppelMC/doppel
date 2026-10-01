@@ -109,6 +109,25 @@ pub fn client_information_body() -> Vec<u8> {
     b
 }
 
+/// Options for a login capture session.
+#[derive(Default)]
+pub struct CaptureOpts<'a> {
+    pub idle_timeout: Option<Duration>,
+    pub max_packets: Option<usize>,
+    pub dump_dir: Option<&'a std::path::Path>,
+    pub commands: &'a [String],
+}
+
+impl CaptureOpts<'_> {
+    fn idle_timeout(&self) -> Duration {
+        self.idle_timeout.unwrap_or(Duration::from_secs(8))
+    }
+
+    fn max_packets(&self) -> usize {
+        self.max_packets.unwrap_or(160)
+    }
+}
+
 /// Connects as an offline-mode login client and records every packet the
 /// server sends, driving the full confirmed choreography — login, ack,
 /// client information, known packs, finish configuration — into the PLAY
@@ -120,10 +139,12 @@ pub fn login_capture(
     port: u16,
     protocol: i32,
     login_start_body: &[u8],
-    idle_timeout: Duration,
-    max_packets: usize,
-    dump_dir: Option<&std::path::Path>,
+    opts: &CaptureOpts<'_>,
 ) -> Result<Vec<CapturedPacket>> {
+    let idle_timeout = opts.idle_timeout();
+    let max_packets = opts.max_packets();
+    let dump_dir = opts.dump_dir;
+    let commands = opts.commands;
     let stream =
         TcpStream::connect((host, port)).with_context(|| format!("connecting to {host}:{port}"))?;
     stream.set_read_timeout(Some(idle_timeout))?;
@@ -151,6 +172,7 @@ pub fn login_capture(
     let mut config_started = false;
     let mut packs_answered = false;
     let mut play_started = false;
+    let mut commands_pending = !commands.is_empty();
     let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
@@ -209,6 +231,17 @@ pub fn login_capture(
         // vanilla's 15s watchdog during long captures.
         if play_started && id == 0x2d {
             conn.write_packet(0x1c, &body)?;
+        }
+        // Once the chunk batch closes, run any scripted commands (unsigned
+        // chat_command: serverbound play 0x07, body = the command string).
+        if play_started && commands_pending && id == 0x0b {
+            commands_pending = false; // only trigger on the first batch end
+            for cmd in commands {
+                let mut body = Vec::new();
+                doppel_protocol::write_string(&mut body, cmd);
+                conn.write_packet(0x07, &body)?;
+                note = Some(format!("sent command: {cmd}"));
+            }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.

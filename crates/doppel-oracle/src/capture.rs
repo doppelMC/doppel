@@ -71,9 +71,12 @@ pub fn run(out_path: &Path, blobs_dir: Option<&Path>) -> Result<()> {
         VANILLA_PORT,
         pin.protocol.unwrap_or(0),
         &login_body,
-        Duration::from_secs(22),
-        220,
-        blobs_dir,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(22)),
+            max_packets: Some(220),
+            dump_dir: blobs_dir,
+            commands: &[],
+        },
     )
     .context("capturing full login transcript")?;
     println!("[oracle] full transcript: {} packets", packets.len());

@@ -143,6 +143,13 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
     std::fs::write(run_dir.join("server.properties"), properties)
         .context("writing server.properties")?;
 
+    // Op the capture bot so scenarios can run commands (/tick, /setblock,
+    // /data). The offline-mode profile UUID for "Doppel" is deterministic
+    // (UUIDv3 of "OfflinePlayer:Doppel"), so the same entry works every run.
+    let ops = r#"[{"uuid": "97e9cb14-470c-3c15-a976-2b16dcd2e827", "name": "Doppel", "level": 4, "bypassesPlayerLimit": true}]
+"#;
+    std::fs::write(run_dir.join("ops.json"), ops).context("writing ops.json")?;
+
     eprintln!("[oracle] booting vanilla {} on port {port}...", pin.id);
     let mut child = Command::new("java")
         .args(["-Xms512M", "-Xmx2G", "-jar"])
