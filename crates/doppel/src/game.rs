@@ -108,6 +108,9 @@ pub struct Game {
     dirty: std::collections::BTreeMap<(i32, i32, i32), Vec<(u64, u32)>>,
     /// Block-state registry (name+props -> id), loaded from pins/blocks.json.
     registry: Option<doppel_world::registry::BlockRegistry>,
+    /// Flat-world generator: the fallback for chunks the Anvil store does
+    /// not have, built from the same registry pins.
+    flat: Option<doppel_world::worldgen::FlatGenerator>,
     /// Monotonic game tick.
     tick: u64,
     /// Scheduled actions: fire at tick T with a behavior tag.
@@ -159,7 +162,7 @@ impl Game {
         world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
         blobs: Option<std::sync::Arc<Blobs>>,
     ) -> Game {
-        Game {
+        let mut game = Game {
             chunks: std::collections::BTreeMap::new(),
             players: std::collections::BTreeMap::new(),
             viewers: std::collections::BTreeMap::new(),
@@ -182,7 +185,15 @@ impl Game {
             scheduled: Vec::new(),
             pending: std::collections::BTreeSet::new(),
             torch_queue: Vec::new(),
-        }
+            flat: None,
+        };
+        // The flat fallback needs the registry pins; build it once here.
+        game.flat = game.registry.as_ref().and_then(|r| {
+            doppel_world::worldgen::FlatGenerator::classic(r)
+                .inspect_err(|e| eprintln!("[game] flat generator: {e:#}"))
+                .ok()
+        });
+        game
     }
 
     /// The event loop. The 1s recv timeout doubles as the coarse keep-alive
@@ -834,7 +845,15 @@ impl Game {
         if let std::collections::btree_map::Entry::Vacant(slot) = self.chunks.entry((cx, cz)) {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
             let Some(anvil) = w.dir.chunk(cx, cz)? else {
-                anyhow::bail!("chunk not generated");
+                // No stored chunk: fall back to flat generation so
+                // streaming extends past whatever the world has saved.
+                let Some(flat) = &self.flat else {
+                    anyhow::bail!("chunk not generated and flat fallback unavailable");
+                };
+                let wire = flat.generate(cx, cz);
+                drop(w);
+                slot.insert(CachedChunk { wire, version: 0 });
+                return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
             };
             let reference = blobs.play.iter().find_map(|(id, body)| {
                 if *id != 0x2e {
