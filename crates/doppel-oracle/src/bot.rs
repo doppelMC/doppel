@@ -282,8 +282,9 @@ pub fn login_capture(
                 last_walk_at = std::time::Instant::now();
             }
         }
-        // Walk pacing: one move_player_pos (0x1e: f64 x3 + flags u8) per
-        // 400ms once walking has begun, crossing one chunk per step.
+        // Walk pacing: cross one chunk per step via /tp — vanilla's
+        // movement speed checks reject raw move packets this fast, but
+        // teleports are legal and trigger the same chunk streaming.
         if let (Some(steps), Some((bx, by, bz))) = (walk, walk_base) {
             if play_started
                 && !commands_pending
@@ -291,15 +292,13 @@ pub fn login_capture(
                 && last_walk_at.elapsed() >= Duration::from_millis(400)
             {
                 let x = bx + (steps_done as f64 + 1.0) * 16.0;
-                let mut mv = Vec::with_capacity(25);
-                mv.extend_from_slice(&x.to_be_bytes());
-                mv.extend_from_slice(&by.to_be_bytes());
-                mv.extend_from_slice(&bz.to_be_bytes());
-                mv.push(0x01); // on ground
-                conn.write_packet(0x1e, &mv)?;
+                let cmd = format!("tp @s {x} {by} {bz}");
+                let mut body = Vec::new();
+                doppel_protocol::write_string(&mut body, &cmd);
+                conn.write_packet(0x07, &body)?;
                 steps_done += 1;
                 last_walk_at = std::time::Instant::now();
-                note = Some(format!("walk step {steps_done}: x={x:.1}"));
+                note = Some(format!("tp-walk step {steps_done}: x={x:.1}"));
             }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
