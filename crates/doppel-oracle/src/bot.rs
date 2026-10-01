@@ -126,7 +126,17 @@ pub fn login_capture(
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
-            Err(_) => break, // idle timeout, EOF, or disconnect: transcript over
+            Err(e) => {
+                // Record WHY the transcript ended: "idle timeout" (server
+                // waiting on us) reads very differently from a framing error.
+                packets.push(CapturedPacket {
+                    id: -1,
+                    body_len: 0,
+                    head_hex: String::new(),
+                    note: Some(format!("transcript ended: {e:#}")),
+                });
+                break;
+            }
         };
         let mut note = None;
         // Set Compression arrives raw in login state and switches framing
