@@ -453,7 +453,8 @@ pub fn parity_walk() -> Result<bool> {
         }
     }
 
-    // 1. Vanilla walk.
+    // 1. Vanilla walk, dumped straight into the blobs dir so the walk
+    // chunks join the reference set Doppel's streaming replays.
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
@@ -465,7 +466,7 @@ pub fn parity_walk() -> Result<bool> {
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(5)),
             max_packets: Some(500),
-            dump_dir: Some(&v_dump),
+            dump_dir: Some(&blobs_dir),
             commands: &[],
             walk_chunks: Some(4),
         },
@@ -534,7 +535,7 @@ pub fn parity_walk() -> Result<bool> {
                 })
                 .collect()
         };
-    let vb = chunk_bodies(&vr, &v_dump);
+    let vb = chunk_bodies(&vr, &blobs_dir);
     let db = chunk_bodies(&dr, &d_dump);
     println!(
         "[oracle] walk chunks: vanilla {} doppel {} (forgets: vanilla {} doppel {})",
