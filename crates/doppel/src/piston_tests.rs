@@ -351,3 +351,30 @@ fn piston_quasi_connectivity() {
         "quasi-connectivity extends the piston"
     );
 }
+
+/// Reproduces the parity_redstone circuit against the real Game to trace
+/// the extra-broadcast divergence locally (run with WIRE_TRACE=1).
+#[test]
+fn circuit_trace() {
+    let (mut g, _rx) = harness();
+    for c in [
+        "setblock 10 100 10 minecraft:lever[face=floor,powered=false]",
+        "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 12 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 13 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 14 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 15 100 10 minecraft:redstone_torch",
+    ] {
+        cmd(&mut g, c);
+        g.tick_once_for_test();
+    }
+    std::env::set_var("WIRE_TRACE", "1");
+    cmd(
+        &mut g,
+        "setblock 10 100 10 minecraft:lever[face=floor,powered=true]",
+    );
+    for _ in 0..10 {
+        g.tick_once_for_test();
+    }
+    std::env::remove_var("WIRE_TRACE");
+}

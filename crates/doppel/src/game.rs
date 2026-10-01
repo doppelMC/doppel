@@ -1967,6 +1967,9 @@ impl wire::BlockView for Game {
 
 impl wire::WireHost for Game {
     fn set_wire_state(&mut self, x: i32, y: i32, z: i32, state: u32) {
+        if std::env::var("WIRE_TRACE").is_ok() {
+            eprintln!("[trace] set_wire ({x},{y},{z}) state={state}");
+        }
         self.set_block(x, y, z, state, false);
     }
     fn resolve_wire_state(&self, conn: &wire::Connections, power: i32) -> Option<u32> {
