@@ -102,44 +102,52 @@ impl PaletteBootstrap {
             let Some(as_) = by_y.get(&y).copied() else {
                 continue;
             };
-            if let Container::Palette { entries, longs, .. } = &ws.block_states {
+            // Cell-level correspondence: unpack both sides' cells and pair
+            // each disk name with the wire id at the same position. This
+            // works regardless of palette ORDER (which differs between disk
+            // and wire) — only the per-cell content must agree.
+            if let Container::Palette {
+                entries,
+                longs,
+                bits: w_bits,
+            } = &ws.block_states
+            {
                 if let Some(anvil_bs) = &as_.block_states {
-                    let wire_longs: Vec<u64> = longs.to_vec();
-                    if anvil_bs.palette.len() == entries.len() {
-                        if let Some(data) = &anvil_bs.data {
-                            let anvil_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
-                            if wire_longs == anvil_longs {
-                                for (entry, id) in anvil_bs.palette.iter().zip(entries.iter()) {
-                                    if entry.properties().is_none() {
-                                        Self::record(
-                                            &mut self.blocks,
-                                            entry.name(),
-                                            *id,
-                                            &mut learned,
-                                        );
-                                    }
-                                }
+                    if let Some(data) = &anvil_bs.data {
+                        let wire_cells = unpack(longs, *w_bits as usize, 4096);
+                        let disk_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
+                        let disk_cells =
+                            unpack(&disk_longs, anvil_disk_bits(anvil_bs.palette.len()), 4096);
+                        for i in 0..4096 {
+                            let wid = entries[wire_cells[i] as usize];
+                            let entry = &anvil_bs.palette[disk_cells[i] as usize];
+                            if entry.properties().is_none() {
+                                Self::record(&mut self.blocks, entry.name(), wid, &mut learned);
                             }
                         }
                     }
-                    // Biomes likewise.
-                    if let Container::Palette {
-                        entries: be,
-                        longs: bl,
-                        ..
-                    } = &ws.biomes
-                    {
-                        if let Some(ab) = &as_.biomes {
-                            let empty: Vec<i64> = Vec::new();
-                            let abl = ab.data.as_deref().unwrap_or(&empty);
-                            let same = ab.palette.len() == be.len()
-                                && !bl.is_empty()
-                                && bl.iter().map(|&v| v as i64).eq(abl.iter().copied());
-                            if same {
-                                for (name, id) in ab.palette.iter().zip(be.iter()) {
-                                    Self::record(&mut self.biomes, name, *id, &mut learned);
-                                }
-                            }
+                }
+            }
+            // Biomes likewise (64 quart cells).
+            if let Container::Palette {
+                entries: be,
+                longs: bl,
+                bits: b_bits,
+            } = &ws.biomes
+            {
+                if let Some(ab) = &as_.biomes {
+                    if let Some(data) = &ab.data {
+                        let wire_cells = unpack(bl, *b_bits as usize, 64);
+                        let disk_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
+                        let disk_cells = unpack(&disk_longs, anvil_disk_bits(ab.palette.len()), 64);
+                        for i in 0..64 {
+                            let wid = be[wire_cells[i] as usize];
+                            Self::record(
+                                &mut self.biomes,
+                                &ab.palette[disk_cells[i] as usize],
+                                wid,
+                                &mut learned,
+                            );
                         }
                     }
                 }
