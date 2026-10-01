@@ -38,18 +38,20 @@ pub fn write_manifest(packets: &[bot::CapturedPacket], dir: &std::path::Path) ->
     let mut play = false;
     let mut manifest: Vec<serde_json::Value> = Vec::new();
     for p in packets {
-        if p.note
-            .as_deref()
-            .is_some_and(|n| n.contains("finish configuration"))
-        {
-            play = true;
-        }
+        // The finish_configuration packet itself stays in the config phase —
+        // Doppel sends it natively. The phase flips for everything AFTER it.
         if let Some(file) = &p.file {
             manifest.push(serde_json::json!({
                 "file": file,
                 "id": p.id,
                 "phase": if play { "play" } else { "config" },
             }));
+        }
+        if p.note
+            .as_deref()
+            .is_some_and(|n| n.contains("finish configuration"))
+        {
+            play = true;
         }
     }
     let path = dir.join("manifest.json");
