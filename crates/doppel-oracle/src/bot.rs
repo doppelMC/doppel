@@ -204,6 +204,12 @@ pub fn login_capture(
             play_started = true;
             note = Some("finish configuration; acked — entering play state".into());
         }
+        // Keep-alive (S->C play 0x2d): echo the i64
+        // challenge back as serverbound 0x1c so the connection survives
+        // vanilla's 15s watchdog during long captures.
+        if play_started && id == 0x2d {
+            conn.write_packet(0x1c, &body)?;
+        }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.
         let head = &body[..body.len().min(4096)];
