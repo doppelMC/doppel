@@ -67,6 +67,8 @@ jobs:
         run: cargo build --release
       - name: Pin latest vanilla release
         run: cargo run --release -p doppel-oracle -- pin
+      - name: Extract block registry
+        run: cargo run --release -p doppel-oracle -- registry
       - name: Record vanilla login transcript
         run: cargo run --release -p doppel-oracle -- capture-vanilla-login captures/vanilla-login.jsonl captures/blobs
       - name: Run first tick-stepped scenario
@@ -78,3 +80,4 @@ jobs:
             captures/vanilla-login.jsonl
             captures/blobs
             captures/scenario.jsonl
+            pins/blocks.json

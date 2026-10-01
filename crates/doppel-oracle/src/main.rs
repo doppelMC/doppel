@@ -3,6 +3,7 @@
 mod bot;
 mod capture;
 mod parity;
+mod registry;
 mod scenario;
 mod vanilla;
 
@@ -77,6 +78,7 @@ fn run() -> Result<()> {
                 blobs.as_deref().map(std::path::Path::new),
             )?
         }
+        Some("registry") => registry::run()?,
         Some("scenario") => {
             let out = args
                 .get(1)
