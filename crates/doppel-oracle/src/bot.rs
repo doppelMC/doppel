@@ -239,6 +239,15 @@ pub fn login_capture(
         if play_started && id == 0x2d {
             conn.write_packet(0x1c, &body)?;
         }
+        // Chunk batch flow control: after every batch_finished, the client
+        // reports throughput (serverbound 0x0b, f32 desired chunks/tick);
+        // the server sends no further batches until it hears one. Without
+        // this, vanilla streams the join batch and then waits forever.
+        if play_started && id == 0x0b && !body.is_empty() {
+            let mut feedback = Vec::with_capacity(4);
+            feedback.extend_from_slice(&64.0f32.to_be_bytes());
+            conn.write_packet(0x0b, &feedback)?;
+        }
         // player_position (S->C 0x49, the join teleport): the client MUST
         // acknowledge it before the server accepts movement or chat. 26.3's
         // accept_teleportation echoes the id AND the full position (id

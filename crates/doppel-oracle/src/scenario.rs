@@ -35,7 +35,7 @@ pub fn run(out_path: &Path) -> Result<()> {
         &login,
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(12)),
-            max_packets: Some(600),
+            max_packets: Some(320),
             commands: &commands,
             walk_chunks: Some(8),
             ..Default::default()
