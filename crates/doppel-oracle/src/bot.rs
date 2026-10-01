@@ -268,18 +268,17 @@ pub fn login_capture(
             ));
         }
         // Once the chunk batch closes, run any scripted commands (unsigned
-        // chat_command: serverbound play 0x07, body = the command string).
+        // chat_command: serverbound play 0x07; the wire string has NO
+        // leading slash — clients strip it before sending).
         if play_started && commands_pending && id == 0x0b {
             commands_pending = false; // only trigger on the first batch end
             for cmd in commands {
                 let mut body = Vec::new();
-                doppel_protocol::write_string(&mut body, cmd);
+                doppel_protocol::write_string(&mut body, cmd.trim_start_matches('/'));
                 conn.write_packet(0x07, &body)?;
                 note = Some(format!("sent command: {cmd}"));
             }
             if walk.is_some() {
-                // Begin walking after the join burst; server traffic (time
-                // updates, position syncs) paces the steps below.
                 last_walk_at = std::time::Instant::now();
             }
         }
