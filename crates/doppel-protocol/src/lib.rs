@@ -467,6 +467,7 @@ mod tests {
         }
         buf.set_position(0);
         let mut c = Conn::new(&mut buf);
+        c.set_compression(64); // reader must share the compression state
         let (id, body) = c.read_packet().unwrap();
         assert_eq!(id, 0x01);
         assert_eq!(body, b"tiny".to_vec());
