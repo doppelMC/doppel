@@ -40,36 +40,47 @@ pub fn run(out_path: &Path) -> Result<()> {
     // body sent under each candidate packet id on a fresh connection.
     // A valid id either continues the handshake or errors with the packet's
     // name; an invalid id closes the connection silently.
+    struct Probe {
+        label: String,
+        login: Vec<u8>,
+        config: (i32, Vec<u8>),
+    }
     let login_body = login_start_c("Doppel");
     let info = bot::client_information_body();
-    let mut variants: Vec<(String, Vec<u8>, (i32, Vec<u8>))> = (0x00..=0x0a)
-        .map(|id| {
-            (
-                format!("cfg0x{id:02x}"),
-                login_body.clone(),
-                (id, info.clone()),
-            )
+    let mut variants: Vec<Probe> = (0x00..=0x0a)
+        .map(|id| Probe {
+            label: format!("cfg0x{id:02x}"),
+            login: login_body.clone(),
+            config: (id, info.clone()),
         })
         .collect();
     // Control: no config probe at all (documented silent wait).
-    variants.push(("no-probe".into(), login_body.clone(), (0x63, info.clone())));
+    variants.push(Probe {
+        label: "no-probe".into(),
+        login: login_body.clone(),
+        config: (0x63, info.clone()),
+    });
 
     let mut lines: Vec<String> = Vec::new();
-    for (label, login, probe) in &variants {
+    for probe in &variants {
         let packets = bot::login_capture(
             "127.0.0.1",
             VANILLA_PORT,
             pin.protocol.unwrap_or(0),
-            login,
-            probe.clone(),
+            &probe.login,
+            probe.config.clone(),
             Duration::from_secs(5),
             120,
         )
-        .with_context(|| format!("capturing variant {label}"))?;
-        println!("[oracle] variant {label}: {} packets", packets.len());
+        .with_context(|| format!("capturing variant {}", probe.label))?;
+        println!(
+            "[oracle] variant {}: {} packets",
+            probe.label,
+            packets.len()
+        );
         for p in &packets {
             let mut obj = serde_json::to_value(p)?;
-            obj["variant"] = serde_json::json!(label);
+            obj["variant"] = serde_json::json!(probe.label);
             lines.push(obj.to_string());
         }
     }
