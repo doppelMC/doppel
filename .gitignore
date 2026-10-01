@@ -1,0 +1,6 @@
+/target
+/tools/
+/scratch/
+*.log
+.idea/
+.vscode/

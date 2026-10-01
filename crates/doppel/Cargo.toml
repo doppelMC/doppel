@@ -1,0 +1,11 @@
+[package]
+name = "doppel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A clean-room Rust Minecraft server verified 1:1 against vanilla by differential testing"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+doppel-protocol = { path = "../doppel-protocol" }

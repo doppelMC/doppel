@@ -1,0 +1,11 @@
+[package]
+name = "doppel-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Packet primitives and shared artifacts for Doppel and its oracle harness"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
