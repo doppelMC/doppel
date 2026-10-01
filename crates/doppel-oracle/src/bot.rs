@@ -94,6 +94,8 @@ pub struct CapturedPacket {
 /// locale, view distance, chat mode, chat colors, skin parts, main hand,
 /// text filtering, server listings. Candidate layout; the oracle's
 /// decoder errors will correct any field that drifted.
+/// Unused while the Login Acknowledged probe runs; returns next iteration.
+#[allow(dead_code)]
 pub fn client_information_body() -> Vec<u8> {
     let mut b = Vec::new();
     doppel_protocol::write_string(&mut b, "en_US");
