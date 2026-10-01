@@ -58,7 +58,7 @@ type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
 /// capture when vanilla sent one, otherwise the reference-free conversion.
 /// TODO(chunk-store): lock currently spans region IO + conversion; the
 /// tick-loop rework moves region reads to positional shared-file reads and
-/// learned maps to immutable Arcs (Opus M2 review), dissolving this lock.
+/// learned maps to immutable Arcs, dissolving this lock.
 fn stream_chunk(world: &SharedWorld, cx: i32, cz: i32, blobs: &Blobs) -> Result<Option<WireChunk>> {
     let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
     let Some(anvil) = w.dir.chunk(cx, cz)? else {
@@ -475,7 +475,7 @@ fn stream_if_moved(
     conn.write_packet(0x0c, &[])?; // batch start
     let mut sent_now = 0u32;
     for (x, z) in entering {
-        // A failed chunk must never abort the batch (Opus review): skip it,
+        // A failed chunk must never abort the batch: skip it,
         // always close with the count actually sent.
         match stream_chunk(world, x, z, blobs) {
             Ok(Some(chunk)) => {

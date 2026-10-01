@@ -1,5 +1,5 @@
 //! The game thread: single owner of world state, players, and streaming
-//! decisions (Opus M2 blueprint). Connection threads are IO actors that
+//! decisions. Connection actors. Connection threads are IO actors that
 //! forward inbound events and drain outbound frames; nothing here touches
 //! a socket. This is the skeleton the block-modification tick loop hangs
 //! from.
