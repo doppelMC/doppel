@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use doppel_protocol::{encode_handshake, encode_ping, encode_status_request, read_packet, Reader};
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
