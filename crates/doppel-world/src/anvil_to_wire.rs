@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::chunk_codec::{Container, WireChunk, WireLight, WireSection};
+use crate::chunk_codec::{Container, ContainerKind, WireChunk, WireLight, WireSection};
 use crate::{Chunk, Region, Section};
 
 /// Unpacks SimpleBitStorage: values packed LSB-first within each long,
@@ -33,14 +33,24 @@ pub fn unpack(longs: &[u64], bits: usize, count: usize) -> Vec<u16> {
     out
 }
 
-/// Wire palette bits per vanilla rules: 4 minimum, growing to 8, then
-/// direct global ids (handled by the caller).
-fn palette_bits(len: usize) -> u8 {
-    let mut bits = 4;
+/// Wire palette bits per vanilla rules, per container kind: blocks start at
+/// 4 bits and stay indirect up to 8; biomes start at 1 and stay indirect up
+/// to 3. Larger palettes would require DIRECT conversion (global ids in the
+/// longs, repacked) — not implemented yet, so this bails instead of
+/// silently corrupting the passthrough longs.
+fn palette_bits(len: usize, kind: ContainerKind) -> Result<u8> {
+    let (min, max) = match kind {
+        ContainerKind::Blocks => (4usize, 8usize),
+        ContainerKind::Biomes => (1, 3),
+    };
+    let mut bits = min;
     while (1usize << bits) < len {
         bits += 1;
     }
-    bits.min(8) as u8
+    if bits > max {
+        bail!("{len} palette entries need direct-mode conversion (not yet implemented)");
+    }
+    Ok(bits as u8)
 }
 
 /// Learned name -> global-id maps (blocks and biomes).
@@ -51,77 +61,86 @@ pub struct PaletteBootstrap {
 }
 
 impl PaletteBootstrap {
-    /// Learns mappings from one (wire, anvil) chunk pair. Returns how many
-    /// new mappings were learned.
+    /// Records a mapping, refusing conflicting re-learns (a name that
+    /// already maps to a different id means the pairing was unsound).
+    fn record(blocks: &mut HashMap<String, u32>, name: &str, id: u32, learned: &mut usize) -> bool {
+        match blocks.get(name) {
+            Some(existing) if *existing != id => {
+                eprintln!("[world] palette conflict for {name}: {existing} vs {id}");
+                false
+            }
+            None => {
+                blocks.insert(name.to_string(), id);
+                *learned += 1;
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Learns mappings from one (wire, anvil) chunk pair. Sections are
+    /// paired by Y — Anvil section lists may be unordered, carry extra
+    /// light-only sections, or omit empty ones, so positional zip would
+    /// misalign. Returns how many new mappings were learned.
     #[allow(clippy::collapsible_if)]
     pub fn learn(&mut self, wire: &WireChunk, anvil: &Chunk) -> usize {
+        let by_y: HashMap<i8, &Section> = anvil.sections.iter().map(|s| (s.y, s)).collect();
         let mut learned = 0;
-        for (ws, as_) in wire.sections.iter().zip(anvil.sections.iter()) {
-            let Container::Palette { entries, longs, .. } = &ws.block_states else {
+        for (i, ws) in wire.sections.iter().enumerate() {
+            let y = i as i8 - 4; // wire sections are bottom-to-top, y=-4..=19
+            let Some(as_) = by_y.get(&y).copied() else {
                 continue;
             };
-            let Some(anvil_bs) = &as_.block_states else {
-                continue;
-            };
-            let wire_longs: Vec<u64> = longs.to_vec();
-            if anvil_bs.palette.len() != entries.len() {
-                continue;
-            }
-            let Some(data) = &anvil_bs.data else {
-                continue;
-            };
-            let anvil_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
-            if wire_longs != anvil_longs {
-                continue; // palette orders differ; not a safe pair
-            }
-            for (entry, id) in anvil_bs.palette.iter().zip(entries.iter()) {
-                if entry.properties.is_some() {
-                    continue; // state-specific mapping needs property enumeration
-                }
-                if self.blocks.insert(entry.name.clone(), *id).is_none() {
-                    learned += 1;
-                }
-            }
-            // Biomes likewise.
-            if let Container::Palette {
-                entries: be,
-                longs: bl,
-                ..
-            } = &ws.biomes
-            {
-                if let Some(ab) = &as_.biomes {
-                    let abl = ab.data.as_deref().unwrap_or_default();
-                    let same = ab.palette.len() == be.len()
-                        && !bl.is_empty()
-                        && bl.iter().map(|&v| v as i64).eq(abl.iter().copied());
-                    if same {
-                        for (name, id) in ab.palette.iter().zip(be.iter()) {
-                            if self.biomes.insert(name.clone(), *id).is_none() {
-                                learned += 1;
+            if let Container::Palette { entries, longs, .. } = &ws.block_states {
+                if let Some(anvil_bs) = &as_.block_states {
+                    let wire_longs: Vec<u64> = longs.to_vec();
+                    if anvil_bs.palette.len() == entries.len() {
+                        if let Some(data) = &anvil_bs.data {
+                            let anvil_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
+                            if wire_longs == anvil_longs {
+                                for (entry, id) in anvil_bs.palette.iter().zip(entries.iter()) {
+                                    if entry.properties.is_none() {
+                                        Self::record(
+                                            &mut self.blocks,
+                                            &entry.name,
+                                            *id,
+                                            &mut learned,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Biomes likewise.
+                    if let Container::Palette {
+                        entries: be,
+                        longs: bl,
+                        ..
+                    } = &ws.biomes
+                    {
+                        if let Some(ab) = &as_.biomes {
+                            let abl = ab.data.as_deref().unwrap_or_default();
+                            let same = ab.palette.len() == be.len()
+                                && !bl.is_empty()
+                                && bl.iter().map(|&v| v as i64).eq(abl.iter().copied());
+                            if same {
+                                for (name, id) in ab.palette.iter().zip(be.iter()) {
+                                    Self::record(&mut self.biomes, name, *id, &mut learned);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-        // Single-value sections learn their one mapping directly.
-        for (ws, as_) in wire.sections.iter().zip(anvil.sections.iter()) {
+            // Single-value sections learn their one mapping directly.
             if let (Container::Single(id), Some(ab)) = (&ws.block_states, &as_.block_states) {
                 if ab.palette.len() == 1 && ab.palette[0].properties.is_none() {
-                    if self
-                        .blocks
-                        .insert(ab.palette[0].name.clone(), *id)
-                        .is_none()
-                    {
-                        learned += 1;
-                    }
+                    Self::record(&mut self.blocks, &ab.palette[0].name, *id, &mut learned);
                 }
             }
             if let (Container::Single(id), Some(ab)) = (&ws.biomes, &as_.biomes) {
                 if ab.palette.len() == 1 {
-                    if self.biomes.insert(ab.palette[0].clone(), *id).is_none() {
-                        learned += 1;
-                    }
+                    Self::record(&mut self.biomes, &ab.palette[0], *id, &mut learned);
                 }
             }
         }
@@ -191,7 +210,7 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                         .with_context(|| format!("no global id learned for {}", p.name))
                 })
                 .collect::<Result<_>>()?;
-            let bits = palette_bits(ids.len());
+            let bits = palette_bits(ids.len(), ContainerKind::Blocks)?;
             match (&bs.data, ids.len()) {
                 (None, 1) => {
                     let id = ids[0];
@@ -249,7 +268,7 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                         .with_context(|| format!("no biome id learned for {n}"))
                 })
                 .collect::<Result<_>>()?;
-            let bits = palette_bits(ids.len());
+            let bits = palette_bits(ids.len(), ContainerKind::Biomes)?;
             match (&b.data, ids.len()) {
                 (None, 1) => Container::Single(ids[0]),
                 (Some(data), _) => Container::Palette {
@@ -282,10 +301,16 @@ pub struct WorldDir {
 
 impl WorldDir {
     pub fn open(path: &Path) -> Result<WorldDir> {
-        let root = path.join("region");
-        if !root.is_dir() {
-            bail!("no region dir under {}", path.display());
-        }
+        // Modern versions keep overworld regions under
+        // dimensions/minecraft/overworld; older layouts use the root.
+        let candidates = [
+            path.join("dimensions/minecraft/overworld/region"),
+            path.join("region"),
+        ];
+        let root = candidates
+            .into_iter()
+            .find(|p| p.is_dir())
+            .with_context(|| format!("no region dir under {}", path.display()))?;
         Ok(WorldDir {
             root,
             regions: HashMap::new(),

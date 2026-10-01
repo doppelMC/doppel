@@ -29,14 +29,43 @@ pub enum Container {
     Global { bits: u8, longs: Vec<u64> },
 }
 
+/// Per-container-kind palette rules: blocks use indirect palettes at 4..=8
+/// bits then direct at >=9; biomes use 1..=3 then direct at >=4 (64 entries).
+#[derive(Clone, Copy)]
+pub enum ContainerKind {
+    Blocks,
+    Biomes,
+}
+
+impl ContainerKind {
+    fn max_indirect_bits(self) -> u8 {
+        match self {
+            ContainerKind::Blocks => 8,
+            ContainerKind::Biomes => 3,
+        }
+    }
+
+    /// Hard sanity cap on the bits byte — hostile values above this would
+    /// otherwise make 64/bits zero and panic (div-by-zero on remote input).
+    fn max_bits(self) -> u8 {
+        match self {
+            ContainerKind::Blocks => 16,
+            ContainerKind::Biomes => 8,
+        }
+    }
+}
+
 impl Container {
-    fn decode(r: &mut Reader, entry_count: usize) -> Result<Container> {
+    fn decode(r: &mut Reader, entry_count: usize, kind: ContainerKind) -> Result<Container> {
         let bits = r.read_u8().context("container bits")?;
+        if bits > kind.max_bits() {
+            bail!("container bits {bits} out of range");
+        }
         match bits {
             0 => Ok(Container::Single(
                 r.read_varint().context("single value")? as u32
             )),
-            1..=8 => {
+            1..=8 if bits <= kind.max_indirect_bits() => {
                 let size = r.read_varint().context("palette size")? as usize;
                 if size > 65536 {
                     bail!("palette size {size} out of range");
@@ -176,8 +205,9 @@ impl WireChunk {
         while sr.remaining() > 0 {
             let non_empty = sr.read_i16().context("nonEmpty count")?;
             let fluid = sr.read_i16().context("fluid count")?;
-            let block_states = Container::decode(&mut sr, 4096).context("block states")?;
-            let biomes = Container::decode(&mut sr, 64).context("biomes")?;
+            let block_states =
+                Container::decode(&mut sr, 4096, ContainerKind::Blocks).context("block states")?;
+            let biomes = Container::decode(&mut sr, 64, ContainerKind::Biomes).context("biomes")?;
             sections.push(WireSection {
                 non_empty,
                 fluid,
