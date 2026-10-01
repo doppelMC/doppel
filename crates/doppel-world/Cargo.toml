@@ -1,0 +1,12 @@
+[package]
+name = "doppel-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "World storage for Doppel: Anvil region loading and chunk model"
+
+[dependencies]
+anyhow = "1"
+fastnbt = "2"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }

@@ -4,6 +4,7 @@ members = [
     "crates/doppel",
     "crates/doppel-protocol",
     "crates/doppel-oracle",
+    "crates/doppel-world",
 ]
 
 [workspace.package]
