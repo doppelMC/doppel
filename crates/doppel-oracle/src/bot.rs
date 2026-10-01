@@ -93,7 +93,7 @@ pub struct CapturedPacket {
 /// locale, view distance, chat mode, chat colors, skin parts, main hand,
 /// text filtering, server listings. Candidate layout; the oracle's
 /// decoder errors will correct any field that drifted.
-fn client_information_body() -> Vec<u8> {
+pub fn client_information_body() -> Vec<u8> {
     let mut b = Vec::new();
     doppel_protocol::write_string(&mut b, "en_US");
     b.push(8); // view distance
@@ -108,14 +108,16 @@ fn client_information_body() -> Vec<u8> {
 
 /// Connects as an offline-mode login client and records every packet the
 /// server sends from the moment of login until the stream goes idle.
-/// `login_start_body` is the pre-built serverbound `minecraft:hello` body —
-/// the caller decides the field layout to probe (this is how the capture
-/// discovers the exact 26.3 encoding).
+/// `login_start_body` is the pre-built serverbound `minecraft:hello` body;
+/// `config_probe` is the (packet id, body) the bot sends as its first
+/// configuration-state packet — probing ids maps vanilla's serverbound
+/// configuration state empirically.
 pub fn login_capture(
     host: &str,
     port: u16,
     protocol: i32,
     login_start_body: &[u8],
+    config_probe: (i32, Vec<u8>),
     idle_timeout: Duration,
     max_packets: usize,
 ) -> Result<Vec<CapturedPacket>> {
@@ -168,12 +170,16 @@ pub fn login_capture(
             note = Some(format!("set compression threshold={threshold}"));
         }
         // After Login Success the connection enters the configuration state,
-        // where the CLIENT speaks first (Client Information), and only then
-        // does the server send its registry burst.
+        // where the CLIENT speaks first. We send the probe packet; vanilla's
+        // reaction (registry burst, named decoder error, or silent close)
+        // maps the serverbound configuration state.
         if !config_started && id == 0x02 {
-            conn.write_packet(0x00, &client_information_body())?;
+            conn.write_packet(config_probe.0, &config_probe.1)?;
             config_started = true;
-            note = Some("login success; sent client information".into());
+            note = Some(format!(
+                "login success; probed config packet id 0x{:02x}",
+                config_probe.0
+            ));
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.

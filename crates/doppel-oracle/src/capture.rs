@@ -23,23 +23,12 @@ fn offline_uuid(username: &str) -> [u8; 16] {
 }
 
 /// Candidate field layouts for serverbound `minecraft:hello` (Login Start).
-/// Variant C is the confirmed 26.3 layout (String name + bare UUID); the
-/// others remain for regression documentation.
-fn login_start_variants(username: &str) -> Vec<(String, Vec<u8>)> {
-    let uuid16 = offline_uuid(username);
-    let mut v = Vec::new();
-
+/// Variant C is the confirmed 26.3 layout (String name + bare UUID).
+fn login_start_c(username: &str) -> Vec<u8> {
     let mut c = Vec::new();
     doppel_protocol::write_string(&mut c, username);
-    c.extend_from_slice(&uuid16); // bare UUID, no flag — confirmed layout
-    v.push(("C:name+uuid".into(), c));
-
-    let mut a = Vec::new();
-    doppel_protocol::write_string(&mut a, username);
-    a.push(0x00);
-    v.push(("A:name+opt_uuid(false)".into(), a));
-
-    v
+    c.extend_from_slice(&offline_uuid(username));
+    c
 }
 
 pub fn run(out_path: &Path) -> Result<()> {
@@ -47,14 +36,32 @@ pub fn run(out_path: &Path) -> Result<()> {
     let jar = vanilla::ensure_jar(&pin)?;
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
 
-    let variants = login_start_variants("Doppel");
+    // Probe the serverbound configuration state: same Client Information
+    // body sent under each candidate packet id on a fresh connection.
+    // A valid id either continues the handshake or errors with the packet's
+    // name; an invalid id closes the connection silently.
+    let login_body = login_start_c("Doppel");
+    let info = bot::client_information_body();
+    let mut variants: Vec<(String, Vec<u8>, (i32, Vec<u8>))> = (0x00..=0x0a)
+        .map(|id| {
+            (
+                format!("cfg0x{id:02x}"),
+                login_body.clone(),
+                (id, info.clone()),
+            )
+        })
+        .collect();
+    // Control: no config probe at all (documented silent wait).
+    variants.push(("no-probe".into(), login_body.clone(), (0x63, info.clone())));
+
     let mut lines: Vec<String> = Vec::new();
-    for (label, body) in &variants {
+    for (label, login, probe) in &variants {
         let packets = bot::login_capture(
             "127.0.0.1",
             VANILLA_PORT,
             pin.protocol.unwrap_or(0),
-            body,
+            login,
+            probe.clone(),
             Duration::from_secs(5),
             120,
         )
