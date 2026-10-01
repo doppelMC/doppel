@@ -59,13 +59,35 @@ pub struct BlockStates {
     pub data: Option<fastnbt::LongArray>,
 }
 
-/// One palette entry: a block type, plus optional state properties.
+/// One palette entry on disk. Vanilla's BlockState codec is an Either:
+/// property-less default states serialize as the bare block name string;
+/// non-default states carry the full {Name, Properties} compound.
 #[derive(Debug, Deserialize, Serialize)]
-pub struct PaletteEntry {
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "Properties", default)]
-    pub properties: Option<fastnbt::Value>,
+#[serde(untagged)]
+pub enum PaletteEntry {
+    Name(String),
+    Full {
+        #[serde(rename = "Name")]
+        name: String,
+        #[serde(rename = "Properties", default)]
+        properties: Option<fastnbt::Value>,
+    },
+}
+
+impl PaletteEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            PaletteEntry::Name(n) => n,
+            PaletteEntry::Full { name, .. } => name,
+        }
+    }
+
+    pub fn properties(&self) -> Option<&fastnbt::Value> {
+        match self {
+            PaletteEntry::Name(_) => None,
+            PaletteEntry::Full { properties, .. } => properties.as_ref(),
+        }
+    }
 }
 
 /// A parsed Anvil chunk (fields kept to what M2 needs so far).
@@ -185,10 +207,7 @@ mod tests {
             sections: vec![Section {
                 y: -1,
                 block_states: Some(BlockStates {
-                    palette: vec![PaletteEntry {
-                        name: "minecraft:air".into(),
-                        properties: None,
-                    }],
+                    palette: vec![PaletteEntry::Name("minecraft:air".into())],
                     data: None,
                 }),
                 biomes: None,
@@ -226,7 +245,7 @@ mod tests {
         assert_eq!(parsed.status, "minecraft:full");
         assert_eq!(parsed.sections.len(), 1);
         assert_eq!(
-            parsed.sections[0].block_states.as_ref().unwrap().palette[0].name,
+            parsed.sections[0].block_states.as_ref().unwrap().palette[0].name(),
             "minecraft:air"
         );
         // Missing chunk reads as None, not an error.

@@ -99,10 +99,10 @@ impl PaletteBootstrap {
                             let anvil_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
                             if wire_longs == anvil_longs {
                                 for (entry, id) in anvil_bs.palette.iter().zip(entries.iter()) {
-                                    if entry.properties.is_none() {
+                                    if entry.properties().is_none() {
                                         Self::record(
                                             &mut self.blocks,
-                                            &entry.name,
+                                            entry.name(),
                                             *id,
                                             &mut learned,
                                         );
@@ -135,8 +135,8 @@ impl PaletteBootstrap {
             }
             // Single-value sections learn their one mapping directly.
             if let (Container::Single(id), Some(ab)) = (&ws.block_states, &as_.block_states) {
-                if ab.palette.len() == 1 && ab.palette[0].properties.is_none() {
-                    Self::record(&mut self.blocks, &ab.palette[0].name, *id, &mut learned);
+                if ab.palette.len() == 1 && ab.palette[0].properties().is_none() {
+                    Self::record(&mut self.blocks, ab.palette[0].name(), *id, &mut learned);
                 }
             }
             if let (Container::Single(id), Some(ab)) = (&ws.biomes, &as_.biomes) {
@@ -202,13 +202,16 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                 .palette
                 .iter()
                 .map(|p| {
-                    if p.properties.is_some() {
-                        bail!("state-specific block mapping not yet supported: {}", p.name);
+                    if p.properties().is_some() {
+                        bail!(
+                            "state-specific block mapping not yet supported: {}",
+                            p.name()
+                        );
                     }
                     boot.blocks
-                        .get(&p.name)
+                        .get(p.name())
                         .copied()
-                        .with_context(|| format!("no global id learned for {}", p.name))
+                        .with_context(|| format!("no global id learned for {}", p.name()))
                 })
                 .collect::<Result<_>>()?;
             let bits = palette_bits(ids.len(), ContainerKind::Blocks)?;
@@ -231,7 +234,7 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                         let name = sec
                             .block_states
                             .as_ref()
-                            .and_then(|b| b.palette.get(idx as usize).map(|p| p.name.clone()))
+                            .and_then(|b| b.palette.get(idx as usize).map(|p| p.name().to_string()))
                             .unwrap_or_default();
                         if name.contains("water") || name.contains("lava") {
                             fluid += 1;
