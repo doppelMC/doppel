@@ -95,7 +95,25 @@ pub struct Game {
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
     /// (localPos, state) changes awaiting the tick-end broadcast.
     dirty: HashMap<(i32, i32, i32), Vec<(u64, u32)>>,
+    /// Block-state registry (name+props -> id), loaded from pins/blocks.json.
+    registry: Option<doppel_world::registry::BlockRegistry>,
+    /// Monotonic game tick.
+    tick: u64,
+    /// Scheduled actions: fire at tick T.
+    scheduled: Vec<(u64, i32, i32, i32)>,
+    /// Torch state change awaiting its 1gt delay.
+    pending_torch: Option<((i32, i32, i32), u32)>,
 }
+
+/// Face offsets for the six neighbors.
+const NEIGHBORS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
 
 const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -116,6 +134,19 @@ impl Game {
             blobs,
             next_conn: 0,
             dirty: HashMap::new(),
+            registry: doppel_protocol::find_repo_root().ok().and_then(|r| {
+                let p = r.join("pins").join("blocks.json");
+                p.exists()
+                    .then(|| {
+                        doppel_world::registry::BlockRegistry::load(&p)
+                            .inspect_err(|e| eprintln!("[game] registry: {e:#}"))
+                            .ok()
+                    })
+                    .flatten()
+            }),
+            tick: 0,
+            scheduled: Vec::new(),
+            pending_torch: None,
         }
     }
 
@@ -129,8 +160,9 @@ impl Game {
     /// The event loop. The 1s recv timeout doubles as the coarse keep-alive
     /// tick; the real 20 TPS loop replaces this when simulation arrives.
     pub fn run(&mut self) {
+        const TICK: Duration = Duration::from_millis(50);
         loop {
-            match self.inbound.recv_timeout(Duration::from_secs(1)) {
+            match self.inbound.recv_timeout(TICK) {
                 Ok(event) => {
                     self.handle(event);
                     // Drain everything else already queued: events arriving
@@ -143,8 +175,41 @@ impl Game {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
+            self.game_tick();
             self.flush_dirty();
             self.tick_keep_alives();
+        }
+    }
+
+    /// One game tick (50ms): fire scheduled actions, then housekeeping.
+    fn game_tick(&mut self) {
+        self.tick += 1;
+        if self.tick.is_multiple_of(20) {
+            // set_time (0x73): gameTime i64 + day counter. Static world
+            // placeholder until time simulation lands.
+            let mut body = Vec::with_capacity(18);
+            body.extend_from_slice(&0i64.to_be_bytes());
+            body.extend_from_slice(&0i64.to_be_bytes());
+            body.push(0);
+            let conns: Vec<ConnId> = self.players.keys().copied().collect();
+            for c in conns {
+                self.send(c, 0x73, &body);
+            }
+        }
+        // Apply the pending torch transition (1gt delay).
+        if let Some(((x, y, z), state)) = self.pending_torch.take() {
+            self.set_block(x, y, z, state, true);
+        }
+        // Fire scheduled redstone actions due this tick.
+        let due: Vec<(i32, i32, i32)> = self
+            .scheduled
+            .iter()
+            .filter(|(t, _, _, _)| *t <= self.tick)
+            .map(|(_, x, y, z)| (*x, *y, *z))
+            .collect();
+        self.scheduled.retain(|(t, _, _, _)| *t > self.tick);
+        for (x, y, z) in due {
+            self.update_block(x, y, z);
         }
     }
 
@@ -252,35 +317,11 @@ impl Game {
     /// version, and broadcast one section_blocks_update (0x56) to every
     /// viewer - exactly vanilla's batching (one packet per section per tick).
     fn setblock(&mut self, _conn: ConnId, x: i32, y: i32, z: i32, name: String) {
-        let Some(state) = Self::state_id(&name) else {
+        let Some(state) = self.resolve_state(&name).or_else(|| Self::state_id(&name)) else {
             eprintln!("[game] setblock: unknown block {name}");
             return;
         };
-        let cx = x.div_euclid(16);
-        let cz = z.div_euclid(16);
-        let sec_index = (y.div_euclid(16) + 4) as usize; // array index: y=-64 is section 0
-        let lx = x.rem_euclid(16) as u64;
-        let ly = y.rem_euclid(16) as u64;
-        let lz = z.rem_euclid(16) as u64;
-        let local: usize = ((lx << 8) | (lz << 4) | ly) as usize;
-
-        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
-            return;
-        };
-        if self.load_chunk(&world, &blobs, cx, cz).is_err() {
-            eprintln!("[game] setblock: chunk ({cx},{cz}) unavailable");
-            return;
-        }
-        let chunk = self.chunks.get_mut(&(cx, cz)).expect("loaded");
-        if !set_section_cell(&mut chunk.wire, sec_index, local, state) {
-            eprintln!("[game] setblock: section {sec_index} not mutable");
-            return;
-        }
-        chunk.version += 1;
-        self.dirty
-            .entry((cx, cz, y.div_euclid(16)))
-            .or_default()
-            .push((local as u64, state));
+        self.set_block(x, y, z, state, true);
     }
 
     /// Tick end: one section_blocks_update per dirty section, entries
@@ -306,6 +347,139 @@ impl Game {
                 self.send(v, 0x56, &body);
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // World block access + redstone
+    // ------------------------------------------------------------------
+
+    /// Reads the block state at world coords via the registry.
+    fn get_block(&self, x: i32, y: i32, z: i32) -> Option<(String, String)> {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        let sec_index = (y.div_euclid(16) + 4) as usize;
+        let idx = (((x.rem_euclid(16) as u64) << 8)
+            | ((z.rem_euclid(16) as u64) << 4)
+            | y.rem_euclid(16) as u64) as usize;
+        let chunk = self.chunks.get(&(cx, cz))?;
+        let state = get_section_cell(&chunk.wire, sec_index, idx)?;
+        let reg = self.registry.as_ref()?;
+        let (name, props) = reg.state_of(state)?;
+        Some((name.to_string(), props.to_string()))
+    }
+
+    /// Writes a block state, marking dirty + scheduling neighbor updates.
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32, notify: bool) {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        let sec_index = (y.div_euclid(16) + 4) as usize;
+        let idx = (((x.rem_euclid(16) as u64) << 8)
+            | ((z.rem_euclid(16) as u64) << 4)
+            | y.rem_euclid(16) as u64) as usize;
+        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+            return;
+        };
+        if self.load_chunk(&world, &blobs, cx, cz).is_err() {
+            return;
+        }
+        let chunk = self.chunks.get_mut(&(cx, cz)).expect("loaded");
+        if !set_section_cell(&mut chunk.wire, sec_index, idx, state) {
+            return;
+        }
+        chunk.version += 1;
+        self.dirty
+            .entry((cx, cz, y.div_euclid(16)))
+            .or_default()
+            .push((idx as u64, state));
+        if notify {
+            for (dx, dy, dz) in NEIGHBORS {
+                self.scheduled.push((self.tick, x + dx, y + dy, z + dz));
+            }
+            self.scheduled.push((self.tick, x, y, z));
+        }
+    }
+
+    /// The state id for a spec like "name[k=v]".
+    fn resolve_state(&self, spec: &str) -> Option<u32> {
+        let reg = self.registry.as_ref()?;
+        let (name, props) = doppel_world::registry::BlockRegistry::split_state(spec);
+        reg.state_id(name, props)
+    }
+
+    /// A scheduled block update: recompute redstone behavior at this pos.
+    fn update_block(&mut self, x: i32, y: i32, z: i32) {
+        let Some((name, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        match name.as_str() {
+            "minecraft:redstone_wire" => self.update_wire(x, y, z, &props),
+            "minecraft:redstone_torch" | "minecraft:redstone_wall_torch" => {
+                self.update_torch(x, y, z, &name, &props)
+            }
+            _ => {}
+        }
+    }
+
+    /// Wire power: max(source=15, adjacent wire - 1). Sources: lever on,
+    /// torch lit.
+    fn wire_power_from_neighbors(&self, x: i32, y: i32, z: i32) -> i32 {
+        let mut power = 0;
+        for (dx, dy, dz) in NEIGHBORS {
+            if let Some((n, p)) = self.get_block(x + dx, y + dy, z + dz) {
+                match n.as_str() {
+                    "minecraft:lever" if p.contains("powered=true") => return 15,
+                    "minecraft:redstone_torch" | "minecraft:redstone_wall_torch"
+                        if !p.contains("lit=false") =>
+                    {
+                        return 15;
+                    }
+                    "minecraft:redstone_wire" => {
+                        let lvl = doppel_world::registry::BlockRegistry::prop_int(&p, "power")
+                            .unwrap_or(0);
+                        power = power.max(lvl - 1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        power
+    }
+
+    /// Recompute a wire's power; on change, update + notify neighbors.
+    fn update_wire(&mut self, x: i32, y: i32, z: i32, props: &str) {
+        let target = self.wire_power_from_neighbors(x, y, z).clamp(0, 15);
+        let current = doppel_world::registry::BlockRegistry::prop_int(props, "power").unwrap_or(0);
+        if target == current {
+            return;
+        }
+        let spec = format!("minecraft:redstone_wire[power={target}]");
+        let Some(new_state) = self.resolve_state(&spec) else {
+            return;
+        };
+        self.set_block(x, y, z, new_state, true);
+    }
+
+    /// Torch: lit unless its supporting block carries power. Simple model:
+    /// check the neighbors of the block below the torch. 1gt delay via
+    /// pending_torch applied at next tick.
+    fn update_torch(&mut self, x: i32, y: i32, z: i32, name: &str, props: &str) {
+        let (ax, ay, az) = (x, y - 1, z);
+        let input_power = self.wire_power_from_neighbors(ax, ay, az);
+        let should_be_lit = input_power == 0;
+        let lit = !props.contains("lit=false");
+        if lit == should_be_lit {
+            return;
+        }
+        let new_props = doppel_world::registry::BlockRegistry::with_prop(
+            props,
+            "lit",
+            if should_be_lit { "true" } else { "false" },
+        );
+        let spec = format!("{name}[{new_props}]");
+        let Some(new_state) = self.resolve_state(&spec) else {
+            return;
+        };
+        self.pending_torch = Some(((x, y, z), new_state));
     }
 
     fn tick_keep_alives(&mut self) {
@@ -556,5 +730,32 @@ pub fn set_section_cell(chunk: &mut WireChunk, section: usize, idx: usize, state
             true
         }
         Container::Global { .. } => false,
+    }
+}
+
+/// Reads one cell from a section's block-state container.
+pub fn get_section_cell(chunk: &WireChunk, section: usize, idx: usize) -> Option<u32> {
+    use doppel_world::chunk_codec::Container;
+    let sec = chunk.sections.get(section)?;
+    match &sec.block_states {
+        Container::Single(v) => Some(*v),
+        Container::Palette {
+            entries,
+            longs,
+            bits,
+        } => {
+            let per_long = 64 / *bits as usize;
+            let mask = (1u64 << *bits as usize) - 1;
+            let long = longs.get(idx / per_long).copied().unwrap_or(0);
+            let shift = (idx % per_long) * *bits as usize;
+            entries.get(((long >> shift) & mask) as usize).copied()
+        }
+        Container::Global { longs, bits } => {
+            let per_long = 64 / *bits as usize;
+            let mask = (1u64 << *bits as usize) - 1;
+            let long = longs.get(idx / per_long).copied().unwrap_or(0);
+            let shift = (idx % per_long) * *bits as usize;
+            Some(((long >> shift) & mask) as u32)
+        }
     }
 }
