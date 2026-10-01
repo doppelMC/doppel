@@ -71,7 +71,7 @@ fn cmd_pin() -> Result<()> {
 
     let vjson = fetch_json(&version_url)?;
     let server = &vjson["downloads"]["server"];
-    let pin = Pin {
+    let mut pin = Pin {
         id: vjson["id"].as_str().context("no id")?.to_string(),
         release_time: vjson["releaseTime"]
             .as_str()
@@ -88,6 +88,14 @@ fn cmd_pin() -> Result<()> {
         protocol: None,
         version_name: None,
     };
+    // Repinning the SAME version must keep the oracle-healed values —
+    // wiping them would un-teach the capture bot the protocol number.
+    if let Ok(prev) = doppel_protocol::load_pin() {
+        if prev.id == pin.id {
+            pin.protocol = prev.protocol;
+            pin.version_name = prev.version_name;
+        }
+    }
     save_pin(&pin)?;
     println!(
         "[oracle] pinned {} (java {}+, jar sha1 {})",
