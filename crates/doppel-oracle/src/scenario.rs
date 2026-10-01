@@ -20,6 +20,7 @@ pub fn run(out_path: &Path) -> Result<()> {
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
 
     let commands = vec![
+        "/help".to_string(),
         "/tick freeze".to_string(),
         "/setblock 0 100 0 minecraft:stone".to_string(),
         "/data get block 0 100 0".to_string(),
