@@ -223,6 +223,12 @@ impl Game {
                 z,
                 sent,
             } => {
+                // Register the viewer index for chunks the join burst
+                // already delivered — without this, block broadcasts skip
+                // players who never triggered movement streaming.
+                for chunk in &sent {
+                    self.viewers.entry(*chunk).or_default().push(conn);
+                }
                 self.players.insert(
                     conn,
                     Player {
