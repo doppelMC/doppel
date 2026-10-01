@@ -161,8 +161,40 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
         }
     }
 
-    // Steady state: consume client traffic until the connection ends.
-    while conn.read_packet().is_ok() {}
+    // Steady state: poll with a short read timeout so the server can
+    // schedule its own work (keep-alives) between client packets. A read
+    // timeout is a tick, not an error; anything else ends the connection.
+    // Known limitation (revisit with async IO): a client stalling longer
+    // than one poll INSIDE a frame would desync the stream — frame size
+    // caps turn that into a safe disconnect, never corruption.
+    conn.get_mut()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .context("setting poll timeout")?;
+    let idle_limit = Duration::from_secs(90);
+    let mut last_seen = std::time::Instant::now();
+    loop {
+        match conn.read_packet() {
+            Ok((_id, _body)) => {
+                last_seen = std::time::Instant::now();
+                // M1.5: keep-alive replies and movement parsing land here.
+            }
+            Err(e) => {
+                let timed_out = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+                });
+                if !timed_out {
+                    break; // EOF or protocol error: connection over
+                }
+            }
+        }
+        if last_seen.elapsed() > idle_limit {
+            eprintln!("[doppel] {name}: idle timeout");
+            break;
+        }
+    }
     Ok(())
 }
 

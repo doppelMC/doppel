@@ -213,6 +213,14 @@ impl<S: Read + Write> Conn<S> {
         self.stream
     }
 
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.stream
+    }
+
     /// Reads one packet, transparently decompressing if needed.
     /// Returns `(packet_id, body_after_id)`.
     pub fn read_packet(&mut self) -> Result<(i32, Vec<u8>)> {
