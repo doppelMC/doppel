@@ -1004,12 +1004,24 @@ mod tests {
             "minecraft:redstone_wire[east=none,north=none,power=7,south=none,west=none]",
         );
         sim.wire((0, 100, 0), 0); // a fresh dot
+                                  // Input side: the read never consults the stored sides.
         assert_eq!(incoming_wire_signal(&sim, (0, 100, 0)), 6);
+        // Without a source the cascade drains the stale value: mutual
+        // re-notifications decay the pair to zero, exactly vanilla's
+        // source-removal behavior.
         run_update(&mut sim, (0, 100, 0));
-        assert_eq!(sim.power_at((0, 100, 0)), Some(6));
-        // The consumer sits EAST (the other wire): from_consumer = West,
-        // so the side facing it is East, which the live recompute
-        // connects even though the stored state is a dot.
+        assert_eq!(sim.power_at((0, 100, 0)), Some(0));
+        assert_eq!(sim.power_at((1, 100, 0)), Some(0));
+        // With a source the pair carries full strength across the same-Y
+        // boundary even while the receiving wire is a stored dot.
+        sim.put((2, 100, 0), LEVER);
+        run_update(&mut sim, (1, 100, 0));
+        assert_eq!(sim.power_at((1, 100, 0)), Some(15));
+        assert_eq!(sim.power_at((0, 100, 0)), Some(14));
+        // Output gating uses the live recompute: the stored state is
+        // a dot, but the reconnected east side (and the west side the
+        // axis fill extends it into — a line powers blocks at both ends)
+        // emit, while north and the block above see nothing.
         let props = "east=none,north=none,power=6,south=none,west=none";
         assert_eq!(
             wire_signal_toward(&sim, (0, 100, 0), props, Dir::West, true),
@@ -1017,6 +1029,10 @@ mod tests {
         );
         assert_eq!(
             wire_signal_toward(&sim, (0, 100, 0), props, Dir::East, true),
+            6
+        );
+        assert_eq!(
+            wire_signal_toward(&sim, (0, 100, 0), props, Dir::North, true),
             0
         );
         assert_eq!(
