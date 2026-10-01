@@ -901,8 +901,16 @@ pub fn parity_redstone() -> Result<bool> {
     //    differ on the first divergence, which is the data we want).
     let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
     let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
-    let v_updates: Vec<_> = vr.iter().filter(|p| p.id == 0x56 || p.id == 0x08).collect();
-    let d_updates: Vec<_> = dr.iter().filter(|p| p.id == 0x56 || p.id == 0x08).collect();
+    let v_updates: Vec<_> = vr
+        .iter()
+        .filter(|p| p.id == 0x56 || p.id == 0x08)
+        .copied()
+        .collect();
+    let d_updates: Vec<_> = dr
+        .iter()
+        .filter(|p| p.id == 0x56 || p.id == 0x08)
+        .copied()
+        .collect();
     println!(
         "[oracle] redstone updates: vanilla {} doppel {}",
         v_updates.len(),
@@ -914,7 +922,7 @@ pub fn parity_redstone() -> Result<bool> {
     // tick freeze vanilla's in-window packet count is thin and ordering
     // is not reliably observable. Final states are the semantic claim.
     let apply =
-        |pkts: &[&&bot::CapturedPacket]| -> std::collections::BTreeMap<(i32, i32, i32), u32> {
+        |pkts: &[&bot::CapturedPacket]| -> std::collections::BTreeMap<(i32, i32, i32), u32> {
             let mut map = std::collections::BTreeMap::new();
             for p in pkts {
                 let raw = hex::decode(&p.head_hex).unwrap_or_default();
@@ -988,7 +996,34 @@ pub fn parity_redstone() -> Result<bool> {
     for (pos, st) in &vmap {
         match dmap.get(pos) {
             Some(ds) if ds == st => {}
-            Some(ds) => failures.push(format!("pos {:?}: vanilla {st} != doppel {ds}", pos)),
+            Some(ds) => {
+                failures.push(format!("pos {:?}: vanilla {st} != doppel {ds}", pos));
+                // History: every vanilla/doppel update packet mentioning
+                // the lever's coordinate bytes, in order.
+                let hist = |pkts: &[&bot::CapturedPacket]| -> Vec<String> {
+                    let mut out = Vec::new();
+                    for (i, p) in pkts.iter().enumerate() {
+                        let raw = hex::decode(&p.head_hex).unwrap_or_default();
+                        if raw.len() < 8 {
+                            continue;
+                        }
+                        if raw
+                            .windows(2)
+                            .any(|w| w == [(st >> 8) as u8, (st & 0xff) as u8])
+                        {
+                            out.push(format!(
+                                "#{i} id=0x{:02x} len={} {}",
+                                p.id,
+                                p.body_len,
+                                &p.head_hex[..p.head_hex.len().min(48)]
+                            ));
+                        }
+                    }
+                    out
+                };
+                println!("  vanilla pkts: {:?}", hist(v_updates.as_slice()));
+                println!("  doppel pkts: {:?}", hist(d_updates.as_slice()));
+            }
             None => failures.push(format!("pos {:?}: vanilla {st}, missing in doppel", pos)),
         }
     }
