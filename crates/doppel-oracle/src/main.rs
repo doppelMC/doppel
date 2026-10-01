@@ -26,9 +26,16 @@ fn usage() -> ! {
 }
 
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("[oracle] error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.first().map(String::as_str) {
-        Some("pin") => cmd_pin(),
+    match args.first().map(String::as_str) {
+        Some("pin") => cmd_pin()?,
         Some("status") => {
             let host = args.get(1).unwrap_or_else(|| usage()).clone();
             let port: u16 = args
@@ -36,10 +43,18 @@ fn main() {
                 .unwrap_or_else(|| usage())
                 .parse()
                 .unwrap_or_else(|_| usage());
-            cmd_status(&host, port)
+            cmd_status(&host, port)?
         }
-        Some("parity-status") => parity::parity_status(None).map(|_| ()),
-        Some("parity-login") => parity::parity_login().map(|_| ()),
+        Some("parity-status") => {
+            if !parity::parity_status(None)? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-login") => {
+            if !parity::parity_login()? {
+                std::process::exit(1);
+            }
+        }
         Some("capture-vanilla-login") => {
             let out = args
                 .get(1)
@@ -49,14 +64,11 @@ fn main() {
             capture::run(
                 std::path::Path::new(&out),
                 blobs.as_deref().map(std::path::Path::new),
-            )
+            )?
         }
         _ => usage(),
     };
-    if let Err(e) = result {
-        eprintln!("[oracle] error: {e:#}");
-        std::process::exit(1);
-    }
+    Ok(())
 }
 
 /// Resolves the latest Mojang release and (re)writes the version pin.

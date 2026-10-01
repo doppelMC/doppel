@@ -33,9 +33,7 @@ pub fn status_response(pin: &Pin, client_protocol: i32) -> Value {
             "online": 0,
             "sample": [],
         },
-        "description": {
-            "text": "A Minecraft Server",
-        },
+        "description": "A Minecraft Server",
     })
 }
 
@@ -129,10 +127,15 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
     write_string(&mut packs, pin.version_name.as_deref().unwrap_or(&pin.id));
     conn.write_packet(0x0f, &packs)?; // select_known_packs (26.3)
 
-    let (id, _body) = conn.read_packet().context("known packs reply")?;
-    if id != 0x07 {
-        bail!("expected known packs reply (0x07), got id {id}");
-    }
+    // The client may volunteer Client Information (0x00) and keep-alives at
+    // any point; vanilla stores them without blocking. Wait for the actual
+    // known-packs reply (0x07), skipping anything else.
+    let (_id, _body) = loop {
+        let (id, body) = conn.read_packet().context("known packs reply")?;
+        if id == 0x07 {
+            break (id, body);
+        }
+    };
 
     if let Some(b) = blobs {
         for registry in &b.registries {
@@ -144,9 +147,11 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
     }
 
     conn.write_packet(0x03, &[])?; // finish_configuration: server first
-    let (id, body) = conn.read_packet().context("finish configuration reply")?;
-    if id != 0x03 || !body.is_empty() {
-        bail!("expected finish configuration (empty 0x03), got id {id}");
+    loop {
+        let (id, body) = conn.read_packet().context("finish configuration reply")?;
+        if id == 0x03 && body.is_empty() {
+            break;
+        }
     }
 
     // --- play state: join + spawn chunks, then idle ---

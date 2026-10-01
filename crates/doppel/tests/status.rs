@@ -51,7 +51,7 @@ fn status_ping_roundtrip() {
     assert_eq!(json["version"]["protocol"], 777);
     assert_eq!(json["players"]["max"], 20);
     assert_eq!(json["players"]["online"], 0);
-    assert_eq!(json["description"]["text"], "A Minecraft Server");
+    assert_eq!(json["description"], "A Minecraft Server");
 
     let payload = 0x00D0_BB50_0000_0001i64;
     stream.write_all(&encode_ping(payload)).unwrap();
