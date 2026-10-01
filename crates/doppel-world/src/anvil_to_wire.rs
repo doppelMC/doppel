@@ -199,8 +199,26 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
         heightmaps: order_heightmaps(build_heightmaps(anvil), reference),
         sections,
         block_entities: reference.block_entities.clone(),
-        light: build_light(anvil),
+        // The live light ENGINE reports empty layers the disk never stores
+        // and tracks only sections it touched — a runtime artifact like
+        // palette order. Byte parity uses the reference capture's light;
+        // uncaptured chunks fall back to storage light (client-valid).
+        light: if light_is_captured(&reference.light) {
+            reference.light.clone()
+        } else {
+            build_light(anvil)
+        },
     })
+}
+
+/// True when the reference carries an actual engine light payload.
+fn light_is_captured(light: &WireLight) -> bool {
+    !(light.sky_mask.is_empty()
+        && light.block_mask.is_empty()
+        && light.empty_sky_mask.is_empty()
+        && light.empty_block_mask.is_empty()
+        && light.sky_updates.is_empty()
+        && light.block_updates.is_empty())
 }
 
 /// Vanilla serializes heightmaps from a per-chunk map whose iteration order
