@@ -240,17 +240,27 @@ pub fn login_capture(
             conn.write_packet(0x1c, &body)?;
         }
         // player_position (S->C 0x49, the join teleport): the client MUST
-        // acknowledge it (serverbound 0x00 accept_teleportation) before the
-        // server accepts any movement or chat from the player. Its
-        // coordinates become the walk's starting point.
+        // acknowledge it before the server accepts movement or chat. 26.3's
+        // accept_teleportation echoes the id AND the full position (id
+        // VarInt; pos f64×3; delta f64×3; yaw/pitch f32; relatives i32).
         if play_started && id == 0x49 && body.len() >= 4 {
             let mut r = Reader::new(&body);
             let teleport_id = r.read_varint().context("teleport id")?;
             let x = r.read_f64().context("teleport x")?;
             let y = r.read_f64().context("teleport y")?;
             let z = r.read_f64().context("teleport z")?;
-            let mut ack = Vec::new();
+            r.read_f64().ok(); // delta x
+            r.read_f64().ok(); // delta y
+            r.read_f64().ok(); // delta z
+            let yaw = r.read_f32().unwrap_or(0.0);
+            let pitch = r.read_f32().unwrap_or(0.0);
+            let mut ack = Vec::with_capacity(40);
             doppel_protocol::write_varint(&mut ack, teleport_id);
+            ack.extend_from_slice(&x.to_be_bytes());
+            ack.extend_from_slice(&y.to_be_bytes());
+            ack.extend_from_slice(&z.to_be_bytes());
+            ack.extend_from_slice(&yaw.to_be_bytes());
+            ack.extend_from_slice(&pitch.to_be_bytes());
             conn.write_packet(0x00, &ack)?;
             walk_base = Some((x, y, z));
             note = Some(format!(
