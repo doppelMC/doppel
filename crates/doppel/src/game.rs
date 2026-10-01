@@ -323,10 +323,12 @@ impl Game {
     /// version, and broadcast one section_blocks_update (0x56) to every
     /// viewer - exactly vanilla's batching (one packet per section per tick).
     fn setblock(&mut self, _conn: ConnId, x: i32, y: i32, z: i32, name: String) {
+        eprintln!("[game] setblock {name} at ({x},{y},{z})");
         let Some(state) = self.resolve_state(&name).or_else(|| Self::state_id(&name)) else {
             eprintln!("[game] setblock: unknown block {name}");
             return;
         };
+        eprintln!("[game] setblock resolved state={state}");
         self.set_block(x, y, z, state, true);
     }
 
@@ -336,6 +338,7 @@ impl Game {
         if self.dirty.is_empty() {
             return;
         }
+        eprintln!("[game] flush_dirty: {} sections", self.dirty.len());
         let dirty = std::mem::take(&mut self.dirty);
         for ((cx, cz, sy), mut changes) in dirty {
             changes.sort_unstable_by_key(|(local, _)| *local);
@@ -349,6 +352,7 @@ impl Game {
                 write_u64_varlong(&mut body, ((*state as u64) << 12) | *local);
             }
             let viewers: Vec<ConnId> = self.viewers.get(&(cx, cz)).cloned().unwrap_or_default();
+            eprintln!("[game] flush 0x56 to {} viewers", viewers.len());
             for v in viewers {
                 self.send(v, 0x56, &body);
             }
@@ -386,6 +390,7 @@ impl Game {
             return;
         };
         if self.load_chunk(&world, &blobs, cx, cz).is_err() {
+            eprintln!("[game] set_block: load failed ({cx},{cz})");
             return;
         }
         let chunk = self.chunks.get_mut(&(cx, cz)).expect("loaded");
