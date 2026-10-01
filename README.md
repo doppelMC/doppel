@@ -10,7 +10,8 @@ A Minecraft server written in Rust.
 
 ## Status
 
-Early development. Status ping only — not yet playable.
+Early development. Login and world join are implemented and verified
+byte-for-byte against vanilla; the world is currently a static snapshot.
 
 ## Running
 
