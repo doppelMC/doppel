@@ -590,7 +590,6 @@ mod tests {
         }
         if checked == 0 {
             eprintln!("skipping: manifest has no chunk blobs (stale local captures)");
-            return;
         }
     }
 }
