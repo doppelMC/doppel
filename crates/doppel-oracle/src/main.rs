@@ -1,6 +1,7 @@
 //! doppel-oracle: the differential test harness.
 
 mod bot;
+mod capture;
 mod parity;
 mod vanilla;
 
@@ -15,7 +16,9 @@ fn usage() -> ! {
   doppel-oracle pin                   write pins/version.json for the latest release
   doppel-oracle status <host> <port>  ping any server and print its status JSON
   doppel-oracle parity-status         differential test: vanilla oracle vs doppel
-                                       (set DOPPEL_BIN=<path> to override the binary)"
+                                       (set DOPPEL_BIN=<path> to override the binary)
+  doppel-oracle capture-vanilla-login [out.jsonl]
+                                      record vanilla's login packet transcript"
     );
     std::process::exit(2);
 }
@@ -34,6 +37,13 @@ fn main() {
             cmd_status(&host, port)
         }
         Some("parity-status") => parity::parity_status(None).map(|_| ()),
+        Some("capture-vanilla-login") => {
+            let out = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "captures/vanilla-login.jsonl".into());
+            capture::run(std::path::Path::new(&out))
+        }
         _ => usage(),
     };
     if let Err(e) = result {

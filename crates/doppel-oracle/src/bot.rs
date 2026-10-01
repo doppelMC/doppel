@@ -2,7 +2,10 @@
 //! Doppel) from the outside, exactly like a real client would.
 
 use anyhow::{bail, Context, Result};
-use doppel_protocol::{encode_handshake, encode_ping, encode_status_request, read_packet, Reader};
+use doppel_protocol::{
+    encode_handshake, encode_ping, encode_status_request, read_packet, Conn, Reader,
+};
+use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -75,4 +78,74 @@ pub fn status_ping_retry(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("status ping failed without error")))
+}
+
+/// One observed server-to-client packet in a login transcript.
+#[derive(Serialize)]
+pub struct CapturedPacket {
+    pub id: i32,
+    pub body_len: usize,
+    pub head_hex: String,
+    pub note: Option<String>,
+}
+
+/// Connects as an offline-mode login client and records every packet the
+/// server sends from the moment of login until the stream goes idle.
+/// This is protocol discovery: the transcript tells us the exact packet
+/// sequence vanilla 26.3 uses, which we then implement.
+pub fn login_capture(
+    host: &str,
+    port: u16,
+    username: &str,
+    idle_timeout: Duration,
+    max_packets: usize,
+) -> Result<Vec<CapturedPacket>> {
+    let stream =
+        TcpStream::connect((host, port)).with_context(|| format!("connecting to {host}:{port}"))?;
+    stream.set_read_timeout(Some(idle_timeout))?;
+    stream.set_write_timeout(Some(idle_timeout))?;
+    stream.set_nodelay(true).ok();
+    let mut conn = Conn::new(stream);
+
+    // Handshake (packet 0x00) with next_state=2 (login), sent raw.
+    let mut hs = Vec::new();
+    doppel_protocol::write_varint(&mut hs, 0);
+    doppel_protocol::write_string(&mut hs, host);
+    hs.extend_from_slice(&port.to_be_bytes());
+    doppel_protocol::write_varint(&mut hs, 2);
+    conn.write_packet(0x00, &hs)?;
+
+    // Login Start (packet 0x00): username + no UUID (boolean false).
+    let mut ls = Vec::new();
+    doppel_protocol::write_string(&mut ls, username);
+    ls.push(0x00);
+    conn.write_packet(0x00, &ls)?;
+
+    let mut packets = Vec::new();
+    let mut compression_on = false;
+    for _ in 0..max_packets {
+        let (id, body) = match conn.read_packet() {
+            Ok(p) => p,
+            Err(_) => break, // idle timeout, EOF, or disconnect: transcript over
+        };
+        let mut note = None;
+        // Set Compression arrives raw in login state and switches framing
+        // for everything after it.
+        if !compression_on && id == 0x03 {
+            let threshold = Reader::new(&body)
+                .read_varint()
+                .context("set compression threshold")?;
+            conn.set_compression(threshold);
+            compression_on = true;
+            note = Some(format!("set compression threshold={threshold}"));
+        }
+        let head = &body[..body.len().min(64)];
+        packets.push(CapturedPacket {
+            id,
+            body_len: body.len(),
+            head_hex: hex::encode(head),
+            note,
+        });
+    }
+    Ok(packets)
 }
