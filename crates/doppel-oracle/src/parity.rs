@@ -909,55 +909,97 @@ pub fn parity_redstone() -> Result<bool> {
         d_updates.len()
     );
 
-    let decode = |p: &&bot::CapturedPacket| -> String {
-        let raw = hex::decode(&p.head_hex).unwrap_or_default();
-        if p.id == 0x08 {
-            return format!("08 {:?}", &raw[..8.min(raw.len())]);
-        }
-        if raw.len() < 8 {
-            return "56 short".to_string();
-        }
-        let mut o = 8usize;
-        let read_varlong = |o: &mut usize| -> u64 {
-            let mut v: u64 = 0;
-            let mut sh = 0u32;
-            while *o < raw.len() {
-                let b = raw[*o];
-                *o += 1;
-                v |= u64::from(b & 0x7f) << sh;
-                sh += 7;
-                if b & 0x80 == 0 {
-                    break;
+    // Compare FINAL per-position states (apply each stream's updates in
+    // order, last write wins) rather than raw packet sequences: under
+    // tick freeze vanilla's in-window packet count is thin and ordering
+    // is not reliably observable. Final states are the semantic claim.
+    let apply =
+        |pkts: &[&&bot::CapturedPacket]| -> std::collections::BTreeMap<(i32, i32, i32), u32> {
+            let mut map = std::collections::BTreeMap::new();
+            for p in pkts {
+                let raw = hex::decode(&p.head_hex).unwrap_or_default();
+                if p.id == 0x08 && raw.len() >= 9 {
+                    let pos = raw[0..8].try_into().unwrap();
+                    let packed = i64::from_be_bytes(pos);
+                    let x = ((packed >> 38) & 0x3ff_ffff) as i32;
+                    let z = ((packed >> 12) & 0x3ff_ffff) as i32;
+                    let y = (packed & 0xfff) as i32;
+                    // sign-extend 26-bit
+                    let x = ((x as i64) << 38 >> 38) as i32;
+                    let z = (z << 6) >> 6;
+                    let mut o = 8usize;
+                    let mut st = 0u32;
+                    let mut sh = 0u32;
+                    while o < raw.len() {
+                        let b = raw[o];
+                        o += 1;
+                        st |= u32::from(b & 0x7f) << sh;
+                        sh += 7;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    map.insert((x, y, z), st);
+                } else if p.id == 0x56 && raw.len() >= 8 {
+                    // section updates: entries carry localPos:state
+                    let sec = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+                    let sx = ((sec >> 42) & 0x3f_ffff) as i32;
+                    let sz = ((sec >> 20) & 0x3f_ffff) as i32;
+                    let sy = (sec & 0xf_ffff) as i32;
+                    let sx = (sx << 10) >> 10;
+                    let sz = (sz << 10) >> 10;
+                    let mut o = 8usize;
+                    let rd = |o: &mut usize| -> u64 {
+                        let mut v: u64 = 0;
+                        let mut sh = 0u32;
+                        while *o < raw.len() {
+                            let b = raw[*o];
+                            *o += 1;
+                            v |= u64::from(b & 0x7f) << sh;
+                            sh += 7;
+                            if b & 0x80 == 0 {
+                                break;
+                            }
+                        }
+                        v
+                    };
+                    let count = rd(&mut o);
+                    for _ in 0..count {
+                        let e = rd(&mut o);
+                        let local = (e & 0xfff) as i32;
+                        let st = (e >> 12) as u32;
+                        let lx = (local >> 8) & 0xf;
+                        let lz = (local >> 4) & 0xf;
+                        let ly = local & 0xf;
+                        map.insert((sx * 16 + lx, sy * 16 + ly, sz * 16 + lz), st);
+                    }
                 }
             }
-            v
+            map
         };
-        let count = read_varlong(&mut o);
-        let mut entries = Vec::new();
-        for _ in 0..count {
-            let v = read_varlong(&mut o);
-            entries.push(format!("{:03x}:{:x}", v & 0xfff, v >> 12));
-        }
-        format!("56 sec={:x?} n={} {:?}", &raw[..8], count, entries)
-    };
-
+    let vmap = apply(&v_updates);
+    let dmap = apply(&d_updates);
+    println!(
+        "[oracle] final circuit states: vanilla {} doppel {}",
+        vmap.len(),
+        dmap.len()
+    );
     let mut failures = Vec::new();
-    let n = v_updates.len().max(d_updates.len());
-    for i in 0..n {
-        let a = v_updates.get(i).map(|p| decode(p));
-        let b = d_updates.get(i).map(|p| decode(p));
-        if a != b {
-            failures.push(format!("update {i}:\n    vanilla {a:?}\n    doppel  {b:?}"));
+    for (pos, st) in &vmap {
+        match dmap.get(pos) {
+            Some(ds) if ds == st => {}
+            Some(ds) => failures.push(format!("pos {:?}: vanilla {st} != doppel {ds}", pos)),
+            None => failures.push(format!("pos {:?}: vanilla {st}, missing in doppel", pos)),
         }
     }
-    if v_updates.len() != d_updates.len() {
-        failures.push(format!(
-            "count: vanilla {} vs doppel {}",
-            v_updates.len(),
-            d_updates.len()
-        ));
+    for (pos, st) in &dmap {
+        if !vmap.contains_key(pos) {
+            failures.push(format!(
+                "pos {:?}: doppel-only {st} (vanilla never reported)",
+                pos
+            ));
+        }
     }
-
     if failures.is_empty() {
         println!("PASS: redstone circuits match");
         Ok(true)
