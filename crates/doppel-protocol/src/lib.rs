@@ -97,6 +97,22 @@ impl<'a> Reader<'a> {
         Ok(i64::from_be_bytes(bytes))
     }
 
+    pub fn read_f32(&mut self) -> Result<f32> {
+        let mut bytes = [0u8; 4];
+        for b in &mut bytes {
+            *b = self.read_u8()?;
+        }
+        Ok(f32::from_be_bytes(bytes))
+    }
+
+    pub fn read_f64(&mut self) -> Result<f64> {
+        let mut bytes = [0u8; 8];
+        for b in &mut bytes {
+            *b = self.read_u8()?;
+        }
+        Ok(f64::from_be_bytes(bytes))
+    }
+
     pub fn read_string(&mut self, max_bytes: usize) -> Result<String> {
         let len = self.read_varint()?;
         if len < 0 || len as usize > max_bytes {

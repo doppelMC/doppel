@@ -17,6 +17,27 @@ const MAX_FRAME: usize = 1024 * 1024;
 const DEFAULT_MAX_PLAYERS: i64 = 20;
 const COMPRESSION_THRESHOLD: i32 = 256;
 
+/// 26.3 clientbound play ids. The 26.3-vs-26.2 clientbound shift is NOT
+/// uniform (see scratch/protocol-26.3.md); keep_alive follows the +1 model
+/// from the initialize_border anchor — pin empirically against the oracle
+/// before trusting position-dependent behavior.
+const CB_KEEP_ALIVE: i32 = 0x2d;
+
+/// Vanilla keep-alive cadence (ServerCommonPacketListenerImpl): send every
+/// 15 s; a challenge unanswered at the next 15 s check disconnects.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Per-connection player state for the play phase.
+struct PlayState {
+    name: String,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+    pending_keep_alive: Option<(i64, std::time::Instant)>,
+}
+
 // ---------------------------------------------------------------------------
 // Status (M0)
 // ---------------------------------------------------------------------------
@@ -170,13 +191,22 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
     conn.get_mut()
         .set_read_timeout(Some(Duration::from_secs(1)))
         .context("setting poll timeout")?;
-    let idle_limit = Duration::from_secs(90);
-    let mut last_seen = std::time::Instant::now();
+    let mut state = PlayState {
+        name: name.clone(),
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        yaw: 0.0,
+        pitch: 0.0,
+        pending_keep_alive: None,
+    };
     loop {
         match conn.read_packet() {
-            Ok((_id, _body)) => {
-                last_seen = std::time::Instant::now();
-                // M1.5: keep-alive replies and movement parsing land here.
+            Ok((id, body)) => {
+                if let Err(e) = handle_play_packet(&mut conn, &mut state, id, &body) {
+                    eprintln!("[doppel] {}: {e:#}", state.name);
+                    break;
+                }
             }
             Err(e) => {
                 let timed_out = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
@@ -190,9 +220,80 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
                 }
             }
         }
-        if last_seen.elapsed() > idle_limit {
-            eprintln!("[doppel] {name}: idle timeout");
-            break;
+        // Keep-alive scheduling on every poll tick.
+        match state.pending_keep_alive {
+            None => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let mut challenge = Vec::with_capacity(8);
+                challenge.extend_from_slice(&now.to_be_bytes());
+                if conn.write_packet(CB_KEEP_ALIVE, &challenge).is_err() {
+                    break;
+                }
+                state.pending_keep_alive = Some((now, std::time::Instant::now()));
+            }
+            Some((_, sent)) if sent.elapsed() > KEEP_ALIVE_INTERVAL => {
+                eprintln!("[doppel] {}: keep-alive timeout", state.name);
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Handles one serverbound play packet (26.x serverbound ids are stable
+/// across the 26.2→26.3 clientbound shifts). Unknown packets are ignored,
+/// matching vanilla's tolerance for forward-compat channels.
+fn handle_play_packet(
+    _conn: &mut Conn<TcpStream>,
+    state: &mut PlayState,
+    id: i32,
+    body: &[u8],
+) -> Result<()> {
+    let mut r = Reader::new(body);
+    match id {
+        0x1c => {
+            // keep_alive: must echo the pending challenge exactly.
+            let answer = r.read_i64().context("keep alive id")?;
+            match state.pending_keep_alive {
+                Some((challenge, _)) if challenge == answer => {
+                    state.pending_keep_alive = None;
+                }
+                _ => bail!("keep-alive mismatch: answered {answer}"),
+            }
+        }
+        0x1e => {
+            // move_player_pos
+            state.x = r.read_f64().context("x")?;
+            state.y = r.read_f64().context("y")?;
+            state.z = r.read_f64().context("z")?;
+            r.read_u8().context("flags")?;
+        }
+        0x1f => {
+            // move_player_pos_rot
+            state.x = r.read_f64().context("x")?;
+            state.y = r.read_f64().context("y")?;
+            state.z = r.read_f64().context("z")?;
+            state.yaw = r.read_f32().context("yaw")?;
+            state.pitch = r.read_f32().context("pitch")?;
+            r.read_u8().context("flags")?;
+        }
+        0x20 => {
+            // move_player_rot
+            state.yaw = r.read_f32().context("yaw")?;
+            state.pitch = r.read_f32().context("pitch")?;
+            r.read_u8().context("flags")?;
+        }
+        0x00 => {
+            // accept_teleportation (teleport id consumed for now)
+            r.read_varint().context("teleport id")?;
+        }
+        _ => {
+            // movement-status-only (0x21), client_information, custom
+            // payloads and everything else: tolerated, unhandled.
         }
     }
     Ok(())

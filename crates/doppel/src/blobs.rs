@@ -46,6 +46,11 @@ pub fn load(dir: &Path) -> Result<Blobs> {
         match (entry.phase.as_str(), entry.id) {
             ("config", 0x07) => blobs.registries.push(body),
             ("config", 0x0e) => blobs.update_tags = Some(body),
+            ("play", 0x2d) => {
+                // keep_alive: sent live with a fresh challenge, never
+                // replayed (a stale challenge would make clients echo the
+                // wrong id into our matcher).
+            }
             ("play", _) => blobs.play.push((entry.id, body)),
             _ => {}
         }

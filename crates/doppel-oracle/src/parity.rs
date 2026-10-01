@@ -234,8 +234,8 @@ pub fn parity_login() -> Result<bool> {
         VANILLA_PORT,
         protocol,
         &login_body,
-        Duration::from_secs(8),
-        160,
+        Duration::from_secs(22),
+        220,
         Some(&blobs_dir),
     )
     .context("capturing vanilla transcript")?;

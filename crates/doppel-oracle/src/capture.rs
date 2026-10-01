@@ -71,8 +71,8 @@ pub fn run(out_path: &Path, blobs_dir: Option<&Path>) -> Result<()> {
         VANILLA_PORT,
         pin.protocol.unwrap_or(0),
         &login_body,
-        Duration::from_secs(8),
-        160,
+        Duration::from_secs(22),
+        220,
         blobs_dir,
     )
     .context("capturing full login transcript")?;
