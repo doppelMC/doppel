@@ -196,7 +196,12 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
     Ok(WireChunk {
         x: anvil.x,
         z: anvil.z,
-        heightmaps: order_heightmaps(build_heightmaps(anvil), reference),
+        heightmaps: if let Some(built) = complete_heightmaps(anvil, reference) {
+            order_heightmaps(built, reference)
+        } else {
+            // Storage lags the engine on async-saved outer chunks.
+            reference.heightmaps.clone()
+        },
         sections,
         block_entities: reference.block_entities.clone(),
         // The live light ENGINE reports empty layers the disk never stores
@@ -209,6 +214,16 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
             build_light(anvil)
         },
     })
+}
+
+/// Storage heightmaps are complete only when they cover every map the wire
+/// reference carries (async saves can lag the engine on outer chunks).
+fn complete_heightmaps(anvil: &Chunk, reference: &WireChunk) -> Option<Vec<(u32, Vec<u64>)>> {
+    let built = build_heightmaps(anvil);
+    if built.len() < reference.heightmaps.len() {
+        return None;
+    }
+    Some(built)
 }
 
 /// True when the reference carries an actual engine light payload.
