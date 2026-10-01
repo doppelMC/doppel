@@ -290,13 +290,22 @@ pub fn parity_login() -> Result<bool> {
         for (wire, anvil) in &refs {
             anvil_total += 1;
             let rebuilt = doppel_world::anvil_to_wire::convert(anvil, wire, &boot)?;
-            if rebuilt.encode() == wire.encode() {
+            let re = rebuilt.encode();
+            let orig = wire.encode();
+            if re == orig {
                 anvil_ok += 1;
             } else {
+                let pos = re
+                    .iter()
+                    .zip(orig.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(re.len().min(orig.len()));
                 println!(
-                    "[oracle] anvil rebuild differs for chunk ({}, {})",
-                    wire.x, wire.z
+                    "[oracle] anvil rebuild differs for chunk ({}, {}): first diff at {}, re_len={} wire_len={}",
+                    wire.x, wire.z, pos, re.len(), orig.len()
                 );
+                println!("  re  : {:02x?}", &re[pos..(pos + 12).min(re.len())]);
+                println!("  wire: {:02x?}", &orig[pos..(pos + 12).min(orig.len())]);
             }
         }
         println!(
