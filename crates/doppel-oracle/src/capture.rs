@@ -24,26 +24,44 @@ fn offline_uuid(username: &str) -> [u8; 16] {
 
 /// Candidate field layouts for serverbound `minecraft:hello` (Login Start).
 /// Variant C is the confirmed 26.3 layout (String name + bare UUID).
-fn login_start_c(username: &str) -> Vec<u8> {
+pub fn login_start_c(username: &str) -> Vec<u8> {
     let mut c = Vec::new();
     doppel_protocol::write_string(&mut c, username);
     c.extend_from_slice(&offline_uuid(username));
     c
 }
 
-pub fn run(out_path: &Path) -> Result<()> {
+/// Write manifest.json mapping dumped packets to phase + id, so Doppel can
+/// replay them in choreographic order. Phase flips after the server's
+/// finish_configuration.
+pub fn write_manifest(packets: &[bot::CapturedPacket], dir: &std::path::Path) -> Result<usize> {
+    let mut play = false;
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    for p in packets {
+        if p.note
+            .as_deref()
+            .is_some_and(|n| n.contains("finish configuration"))
+        {
+            play = true;
+        }
+        if let Some(file) = &p.file {
+            manifest.push(serde_json::json!({
+                "file": file,
+                "id": p.id,
+                "phase": if play { "play" } else { "config" },
+            }));
+        }
+    }
+    let path = dir.join("manifest.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&manifest)? + "\n")?;
+    Ok(manifest.len())
+}
+
+pub fn run(out_path: &Path, blobs_dir: Option<&Path>) -> Result<()> {
     let pin = doppel_protocol::load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
 
-    // Probe the Login Acknowledged theory: after Login Success the client
-    // must confirm the configuration-state transition with an EMPTY packet
-    // before anything else. Empty body under each candidate id: the true
-    // ack id survives (idle-wait or a registry burst), everything else
-    // closes silently.
-    // Full confirmed choreography, no more probing: the bot drives login ->
-    // configuration -> play and captures everything, including the join
-    // sequence. Longer idle for the play-state burst.
     let login_body = login_start_c("Doppel");
     let mut lines: Vec<String> = Vec::new();
     let packets = bot::login_capture(
@@ -53,6 +71,7 @@ pub fn run(out_path: &Path) -> Result<()> {
         &login_body,
         Duration::from_secs(8),
         160,
+        blobs_dir,
     )
     .context("capturing full login transcript")?;
     println!("[oracle] full transcript: {} packets", packets.len());
@@ -62,6 +81,11 @@ pub fn run(out_path: &Path) -> Result<()> {
         lines.push(obj.to_string());
     }
     drop(server); // teardown
+
+    if let Some(dir) = blobs_dir {
+        let n = write_manifest(&packets, dir)?;
+        println!("[oracle] {n} blob entries -> {}", dir.display());
+    }
 
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;

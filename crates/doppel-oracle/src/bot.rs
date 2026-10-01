@@ -87,6 +87,8 @@ pub struct CapturedPacket {
     pub t_ms: u128,
     pub body_len: usize,
     pub head_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub note: Option<String>,
 }
 
@@ -110,7 +112,9 @@ pub fn client_information_body() -> Vec<u8> {
 /// Connects as an offline-mode login client and records every packet the
 /// server sends, driving the full confirmed choreography — login, ack,
 /// client information, known packs, finish configuration — into the PLAY
-/// state, capturing the join sequence.
+/// state, capturing the join sequence. When `dump_dir` is set, every
+/// packet's FULL body is also written to `pNNN.bin` there (the JSONL head
+/// is truncated; the dumps carry full bodies).
 pub fn login_capture(
     host: &str,
     port: u16,
@@ -118,12 +122,16 @@ pub fn login_capture(
     login_start_body: &[u8],
     idle_timeout: Duration,
     max_packets: usize,
+    dump_dir: Option<&std::path::Path>,
 ) -> Result<Vec<CapturedPacket>> {
     let stream =
         TcpStream::connect((host, port)).with_context(|| format!("connecting to {host}:{port}"))?;
     stream.set_read_timeout(Some(idle_timeout))?;
     stream.set_write_timeout(Some(idle_timeout))?;
     stream.set_nodelay(true).ok();
+    if let Some(dir) = dump_dir {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     let mut conn = Conn::new(stream);
 
     // Handshake (packet 0x00) with next_state=2 (login), sent raw.
@@ -155,6 +163,7 @@ pub fn login_capture(
                     t_ms: started.elapsed().as_millis(),
                     body_len: 0,
                     head_hex: String::new(),
+                    file: None,
                     note: Some(format!("transcript ended: {e:#}")),
                 });
                 break;
@@ -198,11 +207,18 @@ pub fn login_capture(
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.
         let head = &body[..body.len().min(4096)];
+        let mut file = None;
+        if let Some(dir) = dump_dir {
+            let name = format!("p{:03}.bin", packets.len());
+            std::fs::write(dir.join(&name), &body).with_context(|| format!("dumping {name}"))?;
+            file = Some(name);
+        }
         packets.push(CapturedPacket {
             id,
             t_ms: started.elapsed().as_millis(),
             body_len: body.len(),
             head_hex: hex::encode(head),
+            file,
             note,
         });
     }

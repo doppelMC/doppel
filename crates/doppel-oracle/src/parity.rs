@@ -203,3 +203,148 @@ fn flatten_count(v: &Value) -> usize {
     flatten("", v, &mut m);
     m.len()
 }
+
+/// The differential login test: capture vanilla's full login transcript
+/// (with byte-exact blob dumps), feed the blobs to Doppel, drive the same
+/// client dance against Doppel, and compare packet-for-packet through the
+/// spawn chunk batch. The per-connection sessionId UUID in login_finished
+/// is masked; everything else — including the natively-built brand,
+/// features, and known-packs packets — must be byte-identical.
+pub fn parity_login() -> Result<bool> {
+    use crate::capture;
+    use std::fs;
+
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs");
+    let doppel_dump = root.join("target").join("doppel-dump");
+    for dir in [&blobs_dir, &doppel_dump] {
+        if dir.exists() {
+            fs::remove_dir_all(dir).context("cleaning dump dir")?;
+        }
+    }
+
+    // 1. Capture the oracle transcript + blobs.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let login_body = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login_body,
+        Duration::from_secs(8),
+        160,
+        Some(&blobs_dir),
+    )
+    .context("capturing vanilla transcript")?;
+    drop(server);
+    let entries = capture::write_manifest(&v, &blobs_dir)?;
+    anyhow::ensure!(entries > 0, "no blobs captured from vanilla");
+
+    // 2. Spawn Doppel with the blobs.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut doppel_child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+
+    // 3. Drive the same dance against Doppel.
+    let d = bot::login_capture(
+        "127.0.0.1",
+        DOPPEL_PORT,
+        protocol,
+        &login_body,
+        Duration::from_secs(8),
+        160,
+        Some(&doppel_dump),
+    )
+    .context("capturing doppel transcript")?;
+    let _ = doppel_child.kill();
+    let _ = doppel_child.wait();
+
+    // 4. Compare through vanilla's chunk-batch-finished marker.
+    let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
+    let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
+    let mut seen_chunk = false;
+    let cut = vr
+        .iter()
+        .position(|p| {
+            if p.id == 0x2e {
+                seen_chunk = true;
+            }
+            seen_chunk && p.id == 0x0b
+        })
+        .unwrap_or(vr.len().saturating_sub(1));
+    let expected = &vr[..=cut];
+
+    println!(
+        "[oracle] comparing {} packets (vanilla {} vs doppel {})",
+        expected.len(),
+        vr.len(),
+        dr.len()
+    );
+
+    let mut failures = Vec::new();
+    if dr.len() < expected.len() {
+        failures.push(format!(
+            "doppel sent {} packets, expected at least {}",
+            dr.len(),
+            expected.len()
+        ));
+    }
+    for (i, (pv, pd)) in expected.iter().zip(dr.iter()).enumerate() {
+        if pv.id != pd.id {
+            failures.push(format!(
+                "packet {i}: id vanilla 0x{:02x} != doppel 0x{:02x}",
+                pv.id, pd.id
+            ));
+            continue;
+        }
+        if pv.body_len != pd.body_len {
+            failures.push(format!(
+                "packet {i} (0x{:02x}): len vanilla {} != doppel {}",
+                pv.id, pv.body_len, pd.body_len
+            ));
+            continue;
+        }
+        // Byte-exact comparison via dumps; the sessionId UUID (last 16
+        // bytes of login_finished) is per-connection and masked.
+        let (fv, fd) = match (&pv.file, &pd.file) {
+            (Some(fv), Some(fd)) => (
+                fs::read(blobs_dir.join(fv)).context("reading vanilla dump")?,
+                fs::read(doppel_dump.join(fd)).context("reading doppel dump")?,
+            ),
+            _ => continue, // no dump: len/id equality is all we can check
+        };
+        let mask_session = i == 1; // login_finished
+        let bytes_differ = if mask_session {
+            let n = fv.len();
+            fv[..n - 16] != fd[..n - 16]
+        } else {
+            fv != fd
+        };
+        if bytes_differ {
+            failures.push(format!("packet {i} (0x{:02x}): body bytes differ", pv.id));
+        }
+    }
+
+    if failures.is_empty() {
+        println!("PASS: login transcripts match through the chunk batch");
+        Ok(true)
+    } else {
+        println!("FAIL: {} login difference(s):", failures.len());
+        for f in failures.iter().take(20) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}

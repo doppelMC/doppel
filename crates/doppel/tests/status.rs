@@ -28,7 +28,7 @@ fn status_ping_roundtrip() {
     std::thread::spawn({
         let pin = pin.clone();
         move || {
-            doppel::serve_on(listener, pin).unwrap();
+            doppel::serve_on(listener, pin, None).unwrap();
         }
     });
 

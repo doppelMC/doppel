@@ -110,6 +110,16 @@ impl<'a> Reader<'a> {
             .context("packet truncated: string body")?;
         String::from_utf8(bytes.to_vec()).context("string is not valid UTF-8")
     }
+
+    pub fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
+        let start = self.pos;
+        self.pos += n;
+        let bytes = self
+            .buf
+            .get(start..self.pos)
+            .context("packet truncated: fixed bytes")?;
+        Ok(bytes.to_vec())
+    }
 }
 
 /// Reads one length-prefixed packet from a stream.

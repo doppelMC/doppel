@@ -17,8 +17,10 @@ fn usage() -> ! {
   doppel-oracle status <host> <port>  ping any server and print its status JSON
   doppel-oracle parity-status         differential test: vanilla oracle vs doppel
                                        (set DOPPEL_BIN=<path> to override the binary)
-  doppel-oracle capture-vanilla-login [out.jsonl]
-                                      record vanilla's login packet transcript"
+  doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
+                                      record vanilla's login transcript; with a
+                                      blobs dir, dump byte-exact packet bodies
+                                      plus manifest.json for replay"
     );
     std::process::exit(2);
 }
@@ -37,12 +39,17 @@ fn main() {
             cmd_status(&host, port)
         }
         Some("parity-status") => parity::parity_status(None).map(|_| ()),
+        Some("parity-login") => parity::parity_login().map(|_| ()),
         Some("capture-vanilla-login") => {
             let out = args
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| "captures/vanilla-login.jsonl".into());
-            capture::run(std::path::Path::new(&out))
+            let blobs = args.get(2).cloned();
+            capture::run(
+                std::path::Path::new(&out),
+                blobs.as_deref().map(std::path::Path::new),
+            )
         }
         _ => usage(),
     };
