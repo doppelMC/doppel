@@ -912,10 +912,10 @@ mod tests {
     fn l_run_powers_around_corner() {
         let mut sim = Sim::default();
         sim.put((-1, 100, 0), LEVER);
-        sim.wire((0, 100, 0));
-        sim.wire((1, 100, 0));
-        sim.wire((1, 100, 1)); // the corner: turns south
-        sim.wire((1, 100, 2));
+        sim.wire((0, 100, 0), 0);
+        sim.wire((1, 100, 0), 0);
+        sim.wire((1, 100, 1), 0); // the corner: turns south
+        sim.wire((1, 100, 2), 0);
         run_update(&mut sim, (0, 100, 0));
         assert_eq!(sim.power_at((0, 100, 0)), Some(15));
         assert_eq!(sim.power_at((1, 100, 0)), Some(14));
@@ -937,10 +937,10 @@ mod tests {
     fn staircase_carries_signal_up_and_down() {
         let mut sim = Sim::default();
         sim.put((-1, 100, 0), LEVER);
-        sim.wire((0, 100, 0));
+        sim.wire((0, 100, 0), 0);
         sim.put((1, 100, 0), "minecraft:stone");
-        sim.wire((1, 101, 0)); // on top of the step
-        sim.wire((2, 100, 0)); // ground level past the step
+        sim.wire((1, 101, 0), 0); // on top of the step
+        sim.wire((2, 100, 0), 0); // ground level past the step
         run_update(&mut sim, (0, 100, 0));
         assert_eq!(sim.power_at((0, 100, 0)), Some(15));
         assert_eq!(sim.power_at((1, 101, 0)), Some(14)); // up-diagonal
@@ -956,8 +956,8 @@ mod tests {
     fn vertical_neighbor_carries_no_signal() {
         let mut sim = Sim::default();
         sim.put((-1, 100, 0), LEVER);
-        sim.wire((0, 100, 0));
-        sim.wire((0, 101, 0)); // dead-stacked
+        sim.wire((0, 100, 0), 0);
+        sim.wire((0, 101, 0), 0); // dead-stacked
         run_update(&mut sim, (0, 100, 0));
         assert_eq!(sim.power_at((0, 100, 0)), Some(15));
         assert_eq!(sim.power_at((0, 101, 0)), Some(0));
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn conductor_above_cuts_diagonal_up() {
         let mut sim = Sim::default();
-        sim.wire((0, 100, 0));
+        sim.wire((0, 100, 0), 0);
         sim.put((1, 100, 0), "minecraft:stone");
         sim.put(
             (1, 101, 0),
@@ -990,7 +990,7 @@ mod tests {
             (1, 100, 0),
             "minecraft:lever[face=wall,facing=west,powered=true]",
         );
-        sim.wire((0, 101, 0));
+        sim.wire((0, 101, 0), 0);
         run_update(&mut sim, (0, 101, 0));
         assert_eq!(sim.power_at((0, 101, 0)), Some(15));
     }
@@ -1005,7 +1005,7 @@ mod tests {
             (1, 100, 0),
             "minecraft:redstone_wire[east=none,north=none,power=7,south=none,west=none]",
         );
-        sim.wire((0, 100, 0)); // a fresh dot
+        sim.wire((0, 100, 0), 0); // a fresh dot
         assert_eq!(incoming_wire_signal(&sim, (0, 100, 0)), 6);
         run_update(&mut sim, (0, 100, 0));
         assert_eq!(sim.power_at((0, 100, 0)), Some(6));
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn trapdoor_connects_visually_but_not_signalwise() {
         let mut sim = Sim::default();
-        sim.wire((0, 100, 0));
+        sim.wire((0, 100, 0), 0);
         sim.put(
             (1, 100, 0),
             "minecraft:oak_trapdoor[facing=north,half=top,open=false]",
@@ -1056,8 +1056,8 @@ mod tests {
     #[test]
     fn wire_emission_directions() {
         let mut sim = Sim::default();
-        sim.wire((-1, 100, 0));
-        sim.wire((1, 100, 0));
+        sim.wire((-1, 100, 0), 0);
+        sim.wire((1, 100, 0), 0);
         sim.put(
             (0, 100, 0),
             "minecraft:redstone_wire[east=side,north=none,power=12,south=none,west=side]",
@@ -1110,12 +1110,12 @@ mod tests {
             (1, 100, 0),
             "minecraft:redstone_wire[east=side,north=none,power=15,south=none,west=none]",
         );
-        sim.wire((2, 100, 0)); // makes (1,100,0) a line ending at the stone
+        sim.wire((2, 100, 0), 0); // makes (1,100,0) a line ending at the stone
         assert_eq!(signal_toward_consumer_above(&sim, 0, 100, 0), 15);
 
         let mut sim = Sim::default();
         sim.put((0, 100, 0), "minecraft:stone");
-        sim.wire((1, 100, 0)); // isolated dot beside the stone
+        sim.wire((1, 100, 0), 0); // isolated dot beside the stone
         assert_eq!(signal_toward_consumer_above(&sim, 0, 100, 0), 0);
 
         let mut sim = Sim::default();
@@ -1131,8 +1131,8 @@ mod tests {
     #[test]
     fn connection_axis_fill_and_dot_preservation() {
         let mut sim = Sim::default();
-        sim.wire((1, 100, 0));
-        sim.wire((0, 100, 0));
+        sim.wire((1, 100, 0), 0);
+        sim.wire((0, 100, 0), 0);
         let line = get_connection_state(
             &sim,
             (0, 100, 0),
