@@ -33,10 +33,7 @@ fn harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
         g.seed_chunk_for_test(cx, 0, wire(cx));
     }
     let (tx_out, rx_out) = std::sync::mpsc::channel::<Outbound>();
-    // The deadlock fix removed register(); the game thread learns the
-    // outbound channel via the Joined event. Tests inject it directly.
-    let _ = tx_out;
-    g.join_viewer_for_test(0, &[(-1, 0), (0, 0), (1, 0), (2, 0)]);
+    g.join_viewer_for_test(0, &[(-1, 0), (0, 0), (1, 0), (2, 0)], tx_out);
     (g, rx_out)
 }
 

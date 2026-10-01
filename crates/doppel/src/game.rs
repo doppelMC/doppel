@@ -1733,7 +1733,13 @@ impl Game {
             .insert((cx, cz), CachedChunk { wire, version: 0 });
     }
 
-    pub(crate) fn join_viewer_for_test(&mut self, conn: ConnId, chunks: &[(i32, i32)]) {
+    pub(crate) fn join_viewer_for_test(
+        &mut self,
+        conn: ConnId,
+        chunks: &[(i32, i32)],
+        tx: Sender<Outbound>,
+    ) {
+        self.outbounds.insert(conn, tx);
         self.players.insert(
             conn,
             Player {
