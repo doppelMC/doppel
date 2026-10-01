@@ -9,6 +9,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::blobs::Blobs;
+use crate::wire;
 use crate::WireChunk;
 
 pub type ConnId = u64;
@@ -648,20 +649,7 @@ impl Game {
 
     /// Recompute a wire's power; on change, update + notify neighbors.
     fn update_wire(&mut self, x: i32, y: i32, z: i32, props: &str) {
-        let target = self.wire_power_from_neighbors(x, y, z).clamp(0, 15);
-        let current = doppel_world::registry::BlockRegistry::prop_int(props, "power").unwrap_or(0);
-        if target == current {
-            return;
-        }
-        // Wire states carry mandatory connection props (east/north/south/
-        // west); preserve them and swap only power.
-        let new_props =
-            doppel_world::registry::BlockRegistry::with_prop(props, "power", &target.to_string());
-        let spec = format!("minecraft:redstone_wire[{new_props}]");
-        let Some(new_state) = self.resolve_state(&spec) else {
-            return;
-        };
-        self.set_block(x, y, z, new_state, true);
+        wire::update_wire_cascade(self, x, y, z, props);
     }
 
     /// Torch: lit unless its supporting block carries power. Simple model:
@@ -1969,4 +1957,25 @@ fn can_stick_to_each_other(a: &str, b: &str) -> bool {
         return false;
     }
     is_sticky(a) || is_sticky(b)
+}
+
+impl wire::BlockView for Game {
+    fn block_at(&self, x: i32, y: i32, z: i32) -> Option<(String, String)> {
+        self.get_block(x, y, z)
+    }
+}
+
+impl wire::WireHost for Game {
+    fn set_wire_state(&mut self, x: i32, y: i32, z: i32, state: u32) {
+        self.set_block(x, y, z, state, false);
+    }
+    fn resolve_wire_state(&self, conn: &wire::Connections, power: i32) -> Option<u32> {
+        let spec = format!("minecraft:redstone_wire[{}]", conn.props_string(power));
+        let reg = self.registry.as_ref()?;
+        let (name, props) = doppel_world::registry::BlockRegistry::split_state(&spec);
+        reg.state_id(name, props)
+    }
+    fn dispatch_neighbor_changed(&mut self, x: i32, y: i32, z: i32) {
+        self.update_block(x, y, z);
+    }
 }

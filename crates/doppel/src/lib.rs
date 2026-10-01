@@ -4,6 +4,7 @@
 
 pub mod blobs;
 pub mod game;
+pub mod wire;
 
 #[cfg(test)]
 mod piston_tests;
