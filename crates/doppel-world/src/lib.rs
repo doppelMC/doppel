@@ -77,6 +77,9 @@ pub enum PaletteEntry {
         #[serde(rename = "Properties", default)]
         properties: Option<fastnbt::Value>,
     },
+    /// Unknown shapes (version drift, vanilla codec extensions) degrade to
+    /// this instead of failing the whole chunk parse.
+    Other(fastnbt::Value),
 }
 
 impl PaletteEntry {
@@ -84,12 +87,13 @@ impl PaletteEntry {
         match self {
             PaletteEntry::Name(n) => n,
             PaletteEntry::Full { name, .. } => name,
+            PaletteEntry::Other(_) => "minecraft:air",
         }
     }
 
     pub fn properties(&self) -> Option<&fastnbt::Value> {
         match self {
-            PaletteEntry::Name(_) => None,
+            PaletteEntry::Name(_) | PaletteEntry::Other(_) => None,
             PaletteEntry::Full { properties, .. } => properties.as_ref(),
         }
     }
