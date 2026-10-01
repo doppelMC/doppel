@@ -89,6 +89,23 @@ pub struct CapturedPacket {
     pub note: Option<String>,
 }
 
+/// Serverbound Client Information body for the configuration state:
+/// locale, view distance, chat mode, chat colors, skin parts, main hand,
+/// text filtering, server listings. Candidate layout; the oracle's
+/// decoder errors will correct any field that drifted.
+fn client_information_body() -> Vec<u8> {
+    let mut b = Vec::new();
+    doppel_protocol::write_string(&mut b, "en_US");
+    b.push(8); // view distance
+    doppel_protocol::write_varint(&mut b, 0); // chat mode: enabled
+    b.push(0x01); // chat colors: true
+    b.push(0x7f); // all skin parts visible
+    doppel_protocol::write_varint(&mut b, 1); // main hand: right
+    b.push(0x00); // text filtering: off
+    b.push(0x01); // allow server listings: true
+    b
+}
+
 /// Connects as an offline-mode login client and records every packet the
 /// server sends from the moment of login until the stream goes idle.
 /// `login_start_body` is the pre-built serverbound `minecraft:hello` body —
@@ -123,6 +140,7 @@ pub fn login_capture(
 
     let mut packets = Vec::new();
     let mut compression_on = false;
+    let mut config_started = false;
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
@@ -148,6 +166,14 @@ pub fn login_capture(
             conn.set_compression(threshold);
             compression_on = true;
             note = Some(format!("set compression threshold={threshold}"));
+        }
+        // After Login Success the connection enters the configuration state,
+        // where the CLIENT speaks first (Client Information), and only then
+        // does the server send its registry burst.
+        if !config_started && id == 0x02 {
+            conn.write_packet(0x00, &client_information_body())?;
+            config_started = true;
+            note = Some("login success; sent client information".into());
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.
