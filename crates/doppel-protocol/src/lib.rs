@@ -446,9 +446,11 @@ mod tests {
         buf.set_position(0);
         let mut c = Conn::new(&mut buf);
         let (id, body) = c.read_packet().unwrap();
-        assert_eq!((id, body.as_slice()), (0x00, &[1, 2, 3][..]));
+        assert_eq!(id, 0x00);
+        assert_eq!(body, vec![1u8, 2, 3]);
         let (id, body) = c.read_packet().unwrap();
-        assert_eq!((id, body.as_slice()), (0x05, b"hello"[..]));
+        assert_eq!(id, 0x05);
+        assert_eq!(body, b"hello".to_vec());
     }
 
     #[test]
@@ -466,7 +468,8 @@ mod tests {
         buf.set_position(0);
         let mut c = Conn::new(&mut buf);
         let (id, body) = c.read_packet().unwrap();
-        assert_eq!((id, body.as_slice()), (0x01, b"tiny"[..]));
+        assert_eq!(id, 0x01);
+        assert_eq!(body, b"tiny".to_vec());
         let (id, body) = c.read_packet().unwrap();
         assert_eq!(id, 0x02);
         let expected: Vec<u8> = (0..200u8).cycle().take(500).collect();
