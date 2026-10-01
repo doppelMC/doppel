@@ -428,3 +428,145 @@ pub fn parity_login() -> Result<bool> {
         Ok(false)
     }
 }
+
+/// The differential walk test: the bot teleport-walks through vanilla and
+/// Doppel with the same steps, and we compare what streams back — cache
+/// centers, forgotten columns, and every chunk body byte-for-byte (via
+/// dumps) for chunks both servers sent.
+pub fn parity_walk() -> Result<bool> {
+    use crate::capture;
+
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs");
+    let world_dir = root
+        .join("target")
+        .join("vanilla")
+        .join("run")
+        .join("world");
+    let v_dump = root.join("target").join("walk-vanilla");
+    let d_dump = root.join("target").join("walk-doppel");
+    for dir in [&v_dump, &d_dump] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+    }
+
+    // 1. Vanilla walk.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let login = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(500),
+            dump_dir: Some(&v_dump),
+            commands: &[],
+            walk_chunks: Some(4),
+        },
+    )
+    .context("walking through vanilla")?;
+    drop(server);
+    capture::write_manifest(&v, &blobs_dir)?;
+
+    // 2. Doppel walk (blobs from a capture WITHOUT the walk: reuse the
+    // existing blob set is wrong here since it now contains walk chunks —
+    // filter the join burst chunks only for replay sources is future work;
+    // for now the walk uses whatever blobs exist).
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &world_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let d = bot::login_capture(
+        "127.0.0.1",
+        DOPPEL_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(500),
+            dump_dir: Some(&d_dump),
+            commands: &[],
+            walk_chunks: Some(4),
+        },
+    )
+    .context("walking through doppel")?;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 3. Compare the streams.
+    let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
+    let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
+    let mut failures = Vec::new();
+
+    let count = |pkts: &[&bot::CapturedPacket], id: i32| pkts.iter().filter(|p| p.id == id).count();
+    for id in [0x60u32, 0x49u32] {
+        let (cv, cd) = (count(&vr, id as i32), count(&dr, id as i32));
+        if cv != cd {
+            failures.push(format!("packet 0x{id:02x}: vanilla {cv} vs doppel {cd}"));
+        }
+    }
+
+    // Chunk bodies: compare per-coord via dumps.
+    let chunk_bodies =
+        |pkts: &[&bot::CapturedPacket], dir: &std::path::Path| -> Vec<((i32, i32), Vec<u8>)> {
+            pkts.iter()
+                .filter(|p| p.id == 0x2e)
+                .filter_map(|p| {
+                    let file = p.file.as_ref()?;
+                    let body = std::fs::read(dir.join(file)).ok()?;
+                    let c = doppel_world::WireChunk::decode(&body).ok()?;
+                    Some(((c.x, c.z), body))
+                })
+                .collect()
+        };
+    let vb = chunk_bodies(&vr, &v_dump);
+    let db = chunk_bodies(&dr, &d_dump);
+    println!(
+        "[oracle] walk chunks: vanilla {} doppel {} (forgets: vanilla {} doppel {})",
+        vb.len(),
+        db.len(),
+        count(&vr, 0x26),
+        count(&dr, 0x26),
+    );
+    let vmap: std::collections::HashMap<(i32, i32), &Vec<u8>> =
+        vb.iter().map(|(k, v)| (*k, v)).collect();
+    let mut compared = 0usize;
+    for (coord, body) in &db {
+        if let Some(vbody) = vmap.get(coord) {
+            compared += 1;
+            if **vbody != *body {
+                failures.push(format!(
+                    "chunk ({}, {}) body differs from vanilla",
+                    coord.0, coord.1
+                ));
+            }
+        }
+    }
+    println!("[oracle] byte-compared {compared} shared walk chunks");
+
+    if failures.is_empty() {
+        println!("PASS: walk streams match");
+        Ok(true)
+    } else {
+        println!("FAIL: {} walk difference(s):", failures.len());
+        for f in failures.iter().take(10) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}

@@ -37,6 +37,12 @@ struct PlayState {
     yaw: f32,
     pitch: f32,
     pending_keep_alive: Option<(i64, std::time::Instant)>,
+    /// View center (chunk coords) once the first position is known.
+    center: Option<(i32, i32)>,
+    /// Chunk columns already sent to this client.
+    sent: std::collections::HashSet<(i32, i32)>,
+    /// Monotonic teleport id for our player_position syncs.
+    teleport_id: i32,
 }
 
 /// Shared world state: Anvil regions plus the learned palette maps.
@@ -46,6 +52,32 @@ pub struct WorldState {
 }
 
 type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
+
+/// Streams a chunk the client just entered: storage-verified against the
+/// capture when vanilla sent one, otherwise the reference-free conversion.
+fn stream_chunk(world: &SharedWorld, cx: i32, cz: i32, blobs: &Blobs) -> Result<Option<WireChunk>> {
+    let mut w = world.lock().expect("world lock");
+    let Some(anvil) = w.dir.chunk(cx, cz)? else {
+        return Ok(None);
+    };
+    let reference = blobs.play.iter().find_map(|(id, body)| {
+        if *id != 0x2e {
+            return None;
+        }
+        WireChunk::decode(body)
+            .ok()
+            .filter(|c| c.x == cx && c.z == cz)
+    });
+    let chunk = match reference {
+        Some(reference) => {
+            w.boot.learn(&reference, &anvil);
+            doppel_world::anvil_to_wire::convert(&anvil, &reference, &w.boot)?
+        }
+        None => doppel_world::anvil_to_wire::convert_uncaptured(&anvil, &w.boot)?,
+    };
+    drop(w);
+    Ok(Some(chunk))
+}
 
 /// Rebuilds a chunk from Anvil storage when the world has it; the wire
 /// capture bootstraps palette maps and supplies light. Falls back to the
@@ -241,11 +273,24 @@ fn handle_login(
         yaw: 0.0,
         pitch: 0.0,
         pending_keep_alive: None,
+        center: None,
+        sent: std::collections::HashSet::new(),
+        teleport_id: 1,
     };
+    // The replayed join burst already delivered these chunks.
+    if let Some(b) = blobs {
+        for (pid, body) in &b.play {
+            if *pid == 0x2e {
+                if let Ok(chunk) = WireChunk::decode(body) {
+                    state.sent.insert((chunk.x, chunk.z));
+                }
+            }
+        }
+    }
     loop {
         match conn.read_packet() {
             Ok((id, body)) => {
-                if let Err(e) = handle_play_packet(&mut conn, &mut state, id, &body) {
+                if let Err(e) = handle_play_packet(&mut conn, &mut state, id, &body, world, blobs) {
                     eprintln!("[doppel] {}: {e:#}", state.name);
                     break;
                 }
@@ -290,10 +335,12 @@ fn handle_login(
 /// across the 26.2→26.3 clientbound shifts). Unknown packets are ignored,
 /// matching vanilla's tolerance for forward-compat channels.
 fn handle_play_packet(
-    _conn: &mut Conn<TcpStream>,
+    conn: &mut Conn<TcpStream>,
     state: &mut PlayState,
     id: i32,
     body: &[u8],
+    world: Option<&SharedWorld>,
+    blobs: Option<&Blobs>,
 ) -> Result<()> {
     let mut r = Reader::new(body);
     match id {
@@ -313,6 +360,7 @@ fn handle_play_packet(
             state.y = r.read_f64().context("y")?;
             state.z = r.read_f64().context("z")?;
             r.read_u8().context("flags")?;
+            stream_if_moved(conn, state, world, blobs)?;
         }
         0x1f => {
             // move_player_pos_rot
@@ -322,6 +370,7 @@ fn handle_play_packet(
             state.yaw = r.read_f32().context("yaw")?;
             state.pitch = r.read_f32().context("pitch")?;
             r.read_u8().context("flags")?;
+            stream_if_moved(conn, state, world, blobs)?;
         }
         0x20 => {
             // move_player_rot
@@ -333,11 +382,104 @@ fn handle_play_packet(
             // accept_teleportation (teleport id consumed for now)
             r.read_varint().context("teleport id")?;
         }
+        0x07 => {
+            // chat_command (unsigned, no leading slash). Minimal /tp so the
+            // walk-parity bot can drive Doppel exactly like vanilla.
+            let cmd = r.read_string(1024).context("command")?;
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            if parts.len() == 5 && parts[0] == "tp" && parts[1] == "@s" {
+                if let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[2].parse::<f64>(),
+                    parts[3].parse::<f64>(),
+                    parts[4].parse::<f64>(),
+                ) {
+                    state.x = x;
+                    state.y = y;
+                    state.z = z;
+                    // Mirror vanilla's teleport: position sync the client
+                    // must acknowledge, then stream around the new position.
+                    let mut sync = Vec::with_capacity(64);
+                    write_varint(&mut sync, state.teleport_id);
+                    sync.extend_from_slice(&x.to_be_bytes());
+                    sync.extend_from_slice(&y.to_be_bytes());
+                    sync.extend_from_slice(&z.to_be_bytes());
+                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta x
+                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta y
+                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta z
+                    sync.extend_from_slice(&state.yaw.to_be_bytes());
+                    sync.extend_from_slice(&state.pitch.to_be_bytes());
+                    sync.extend_from_slice(&0i32.to_be_bytes()); // relatives
+                    conn.write_packet(0x49, &sync)?;
+                    state.teleport_id += 1;
+                    stream_if_moved(conn, state, world, blobs)?;
+                }
+            }
+        }
         _ => {
             // movement-status-only (0x21), client_information, custom
             // payloads and everything else: tolerated, unhandled.
         }
     }
+    Ok(())
+}
+
+/// Vanilla's chunk-streaming choreography on view-center change, exactly as
+/// captured: cache center, forget leaving columns, then one batch of new
+/// chunks closed by batch_finished.
+fn stream_if_moved(
+    conn: &mut Conn<TcpStream>,
+    state: &mut PlayState,
+    world: Option<&SharedWorld>,
+    blobs: Option<&Blobs>,
+) -> Result<()> {
+    let (Some(world), Some(blobs)) = (world, blobs) else {
+        return Ok(());
+    };
+    let cx = state.x.floor().div_euclid(16.0) as i32;
+    let cz = state.z.floor().div_euclid(16.0) as i32;
+    if state.center == Some((cx, cz)) {
+        return Ok(());
+    }
+    state.center = Some((cx, cz));
+
+    // set_chunk_cache_center: VarInt chunkX, VarInt chunkZ
+    let mut center = Vec::new();
+    write_varint(&mut center, cx);
+    write_varint(&mut center, cz);
+    conn.write_packet(0x60, &center)?;
+
+    // View square around the new center.
+    const RADIUS: i32 = 4;
+    let desired: std::collections::HashSet<(i32, i32)> = (-RADIUS..=RADIUS)
+        .flat_map(move |dx| (-RADIUS..=RADIUS).map(move |dz| (cx + dx, cz + dz)))
+        .collect();
+
+    // forget_level_chunk for columns leaving view (packed chunk pos i64).
+    let leaving: Vec<(i32, i32)> = state.sent.difference(&desired).copied().collect();
+    for (x, z) in leaving {
+        let packed = ((x as i64 & 0x3ff_ffff) << 38) | ((z as i64 & 0x3ff_ffff) << 12);
+        conn.write_packet(0x26, &packed.to_be_bytes())?;
+        state.sent.remove(&(x, z));
+    }
+
+    // New columns in vanilla's observed order: nearest-first by ring.
+    let mut entering: Vec<(i32, i32)> = desired.difference(&state.sent).copied().collect();
+    entering.sort_by_key(|(x, z)| (x - cx).abs() + (z - cz).abs());
+    if entering.is_empty() {
+        return Ok(());
+    }
+    conn.write_packet(0x0c, &[])?; // batch start
+    let mut sent_now = 0u32;
+    for (x, z) in entering {
+        if let Some(chunk) = stream_chunk(world, x, z, blobs)? {
+            conn.write_packet(0x2e, &chunk.encode())?;
+            state.sent.insert((x, z));
+            sent_now += 1;
+        }
+    }
+    let mut finished = Vec::new();
+    write_varint(&mut finished, sent_now as i32);
+    conn.write_packet(0x0b, &finished)?; // batch finished: VarInt count
     Ok(())
 }
 

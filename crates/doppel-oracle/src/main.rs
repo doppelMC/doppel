@@ -51,6 +51,11 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Some("parity-walk") => {
+            if !parity::parity_walk()? {
+                std::process::exit(1);
+            }
+        }
         Some("parity-login") => {
             if !parity::parity_login()? {
                 std::process::exit(1);

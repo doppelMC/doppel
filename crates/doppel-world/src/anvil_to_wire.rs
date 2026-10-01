@@ -183,17 +183,37 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
     }
 }
 
+/// Converts a chunk vanilla never captured: canonical palette ordering,
+/// storage heightmaps and light, no verification reference. The world's
+/// default biome fills sections storage omits.
+pub fn convert_uncaptured(anvil: &Chunk, boot: &PaletteBootstrap) -> Result<WireChunk> {
+    let empty = WireChunk {
+        x: anvil.x,
+        z: anvil.z,
+        heightmaps: Vec::new(),
+        sections: Vec::new(),
+        block_entities: Vec::new(),
+        light: WireLight::default(),
+    };
+    convert_from_storage(anvil, &empty, boot)
+}
+
 fn convert_from_storage(
     anvil: &Chunk,
     reference: &WireChunk,
     boot: &PaletteBootstrap,
 ) -> Result<WireChunk> {
     let air = boot.blocks.get("minecraft:air").copied().unwrap_or(0);
+    let default_biome = boot
+        .biomes
+        .get("minecraft:plains")
+        .copied()
+        .unwrap_or_else(|| boot.biomes.values().next().copied().unwrap_or(0));
     let mut sections = Vec::with_capacity(24);
     let by_y: HashMap<i8, &Section> = anvil.sections.iter().map(|s| (s.y, s)).collect();
     for (i, y) in (-4..=19).enumerate() {
         let Some(sec) = by_y.get(&y).copied() else {
-            sections.push(empty_section(air, reference));
+            sections.push(empty_section(air, reference, default_biome));
             continue;
         };
         let ref_palette = reference
@@ -364,7 +384,7 @@ fn mask_bytes(bits: &[bool]) -> Vec<u8> {
     out
 }
 
-fn empty_section(air: u32, reference: &WireChunk) -> WireSection {
+fn empty_section(air: u32, reference: &WireChunk, default_biome: u32) -> WireSection {
     // Preserve the all-air section's biome from the reference (usually the
     // world's default biome as a single value).
     let biome = reference
@@ -374,7 +394,7 @@ fn empty_section(air: u32, reference: &WireChunk) -> WireSection {
             Container::Single(v) => Some(Container::Single(*v)),
             _ => None,
         })
-        .unwrap_or(Container::Single(0));
+        .unwrap_or(Container::Single(default_biome));
     WireSection {
         non_empty: 0,
         fluid: 0,
