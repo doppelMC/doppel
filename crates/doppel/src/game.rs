@@ -99,10 +99,21 @@ pub struct Game {
     registry: Option<doppel_world::registry::BlockRegistry>,
     /// Monotonic game tick.
     tick: u64,
-    /// Scheduled actions: fire at tick T.
-    scheduled: Vec<(u64, i32, i32, i32)>,
+    /// Scheduled actions: fire at tick T with a behavior tag.
+    scheduled: Vec<(u64, (i32, i32, i32), TickAction)>,
     /// Torch state change awaiting its 1gt delay.
     pending_torch: Option<((i32, i32, i32), u32)>,
+    /// Observers with a pending pulse (vanilla's hasScheduledTick guard).
+    pending_observers: std::collections::HashSet<(i32, i32, i32)>,
+}
+
+/// What a scheduled entry does when its tick arrives.
+#[derive(Clone, Copy)]
+pub enum TickAction {
+    /// Recompute redstone behavior at the position (neighbor notified).
+    NeighborUpdate,
+    /// Observer pulse edge: toggle powered, maybe chain the falling edge.
+    ObserverToggle,
 }
 
 /// Face offsets for the six neighbors.
@@ -147,6 +158,7 @@ impl Game {
             tick: 0,
             scheduled: Vec::new(),
             pending_torch: None,
+            pending_observers: std::collections::HashSet::new(),
         }
     }
 
@@ -201,15 +213,18 @@ impl Game {
             self.set_block(x, y, z, state, true);
         }
         // Fire scheduled redstone actions due this tick.
-        let due: Vec<(i32, i32, i32)> = self
+        let due: Vec<((i32, i32, i32), TickAction)> = self
             .scheduled
             .iter()
-            .filter(|(t, _, _, _)| *t <= self.tick)
-            .map(|(_, x, y, z)| (*x, *y, *z))
+            .filter(|(t, _, _)| *t <= self.tick)
+            .map(|(_, pos, action)| (*pos, *action))
             .collect();
-        self.scheduled.retain(|(t, _, _, _)| *t > self.tick);
-        for (x, y, z) in due {
-            self.update_block(x, y, z);
+        self.scheduled.retain(|(t, _, _)| *t > self.tick);
+        for ((x, y, z), action) in due {
+            match action {
+                TickAction::NeighborUpdate => self.update_block(x, y, z),
+                TickAction::ObserverToggle => self.observer_toggle(x, y, z),
+            }
         }
     }
 
@@ -399,9 +414,14 @@ impl Game {
             .push((idx as u64, state));
         if notify {
             for (dx, dy, dz) in NEIGHBORS {
-                self.scheduled.push((self.tick, x + dx, y + dy, z + dz));
+                self.scheduled.push((
+                    self.tick,
+                    (x + dx, y + dy, z + dz),
+                    TickAction::NeighborUpdate,
+                ));
             }
-            self.scheduled.push((self.tick, x, y, z));
+            self.scheduled
+                .push((self.tick, (x, y, z), TickAction::NeighborUpdate));
         }
     }
 
@@ -422,6 +442,7 @@ impl Game {
             "minecraft:redstone_torch" | "minecraft:redstone_wall_torch" => {
                 self.update_torch(x, y, z, &name, &props)
             }
+            "minecraft:observer" => self.update_observer(x, y, z, &props),
             _ => {}
         }
     }
@@ -490,6 +511,51 @@ impl Game {
             return;
         };
         self.pending_torch = Some(((x, y, z), new_state));
+    }
+
+    /// Observer trigger (vanilla updateShape + startSignal): when an
+    /// unpowered observer's watched position changes, schedule its pulse
+    /// 2gt out — unless one is already pending (hasScheduledTick guard).
+    fn update_observer(&mut self, x: i32, y: i32, z: i32, props: &str) {
+        if props.contains("powered=true") {
+            return;
+        }
+        if self.pending_observers.contains(&(x, y, z)) {
+            return;
+        }
+        self.pending_observers.insert((x, y, z));
+        self.scheduled
+            .push((self.tick + 2, (x, y, z), TickAction::ObserverToggle));
+    }
+
+    /// Observer pulse edge (vanilla tick): rising sets powered and chains
+    /// the falling edge 2gt later; falling clears it. Both notify the
+    /// block behind (opposite the facing).
+    fn observer_toggle(&mut self, x: i32, y: i32, z: i32) {
+        self.pending_observers.remove(&(x, y, z));
+        let Some((name, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        if name != "minecraft:observer" {
+            return;
+        }
+        let powered = props.contains("powered=true");
+        let new_props = doppel_world::registry::BlockRegistry::with_prop(
+            &props,
+            "powered",
+            if powered { "false" } else { "true" },
+        );
+        let spec = format!("{name}[{new_props}]");
+        let Some(new_state) = self.resolve_state(&spec) else {
+            return;
+        };
+        self.set_block(x, y, z, new_state, true);
+        if !powered {
+            // Chain the falling edge.
+            self.pending_observers.insert((x, y, z));
+            self.scheduled
+                .push((self.tick + 2, (x, y, z), TickAction::ObserverToggle));
+        }
     }
 
     fn tick_keep_alives(&mut self) {

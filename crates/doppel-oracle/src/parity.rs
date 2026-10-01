@@ -778,7 +778,11 @@ pub fn parity_redstone() -> Result<bool> {
         "setblock 14 100 10 minecraft:redstone_wire",
         "setblock 15 100 10 minecraft:redstone_torch",
         "setblock 10 100 10 minecraft:lever[face=floor,powered=true]",
-        "tick step 6",
+        "setblock 20 100 10 minecraft:observer[facing=east]",
+        "setblock 21 100 10 minecraft:redstone_wire",
+        "setblock 19 100 10 minecraft:stone",
+        "setblock 19 100 10 minecraft:oak_planks",
+        "tick step 10",
     ]
     .iter()
     .map(|s| s.to_string())
