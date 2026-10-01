@@ -306,6 +306,10 @@ pub fn parity_login() -> Result<bool> {
                 );
                 println!("  re  : {:02x?}", &re[pos..(pos + 12).min(re.len())]);
                 println!("  wire: {:02x?}", &orig[pos..(pos + 12).min(orig.len())]);
+                if wire.x == -1 && wire.z == 0 {
+                    println!("  wire sec0: {:?}", wire.sections.first());
+                    println!("  anvil sec0: {:?}", anvil.sections.first());
+                }
             }
         }
         println!(
