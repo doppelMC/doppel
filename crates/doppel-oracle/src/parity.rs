@@ -778,6 +778,8 @@ pub fn parity_redstone() -> Result<bool> {
         "setblock 14 100 10 minecraft:redstone_wire",
         "setblock 15 100 10 minecraft:redstone_torch",
         "setblock 10 100 10 minecraft:lever[face=floor,powered=true]",
+        "setblock 16 100 10 minecraft:repeater[facing=west,delay=1]",
+        "setblock 17 100 10 minecraft:redstone_wire",
         "setblock 20 100 10 minecraft:observer[facing=east]",
         "setblock 21 100 10 minecraft:redstone_wire",
         "setblock 19 100 10 minecraft:stone",

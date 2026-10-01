@@ -105,6 +105,8 @@ pub struct Game {
     pending_torch: Option<((i32, i32, i32), u32)>,
     /// Observers with a pending pulse (vanilla's hasScheduledTick guard).
     pending_observers: std::collections::HashSet<(i32, i32, i32)>,
+    /// Repeaters with a pending toggle (vanilla's willTickThisTick guard).
+    pending_repeaters: std::collections::HashSet<(i32, i32, i32)>,
 }
 
 /// What a scheduled entry does when its tick arrives.
@@ -114,6 +116,8 @@ pub enum TickAction {
     NeighborUpdate,
     /// Observer pulse edge: toggle powered, maybe chain the falling edge.
     ObserverToggle,
+    /// Repeater output edge: apply the scheduled input change.
+    RepeaterToggle,
 }
 
 /// Face offsets for the six neighbors.
@@ -159,6 +163,7 @@ impl Game {
             scheduled: Vec::new(),
             pending_torch: None,
             pending_observers: std::collections::HashSet::new(),
+            pending_repeaters: std::collections::HashSet::new(),
         }
     }
 
@@ -224,6 +229,7 @@ impl Game {
             match action {
                 TickAction::NeighborUpdate => self.update_block(x, y, z),
                 TickAction::ObserverToggle => self.observer_toggle(x, y, z),
+                TickAction::RepeaterToggle => self.repeater_toggle(x, y, z),
             }
         }
     }
@@ -443,6 +449,7 @@ impl Game {
                 self.update_torch(x, y, z, &name, &props)
             }
             "minecraft:observer" => self.update_observer(x, y, z, &props),
+            "minecraft:repeater" => self.update_repeater(x, y, z, &props),
             _ => {}
         }
     }
@@ -555,6 +562,121 @@ impl Game {
             self.pending_observers.insert((x, y, z));
             self.scheduled
                 .push((self.tick + 2, (x, y, z), TickAction::ObserverToggle));
+        }
+    }
+
+    /// Repeater input: power at the block on its facing side (vanilla
+    /// getInputSignal reads pos.relative(FACING)).
+    fn repeater_input(&self, x: i32, y: i32, z: i32, facing: &str) -> i32 {
+        let (dx, dz) = match facing {
+            "north" => (0, -1),
+            "south" => (0, 1),
+            "west" => (-1, 0),
+            "east" => (1, 0),
+            _ => (0, 0),
+        };
+        if (dx, dz) == (0, 0) {
+            return 0;
+        }
+        // Direct source at the input position.
+        if let Some((n, p)) = self.get_block(x + dx, y, z + dz) {
+            match n.as_str() {
+                "minecraft:redstone_wire" => {
+                    return doppel_world::registry::BlockRegistry::prop_int(&p, "power")
+                        .unwrap_or(0);
+                }
+                "minecraft:lever" if p.contains("powered=true") => return 15,
+                "minecraft:repeater" if p.contains("powered=true") => return 15,
+                _ => {}
+            }
+        }
+        0
+    }
+
+    /// Repeater locked: powered from a perpendicular side (vanilla isLocked).
+    fn repeater_locked(&self, x: i32, y: i32, z: i32, facing: &str) -> bool {
+        let sides: [(i32, i32); 2] = match facing {
+            "north" | "south" => [(1, 0), (-1, 0)],
+            _ => [(0, 1), (0, -1)],
+        };
+        for (dx, dz) in sides {
+            if let Some((n, p)) = self.get_block(x + dx, y, z + dz) {
+                let powered = match n.as_str() {
+                    "minecraft:redstone_wire" => {
+                        doppel_world::registry::BlockRegistry::prop_int(&p, "power").unwrap_or(0)
+                            > 0
+                    }
+                    "minecraft:lever" => p.contains("powered=true"),
+                    "minecraft:repeater" => p.contains("powered=true"),
+                    _ => false,
+                };
+                if powered {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// checkTickOnNeighbor: schedule the output change at delay*2 ticks
+    /// when the desired state differs (vanilla's willTickThisTick guard).
+    fn update_repeater(&mut self, x: i32, y: i32, z: i32, props: &str) {
+        if props.contains("locked=true") {
+            return;
+        }
+        let facing = prop_dir(props);
+        let should_on = self.repeater_input(x, y, z, facing) > 0;
+        let on = props.contains("powered=true");
+        if on != should_on && !self.pending_repeaters.contains(&(x, y, z)) {
+            let delay = doppel_world::registry::BlockRegistry::prop_int(props, "delay")
+                .unwrap_or(1)
+                .clamp(1, 4) as u64;
+            self.pending_repeaters.insert((x, y, z));
+            self.scheduled
+                .push((self.tick + delay * 2, (x, y, z), TickAction::RepeaterToggle));
+        }
+    }
+
+    /// Repeater tick edge (vanilla DiodeBlock.tick): turn off, or turn on
+    /// and chain a turn-off for short pulses.
+    fn repeater_toggle(&mut self, x: i32, y: i32, z: i32) {
+        self.pending_repeaters.remove(&(x, y, z));
+        let Some((name, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        if name != "minecraft:repeater" {
+            return;
+        }
+        if self.repeater_locked(x, y, z, prop_dir(&props)) {
+            return;
+        }
+        let should_on = self.repeater_input(x, y, z, prop_dir(&props)) > 0;
+        let on = props.contains("powered=true");
+        let new_powered = if on && !should_on {
+            false
+        } else if !on {
+            true
+        } else {
+            return;
+        };
+        let new_props = doppel_world::registry::BlockRegistry::with_prop(
+            &props,
+            "powered",
+            if new_powered { "true" } else { "false" },
+        );
+        let spec = format!("{name}[{new_props}]");
+        let Some(new_state) = self.resolve_state(&spec) else {
+            return;
+        };
+        self.set_block(x, y, z, new_state, true);
+        if new_powered && !should_on {
+            // Short pulse: chain the turn-off at the same delay.
+            let delay = doppel_world::registry::BlockRegistry::prop_int(&props, "delay")
+                .unwrap_or(1)
+                .clamp(1, 4) as u64;
+            self.pending_repeaters.insert((x, y, z));
+            self.scheduled
+                .push((self.tick + delay * 2, (x, y, z), TickAction::RepeaterToggle));
         }
     }
 
@@ -834,4 +956,16 @@ pub fn get_section_cell(chunk: &WireChunk, section: usize, idx: usize) -> Option
             Some(((long >> shift) & mask) as u32)
         }
     }
+}
+
+/// Reads the facing= direction from a props string (default north).
+fn prop_dir(props: &str) -> &str {
+    for pair in props.split(',') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "facing" {
+                return v;
+            }
+        }
+    }
+    "north"
 }
