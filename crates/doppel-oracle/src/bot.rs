@@ -91,36 +91,31 @@ pub struct CapturedPacket {
 }
 
 /// Serverbound Client Information body for the configuration state:
-/// locale, view distance, chat mode, chat colors, skin parts, main hand,
-/// text filtering, server listings. Candidate layout; the oracle's
-/// decoder errors will correct any field that drifted.
-/// Unused while the Login Acknowledged probe runs; returns next iteration.
-#[allow(dead_code)]
+/// locale, view distance, chat visibility, chat colors, model customisation
+/// bitmask, main hand, text filtering, server listings, particle status.
 pub fn client_information_body() -> Vec<u8> {
     let mut b = Vec::new();
     doppel_protocol::write_string(&mut b, "en_US");
     b.push(8); // view distance
-    doppel_protocol::write_varint(&mut b, 0); // chat mode: enabled
+    doppel_protocol::write_varint(&mut b, 0); // chat visibility: full
     b.push(0x01); // chat colors: true
-    b.push(0x7f); // all skin parts visible
+    b.push(0x7f); // model customisation: all layers
     doppel_protocol::write_varint(&mut b, 1); // main hand: right
     b.push(0x00); // text filtering: off
     b.push(0x01); // allow server listings: true
+    doppel_protocol::write_varint(&mut b, 0); // particle status: all
     b
 }
 
 /// Connects as an offline-mode login client and records every packet the
-/// server sends from the moment of login until the stream goes idle.
-/// Confirmed choreography: after Login Success the client sends an empty
-/// Login Acknowledged (config id 0x03); vanilla replies with brand +
-/// Known Packs request (S->C 0x0f); the client must then answer Known
-/// Packs — `known_packs_probe` is the (id, body) candidate for that reply.
+/// server sends, driving the full confirmed choreography — login, ack,
+/// client information, known packs, finish configuration — into the PLAY
+/// state, capturing the join sequence.
 pub fn login_capture(
     host: &str,
     port: u16,
     protocol: i32,
     login_start_body: &[u8],
-    known_packs_probe: (i32, Vec<u8>),
     idle_timeout: Duration,
     max_packets: usize,
 ) -> Result<Vec<CapturedPacket>> {
@@ -147,6 +142,7 @@ pub fn login_capture(
     let mut compression_on = false;
     let mut config_started = false;
     let mut packs_answered = false;
+    let mut play_started = false;
     let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
@@ -175,23 +171,29 @@ pub fn login_capture(
             compression_on = true;
             note = Some(format!("set compression threshold={threshold}"));
         }
-        // After Login Success the connection enters the configuration
-        // state: the client confirms with an empty Login Acknowledged
-        // (serverbound config 0x03 — oracle-confirmed).
+        // Login Success -> client confirms the configuration transition with
+        // an empty Login Acknowledged (LOGIN-state serverbound 0x03), then
+        // volunteers its Client Information (serverbound config 0x00).
         if !config_started && id == 0x02 {
-            conn.write_packet(0x03, &[])?;
+            conn.write_packet(0x03, &[])?; // login_acknowledged (login state)
+            conn.write_packet(0x00, &client_information_body())?; // config state
             config_started = true;
-            note = Some("login success; sent login acknowledged (0x03)".into());
+            note = Some("login success; acked + sent client information".into());
         }
-        // Known Packs request (S->C 0x0f): answer with the probe candidate
-        // (expected: an array of pack entries; empty array = send everything).
+        // Known Packs request (S->C 0x0f): reply serverbound config 0x07
+        // with an empty array = "send me everything with full NBT".
         if !packs_answered && config_started && id == 0x0f {
-            conn.write_packet(known_packs_probe.0, &known_packs_probe.1)?;
+            conn.write_packet(0x07, &[0x00])?;
             packs_answered = true;
-            note = Some(format!(
-                "known packs request; probed reply id 0x{:02x}",
-                known_packs_probe.0
-            ));
+            note = Some("known packs request; replied empty list".into());
+        }
+        // Finish Configuration (S->C 0x03, empty, config state): the server
+        // sends first and waits for our empty serverbound 0x03 reply, after
+        // which the connection enters the PLAY state.
+        if packs_answered && !play_started && id == 0x03 && body.is_empty() {
+            conn.write_packet(0x03, &[])?;
+            play_started = true;
+            note = Some("finish configuration; acked — entering play state".into());
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.

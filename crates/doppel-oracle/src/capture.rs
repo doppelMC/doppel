@@ -41,47 +41,25 @@ pub fn run(out_path: &Path) -> Result<()> {
     // before anything else. Empty body under each candidate id: the true
     // ack id survives (idle-wait or a registry burst), everything else
     // closes silently.
-    // Probe the Known Packs reply: Login Acknowledged is confirmed (0x03
-    // empty); vanilla's next wait point is its Known Packs request (S->C
-    // 0x0f). Candidate replies: empty array body (VarInt 0) under each
-    // serverbound id. The true id unlocks the registry burst.
-    struct Probe {
-        label: String,
-        login: Vec<u8>,
-        packs_reply: (i32, Vec<u8>),
-    }
+    // Full confirmed choreography, no more probing: the bot drives login ->
+    // configuration -> play and captures everything, including the join
+    // sequence. Longer idle for the play-state burst.
     let login_body = login_start_c("Doppel");
-    let empty_array = vec![0x00]; // VarInt count = 0
-    let variants: Vec<Probe> = (0x00..=0x0a)
-        .map(|id| Probe {
-            label: format!("packs0x{id:02x}"),
-            login: login_body.clone(),
-            packs_reply: (id, empty_array.clone()),
-        })
-        .collect();
-
     let mut lines: Vec<String> = Vec::new();
-    for probe in &variants {
-        let packets = bot::login_capture(
-            "127.0.0.1",
-            VANILLA_PORT,
-            pin.protocol.unwrap_or(0),
-            &probe.login,
-            probe.packs_reply.clone(),
-            Duration::from_secs(5),
-            120,
-        )
-        .with_context(|| format!("capturing variant {}", probe.label))?;
-        println!(
-            "[oracle] variant {}: {} packets",
-            probe.label,
-            packets.len()
-        );
-        for p in &packets {
-            let mut obj = serde_json::to_value(p)?;
-            obj["variant"] = serde_json::json!(probe.label);
-            lines.push(obj.to_string());
-        }
+    let packets = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        pin.protocol.unwrap_or(0),
+        &login_body,
+        Duration::from_secs(8),
+        160,
+    )
+    .context("capturing full login transcript")?;
+    println!("[oracle] full transcript: {} packets", packets.len());
+    for p in &packets {
+        let mut obj = serde_json::to_value(p)?;
+        obj["variant"] = serde_json::json!("full");
+        lines.push(obj.to_string());
     }
     drop(server); // teardown
 
@@ -91,9 +69,8 @@ pub fn run(out_path: &Path) -> Result<()> {
     let text = lines.join("\n") + "\n";
     std::fs::write(out_path, &text).with_context(|| format!("writing {}", out_path.display()))?;
     println!(
-        "[oracle] captured {} packets across {} variants -> {}",
+        "[oracle] captured {} packets (login through play) -> {}",
         lines.len(),
-        variants.len(),
         out_path.display()
     );
     Ok(())
