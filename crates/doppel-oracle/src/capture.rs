@@ -18,6 +18,7 @@ pub fn run(out_path: &Path) -> Result<()> {
     let packets = bot::login_capture(
         "127.0.0.1",
         VANILLA_PORT,
+        pin.protocol.unwrap_or(0),
         "Doppel",
         Duration::from_secs(10),
         300,

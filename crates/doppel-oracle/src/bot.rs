@@ -96,6 +96,7 @@ pub struct CapturedPacket {
 pub fn login_capture(
     host: &str,
     port: u16,
+    protocol: i32,
     username: &str,
     idle_timeout: Duration,
     max_packets: usize,
@@ -108,8 +109,9 @@ pub fn login_capture(
     let mut conn = Conn::new(stream);
 
     // Handshake (packet 0x00) with next_state=2 (login), sent raw.
+    // Unlike status pings, vanilla validates the protocol number here.
     let mut hs = Vec::new();
-    doppel_protocol::write_varint(&mut hs, 0);
+    doppel_protocol::write_varint(&mut hs, protocol);
     doppel_protocol::write_string(&mut hs, host);
     hs.extend_from_slice(&port.to_be_bytes());
     doppel_protocol::write_varint(&mut hs, 2);
