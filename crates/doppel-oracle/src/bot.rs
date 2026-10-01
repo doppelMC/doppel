@@ -179,6 +179,7 @@ pub fn login_capture(
     let walk = opts.walk_chunks;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
+    let mut walk_base: Option<(f64, f64, f64)> = None;
     let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
@@ -238,6 +239,24 @@ pub fn login_capture(
         if play_started && id == 0x2d {
             conn.write_packet(0x1c, &body)?;
         }
+        // player_position (S->C 0x49, the join teleport): the client MUST
+        // acknowledge it (serverbound 0x00 accept_teleportation) before the
+        // server accepts any movement or chat from the player. Its
+        // coordinates become the walk's starting point.
+        if play_started && id == 0x49 && body.len() >= 4 {
+            let mut r = Reader::new(&body);
+            let teleport_id = r.read_varint().context("teleport id")?;
+            let x = r.read_f64().context("teleport x")?;
+            let y = r.read_f64().context("teleport y")?;
+            let z = r.read_f64().context("teleport z")?;
+            let mut ack = Vec::new();
+            doppel_protocol::write_varint(&mut ack, teleport_id);
+            conn.write_packet(0x00, &ack)?;
+            walk_base = Some((x, y, z));
+            note = Some(format!(
+                "teleport ({x:.1},{y:.1},{z:.1}) id={teleport_id}: acked"
+            ));
+        }
         // Once the chunk batch closes, run any scripted commands (unsigned
         // chat_command: serverbound play 0x07, body = the command string).
         if play_started && commands_pending && id == 0x0b {
@@ -256,22 +275,22 @@ pub fn login_capture(
         }
         // Walk pacing: one move_player_pos (0x1e: f64 x3 + flags u8) per
         // 400ms once walking has begun, crossing one chunk per step.
-        if let Some(steps) = walk {
+        if let (Some(steps), Some((bx, by, bz))) = (walk, walk_base) {
             if play_started
                 && !commands_pending
                 && steps_done < steps
                 && last_walk_at.elapsed() >= Duration::from_millis(400)
             {
-                let x = 8.5 + (steps_done as f64 + 1.0) * 16.0;
+                let x = bx + (steps_done as f64 + 1.0) * 16.0;
                 let mut mv = Vec::with_capacity(25);
                 mv.extend_from_slice(&x.to_be_bytes());
-                mv.extend_from_slice(&(-59.0f64).to_be_bytes());
-                mv.extend_from_slice(&8.5f64.to_be_bytes());
+                mv.extend_from_slice(&by.to_be_bytes());
+                mv.extend_from_slice(&bz.to_be_bytes());
                 mv.push(0x01); // on ground
                 conn.write_packet(0x1e, &mv)?;
                 steps_done += 1;
                 last_walk_at = std::time::Instant::now();
-                note = Some(format!("walk step {steps_done}: x={x}"));
+                note = Some(format!("walk step {steps_done}: x={x:.1}"));
             }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
