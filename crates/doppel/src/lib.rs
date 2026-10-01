@@ -3,6 +3,7 @@
 //! captured from the vanilla oracle.
 
 pub mod blobs;
+pub mod game;
 
 use anyhow::{bail, Context, Result};
 use blobs::Blobs;

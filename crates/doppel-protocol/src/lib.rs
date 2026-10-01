@@ -375,6 +375,38 @@ pub fn save_pin(pin: &Pin) -> Result<()> {
     std::fs::write(&path, text + "\n").with_context(|| format!("writing {}", path.display()))
 }
 
+/// Encodes a complete wire frame (length prefix + optional zlib compression)
+/// without a `Conn` — for writer threads that own only a stream clone.
+/// Mirrors `Conn::write_packet` byte-for-byte.
+pub fn encode_frame(threshold: Option<i32>, id: i32, body: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(body.len() + 5);
+    write_varint(&mut payload, id);
+    payload.extend_from_slice(body);
+    let frame: Vec<u8> = match threshold {
+        Some(t) if payload.len() as i32 >= t => {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&payload).expect("in-memory zlib write");
+            let z = enc.finish().expect("in-memory zlib finish");
+            let mut f = Vec::with_capacity(z.len() + 5);
+            write_varint(&mut f, payload.len() as i32);
+            f.extend_from_slice(&z);
+            f
+        }
+        Some(_) => {
+            let mut f = Vec::with_capacity(payload.len() + 1);
+            write_varint(&mut f, 0);
+            f.extend_from_slice(&payload);
+            f
+        }
+        None => payload,
+    };
+    let mut out = Vec::with_capacity(frame.len() + 5);
+    write_varint(&mut out, frame.len() as i32);
+    out.extend_from_slice(&frame);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
