@@ -311,6 +311,21 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     return Some(game::Inbound::Tp { conn, x, y, z });
                 }
             }
+            if parts.len() == 5 && parts[0] == "setblock" {
+                if let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[1].parse::<i32>(),
+                    parts[2].parse::<i32>(),
+                    parts[3].parse::<i32>(),
+                ) {
+                    return Some(game::Inbound::Setblock {
+                        conn,
+                        x,
+                        y,
+                        z,
+                        name: parts[4].to_string(),
+                    });
+                }
+            }
             None
         }
         _ => None,

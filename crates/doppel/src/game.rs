@@ -42,6 +42,14 @@ pub enum Inbound {
         conn: ConnId,
         id: i64,
     },
+    /// `setblock x y z <name>` (state id resolved from the learned table).
+    Setblock {
+        conn: ConnId,
+        x: i32,
+        y: i32,
+        z: i32,
+        name: String,
+    },
     Left {
         conn: ConnId,
     },
@@ -192,6 +200,13 @@ impl Game {
                     }
                 }
             }
+            Inbound::Setblock {
+                conn,
+                x,
+                y,
+                z,
+                name,
+            } => self.setblock(conn, x, y, z, name),
             Inbound::Left { conn } => {
                 let Some(p) = self.players.remove(&conn) else {
                     return;
@@ -203,6 +218,65 @@ impl Game {
                     }
                 }
             }
+        }
+    }
+
+    /// Known block-state ids (palette-learned + setblock-probed). The
+    /// registry extraction replaces this table eventually.
+    fn state_id(name: &str) -> Option<u32> {
+        Some(match name {
+            "minecraft:air" => 0,
+            "minecraft:stone" => 1,
+            "minecraft:dirt" => 10,
+            "minecraft:grass_block" => 9,
+            "minecraft:bedrock" => 88,
+            "minecraft:oak_planks" => 15,
+            _ => return None,
+        })
+    }
+
+    /// The first world write: mutate the cached chunk's section, bump its
+    /// version, and broadcast one section_blocks_update (0x56) to every
+    /// viewer - exactly vanilla's batching (one packet per section per tick).
+    fn setblock(&mut self, _conn: ConnId, x: i32, y: i32, z: i32, name: String) {
+        let Some(state) = Self::state_id(&name) else {
+            eprintln!("[game] setblock: unknown block {name}");
+            return;
+        };
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        let sec_index = (y.div_euclid(16) + 4) as usize; // array index: y=-64 is section 0
+        let lx = x.rem_euclid(16) as u64;
+        let ly = y.rem_euclid(16) as u64;
+        let lz = z.rem_euclid(16) as u64;
+        let local: usize = ((lx << 8) | (lz << 4) | ly) as usize;
+
+        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+            return;
+        };
+        if self.load_chunk(&world, &blobs, cx, cz).is_err() {
+            eprintln!("[game] setblock: chunk ({cx},{cz}) unavailable");
+            return;
+        }
+        let chunk = self.chunks.get_mut(&(cx, cz)).expect("loaded");
+        if !set_section_cell(&mut chunk.wire, sec_index, local, state) {
+            eprintln!("[game] setblock: section {sec_index} not mutable");
+            return;
+        }
+        chunk.version += 1;
+
+        // section_blocks_update: sectionPos i64 + count VarInt + VarLongs.
+        let sec_pos = (((cx as i64) & 0x3f_ffff) << 42)
+            | (((cz as i64) & 0x3f_ffff) << 20)
+            | (((y.div_euclid(16)) as i64) & 0xf_ffff);
+        let change = ((state as u64) << 12) | local as u64;
+        let mut body = Vec::with_capacity(24);
+        body.extend_from_slice(&sec_pos.to_be_bytes());
+        doppel_protocol::write_varint(&mut body, 1);
+        write_u64_varlong(&mut body, change);
+        let viewers: Vec<ConnId> = self.viewers.get(&(cx, cz)).cloned().unwrap_or_default();
+        for v in viewers {
+            self.send(v, 0x56, &body);
         }
     }
 
@@ -350,5 +424,109 @@ impl Game {
             slot.insert(CachedChunk { wire, version: 0 });
         }
         Ok(self.chunks.get(&(cx, cz)).expect("present: occupied above"))
+    }
+}
+
+/// Writes a protocol VarLong (7 bits per byte, continuation bit 0x80).
+fn write_u64_varlong(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Sets one cell (local pos, (x<<8)|(z<<4)|y) in a section's block-state
+/// container, repacking storage when the palette grows. Returns false for
+/// direct/global containers (unsupported mutation, rare above ground).
+pub fn set_section_cell(chunk: &mut WireChunk, section: usize, idx: usize, state: u32) -> bool {
+    use doppel_world::chunk_codec::Container;
+    let Some(sec) = chunk.sections.get_mut(section) else {
+        return false;
+    };
+    match &mut sec.block_states {
+        Container::Single(v) => {
+            if *v == state {
+                return true;
+            }
+            let old = *v;
+            let bits = 4usize;
+            let per_long = 64 / bits;
+            let mut longs = vec![0u64; 4096usize / per_long];
+            for i in 0..4096 {
+                let cell = if i == idx { 1u64 } else { 0 };
+                longs[i / per_long] |= cell << ((i % per_long) * bits);
+            }
+            if state != 0 {
+                sec.non_empty += 1;
+            }
+            sec.block_states = Container::Palette {
+                bits: bits as u8,
+                entries: vec![old, state],
+                longs,
+            };
+            true
+        }
+        Container::Palette {
+            entries,
+            longs,
+            bits,
+        } => {
+            let per_long = 64 / *bits as usize;
+            let mask = (1u64 << *bits as usize) - 1;
+            let mut cells = vec![0u32; 4096];
+            for (i, cell) in cells.iter_mut().enumerate() {
+                let long = longs.get(i / per_long).copied().unwrap_or(0);
+                let shift = (i % per_long) * *bits as usize;
+                *cell = entries
+                    .get(((long >> shift) & mask) as usize)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            let old = cells[idx];
+            if old == state {
+                return true;
+            }
+            let was_air = old == 0;
+            let now_air = state == 0;
+            sec.non_empty = match (was_air, now_air) {
+                (true, false) => sec.non_empty.saturating_add(1),
+                (false, true) => sec.non_empty.saturating_sub(1),
+                _ => sec.non_empty,
+            };
+            cells[idx] = state;
+            let mut new_entries: Vec<u32> = Vec::new();
+            let mut index_of = std::collections::HashMap::new();
+            for c in &cells {
+                if !index_of.contains_key(c) {
+                    index_of.insert(*c, new_entries.len() as u16);
+                    new_entries.push(*c);
+                }
+            }
+            let mut new_bits = 4usize;
+            while (1usize << new_bits) < new_entries.len() {
+                new_bits += 1;
+            }
+            if new_bits > 8 {
+                return false;
+            }
+            let per = 64 / new_bits;
+            let mut new_longs = vec![0u64; 4096usize.div_ceil(per)];
+            for (i, c) in cells.iter().enumerate() {
+                let v = u64::from(index_of[c]);
+                new_longs[i / per] |= v << ((i % per) * new_bits);
+            }
+            *entries = new_entries;
+            *bits = new_bits as u8;
+            *longs = new_longs;
+            true
+        }
+        Container::Global { .. } => false,
     }
 }
