@@ -137,6 +137,8 @@ pub struct Game {
     /// progress 0 -> 2 in halves (0.0, 0.5, 1.0), landing on the tick the
     /// entry sees progress >= 1.0.
     moving: Vec<MovingPiston>,
+    /// Comparator stored output (vanilla ComparatorBlockEntity OutputSignal).
+    comparator_outputs: std::collections::HashMap<(i32, i32, i32), i32>,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -174,6 +176,7 @@ pub enum PendingKind {
     Torch,
     Observer,
     Repeater,
+    Comparator,
 }
 
 /// What a scheduled entry does when its tick arrives.
@@ -185,6 +188,7 @@ pub enum TickAction {
     ObserverToggle,
     /// Repeater output edge: apply the scheduled input change.
     RepeaterToggle,
+    ComparatorToggle,
 }
 
 /// Face offsets for the six neighbors.
@@ -196,6 +200,9 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
     (0, 0, 1),
     (0, 0, -1),
 ];
+
+#[path = "comparator.rs"]
+mod comparator;
 
 const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -232,6 +239,7 @@ impl Game {
             flat: None,
             block_events: Vec::new(),
             moving: Vec::new(),
+            comparator_outputs: std::collections::HashMap::new(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -313,6 +321,7 @@ impl Game {
                 TickAction::NeighborUpdate => self.update_block(x, y, z),
                 TickAction::ObserverToggle => self.observer_toggle(x, y, z),
                 TickAction::RepeaterToggle => self.repeater_toggle(x, y, z),
+                TickAction::ComparatorToggle => self.comparator_toggle(x, y, z),
             }
         }
         // Vanilla's broadcast point (`ServerChunkCache.tick` inside
@@ -599,6 +608,7 @@ impl Game {
             }
             "minecraft:observer" => self.update_observer(x, y, z, &props),
             "minecraft:repeater" => self.update_repeater(x, y, z, &props),
+            "minecraft:comparator" => self.update_comparator(x, y, z, &props),
             "minecraft:piston" | "minecraft:sticky_piston" => self.update_piston(x, y, z),
             // The head forwards neighbor updates to its base
             // (`PistonHeadBlock.neighborChanged`).
