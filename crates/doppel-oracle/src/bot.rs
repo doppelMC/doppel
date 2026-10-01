@@ -91,13 +91,14 @@ pub struct CapturedPacket {
 
 /// Connects as an offline-mode login client and records every packet the
 /// server sends from the moment of login until the stream goes idle.
-/// This is protocol discovery: the transcript tells us the exact packet
-/// sequence vanilla 26.3 uses, which we then implement.
+/// `login_start_body` is the pre-built serverbound `minecraft:hello` body —
+/// the caller decides the field layout to probe (this is how the capture
+/// discovers the exact 26.3 encoding).
 pub fn login_capture(
     host: &str,
     port: u16,
     protocol: i32,
-    username: &str,
+    login_start_body: &[u8],
     idle_timeout: Duration,
     max_packets: usize,
 ) -> Result<Vec<CapturedPacket>> {
@@ -117,11 +118,8 @@ pub fn login_capture(
     doppel_protocol::write_varint(&mut hs, 2);
     conn.write_packet(0x00, &hs)?;
 
-    // Login Start (packet 0x00): username + no UUID (boolean false).
-    let mut ls = Vec::new();
-    doppel_protocol::write_string(&mut ls, username);
-    ls.push(0x00);
-    conn.write_packet(0x00, &ls)?;
+    // Login Start (packet 0x00) with the caller's field layout.
+    conn.write_packet(0x00, login_start_body)?;
 
     let mut packets = Vec::new();
     let mut compression_on = false;
