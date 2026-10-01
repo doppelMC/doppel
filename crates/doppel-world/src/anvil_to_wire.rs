@@ -33,6 +33,17 @@ pub fn unpack(longs: &[u64], bits: usize, count: usize) -> Vec<u16> {
     out
 }
 
+/// Packs values into SimpleBitStorage (the inverse of `unpack`).
+pub fn pack(cells: &[u16], bits: usize) -> Vec<u64> {
+    let per_long = 64 / bits.max(1);
+    let mut longs = vec![0u64; cells.len().div_ceil(per_long)];
+    for (i, &v) in cells.iter().enumerate() {
+        let shift = (i % per_long) * bits;
+        longs[i / per_long] |= u64::from(v) << shift;
+    }
+    longs
+}
+
 /// Wire palette bits per vanilla rules, per container kind: blocks start at
 /// 4 bits and stay indirect up to 8; biomes start at 1 and stay indirect up
 /// to 3. Larger palettes would require DIRECT conversion (global ids in the
@@ -194,6 +205,16 @@ fn empty_section(air: u32, reference: &WireChunk) -> WireSection {
     }
 }
 
+/// Disk storage bit width: same SimpleBitStorage conventions as the wire,
+/// minimum 4 bits.
+fn anvil_disk_bits(len: usize) -> usize {
+    let mut bits = 4usize;
+    while (1 << bits) < len {
+        bits += 1;
+    }
+    bits
+}
+
 fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<WireSection> {
     let (block_states, non_empty, fluid) = match &sec.block_states {
         None => (Container::Single(air), 0, 0),
@@ -214,7 +235,6 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                         .with_context(|| format!("no global id learned for {}", p.name()))
                 })
                 .collect::<Result<_>>()?;
-            let bits = palette_bits(ids.len(), ContainerKind::Blocks)?;
             match (&bs.data, ids.len()) {
                 (None, 1) => {
                     let id = ids[0];
@@ -222,28 +242,52 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
                     (Container::Single(id), non_empty, 0)
                 }
                 (Some(data), n) if n > 1 => {
-                    let longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
-                    let unpacked = unpack(&longs, bits as usize, 4096);
+                    // Disk palette order is hash-arbitrary; the wire palette
+                    // is vanilla's in-memory container order: air first, then
+                    // the remaining states in first-appearance (disk) order.
+                    // Repack the cells through the canonical palette.
+                    let disk_longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
+                    let disk_bits = anvil_disk_bits(n);
+                    let cells = unpack(&disk_longs, disk_bits, 4096);
+
                     let mut non_empty = 0i16;
                     let mut fluid = 0i16;
-                    for &idx in &unpacked {
+                    let mut global_cells = Vec::with_capacity(4096);
+                    let mut used: Vec<u32> = Vec::new();
+                    for &idx in &cells {
                         let id = ids[idx as usize];
                         if id != air {
                             non_empty += 1;
+                            if !used.contains(&id) {
+                                used.push(id);
+                            }
                         }
                         let name = sec
                             .block_states
                             .as_ref()
-                            .and_then(|b| b.palette.get(idx as usize).map(|p| p.name().to_string()))
+                            .and_then(|b| b.palette.get(idx as usize).map(|p| p.name()))
                             .unwrap_or_default();
                         if name.contains("water") || name.contains("lava") {
                             fluid += 1;
                         }
+                        global_cells.push(id);
                     }
+
+                    let mut entries = vec![air];
+                    entries.extend(used);
+                    let index_of: HashMap<u32, u16> = entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, id)| (*id, i as u16))
+                        .collect();
+                    let repacked: Vec<u16> = global_cells.iter().map(|id| index_of[id]).collect();
+
+                    let bits = palette_bits(entries.len(), ContainerKind::Blocks)?;
+                    let longs = pack(&repacked, bits as usize);
                     (
                         Container::Palette {
                             bits,
-                            entries: ids,
+                            entries,
                             longs,
                         },
                         non_empty,
