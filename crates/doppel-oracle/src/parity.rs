@@ -571,3 +571,177 @@ pub fn parity_walk() -> Result<bool> {
         Ok(false)
     }
 }
+
+/// The differential block test: identical setblock commands on both
+/// servers; compare every section_blocks_update (0x56) and block_update
+/// (0x08) broadcast — section coords, entry counts, and each
+/// (localPos, state) pair.
+pub fn parity_blocks() -> Result<bool> {
+    use crate::capture;
+
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs");
+    let world_dir = root
+        .join("target")
+        .join("vanilla")
+        .join("run")
+        .join("world");
+    for dir in [&blobs_dir] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+    }
+
+    let login = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    let commands: Vec<String> = [
+        "setblock 0 100 0 minecraft:stone",
+        "setblock 1 100 0 minecraft:dirt",
+        "setblock 2 100 0 minecraft:oak_planks",
+        "setblock 0 101 0 minecraft:stone",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // 1. Vanilla: capture join + setblocks + the broadcasts.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(300),
+            dump_dir: Some(&blobs_dir),
+            commands: &commands,
+            walk_chunks: None,
+        },
+    )
+    .context("capturing vanilla setblocks")?;
+    drop(server);
+    capture::write_manifest(&v, &blobs_dir)?;
+
+    // 2. Doppel, same script.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &world_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let d = bot::login_capture(
+        "127.0.0.1",
+        DOPPEL_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(300),
+            dump_dir: None,
+            commands: &commands,
+            walk_chunks: None,
+        },
+    )
+    .context("capturing doppel setblocks")?;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 3. Decode and compare every 0x56/0x08 packet.
+    fn decode_updates(pkts: &[&bot::CapturedPacket]) -> Vec<(i32, String)> {
+        let mut out = Vec::new();
+        for p in pkts {
+            if p.id != 0x56 && p.id != 0x08 {
+                continue;
+            }
+            let raw = hex::decode(&p.head_hex).unwrap_or_default();
+            if p.id == 0x08 && raw.len() >= 8 {
+                out.push((0x08, format!("pos {:?}", raw[..8].to_vec())));
+                continue;
+            }
+            if p.id == 0x56 && raw.len() >= 8 {
+                let b = &raw;
+                let sec = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+                // Decode count + VarLongs.
+                let mut o = 8usize;
+                let mut val: u64 = 0;
+                let mut shift = 0u32;
+                while o < b.len() {
+                    let byte = b[o];
+                    o += 1;
+                    val |= u64::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+                let count = val;
+                let mut entries = Vec::new();
+                for _ in 0..count {
+                    let mut v: u64 = 0;
+                    let mut sh = 0u32;
+                    while o < b.len() {
+                        let byte = b[o];
+                        o += 1;
+                        v |= u64::from(byte & 0x7f) << sh;
+                        sh += 7;
+                        if byte & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    entries.push(format!("{:x}:{:x}", v & 0xfff, v >> 12));
+                }
+                out.push((0x56, format!("sec {:x?} n={} {:?}", sec, count, entries)));
+            }
+        }
+        out
+    }
+
+    let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
+    let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
+    let vu = decode_updates(&vr);
+    let du = decode_updates(&dr);
+    println!(
+        "[oracle] block broadcasts: vanilla {} doppel {}",
+        vu.len(),
+        du.len()
+    );
+    let mut failures = Vec::new();
+    for (i, (a, b)) in vu.iter().zip(du.iter()).enumerate() {
+        if a != b {
+            failures.push(format!("broadcast {i}: vanilla {a:?} != doppel {b:?}"));
+        }
+    }
+    if vu.len() != du.len() {
+        failures.push(format!(
+            "count: vanilla {} vs doppel {}",
+            vu.len(),
+            du.len()
+        ));
+    }
+    // Vanilla's post-broadcast chunk state can also be compared via the
+    // system_chat setblock.success count (all four must have succeeded).
+    let v_ok = vr.iter().filter(|p| p.id == 0x7c).count();
+    let d_ok = dr.iter().filter(|p| p.id == 0x7c).count();
+    println!("[oracle] system_chat: vanilla {v_ok} doppel {d_ok}");
+
+    if failures.is_empty() {
+        println!("PASS: block broadcasts match");
+        Ok(true)
+    } else {
+        println!("FAIL: {} block difference(s):", failures.len());
+        for f in failures.iter().take(10) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}

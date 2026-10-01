@@ -92,6 +92,9 @@ pub struct Game {
     world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
     blobs: Option<std::sync::Arc<Blobs>>,
     next_conn: ConnId,
+    /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
+    /// (localPos, state) changes awaiting the tick-end broadcast.
+    dirty: HashMap<(i32, i32, i32), Vec<(u64, u32)>>,
 }
 
 const VIEW_RADIUS: i32 = 4;
@@ -112,6 +115,7 @@ impl Game {
             world,
             blobs,
             next_conn: 0,
+            dirty: HashMap::new(),
         }
     }
 
@@ -127,10 +131,19 @@ impl Game {
     pub fn run(&mut self) {
         loop {
             match self.inbound.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => self.handle(event),
+                Ok(event) => {
+                    self.handle(event);
+                    // Drain everything else already queued: events arriving
+                    // together group into one tick, matching vanilla's
+                    // tick-end broadcast batching.
+                    while let Ok(event) = self.inbound.try_recv() {
+                        self.handle(event);
+                    }
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
+            self.flush_dirty();
             self.tick_keep_alives();
         }
     }
@@ -264,19 +277,34 @@ impl Game {
             return;
         }
         chunk.version += 1;
+        self.dirty
+            .entry((cx, cz, y.div_euclid(16)))
+            .or_default()
+            .push((local as u64, state));
+    }
 
-        // section_blocks_update: sectionPos i64 + count VarInt + VarLongs.
-        let sec_pos = (((cx as i64) & 0x3f_ffff) << 42)
-            | (((cz as i64) & 0x3f_ffff) << 20)
-            | (((y.div_euclid(16)) as i64) & 0xf_ffff);
-        let change = ((state as u64) << 12) | local as u64;
-        let mut body = Vec::with_capacity(24);
-        body.extend_from_slice(&sec_pos.to_be_bytes());
-        doppel_protocol::write_varint(&mut body, 1);
-        write_u64_varlong(&mut body, change);
-        let viewers: Vec<ConnId> = self.viewers.get(&(cx, cz)).cloned().unwrap_or_default();
-        for v in viewers {
-            self.send(v, 0x56, &body);
+    /// Tick end: one section_blocks_update per dirty section, entries
+    /// sorted by local position (vanilla broadcasts from a sorted set).
+    fn flush_dirty(&mut self) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let dirty = std::mem::take(&mut self.dirty);
+        for ((cx, cz, sy), mut changes) in dirty {
+            changes.sort_unstable_by_key(|(local, _)| *local);
+            let sec_pos = (((cx as i64) & 0x3f_ffff) << 42)
+                | (((cz as i64) & 0x3f_ffff) << 20)
+                | ((sy as i64) & 0xf_ffff);
+            let mut body = Vec::with_capacity(8 + changes.len() * 3);
+            body.extend_from_slice(&sec_pos.to_be_bytes());
+            doppel_protocol::write_varint(&mut body, changes.len() as i32);
+            for (local, state) in &changes {
+                write_u64_varlong(&mut body, ((*state as u64) << 12) | *local);
+            }
+            let viewers: Vec<ConnId> = self.viewers.get(&(cx, cz)).cloned().unwrap_or_default();
+            for v in viewers {
+                self.send(v, 0x56, &body);
+            }
         }
     }
 
