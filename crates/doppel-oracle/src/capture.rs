@@ -76,6 +76,7 @@ pub fn run(out_path: &Path, blobs_dir: Option<&Path>) -> Result<()> {
             max_packets: Some(220),
             dump_dir: blobs_dir,
             commands: &[],
+            walk_chunks: None,
         },
     )
     .context("capturing full login transcript")?;

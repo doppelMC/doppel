@@ -255,6 +255,7 @@ pub fn parity_login() -> Result<bool> {
             max_packets: Some(220),
             dump_dir: Some(&blobs_dir),
             commands: &[],
+            walk_chunks: None,
         },
     )
     .context("capturing vanilla transcript")?;

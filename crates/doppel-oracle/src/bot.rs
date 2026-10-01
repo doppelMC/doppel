@@ -116,6 +116,9 @@ pub struct CaptureOpts<'a> {
     pub max_packets: Option<usize>,
     pub dump_dir: Option<&'a std::path::Path>,
     pub commands: &'a [String],
+    /// After the join burst, walk this many chunks in +x (one
+    /// move_player_pos per 400ms) to exercise chunk streaming.
+    pub walk_chunks: Option<usize>,
 }
 
 impl CaptureOpts<'_> {
@@ -173,6 +176,9 @@ pub fn login_capture(
     let mut packs_answered = false;
     let mut play_started = false;
     let mut commands_pending = !commands.is_empty();
+    let walk = opts.walk_chunks;
+    let mut steps_done = 0usize;
+    let mut last_walk_at = std::time::Instant::now();
     let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
@@ -241,6 +247,31 @@ pub fn login_capture(
                 doppel_protocol::write_string(&mut body, cmd);
                 conn.write_packet(0x07, &body)?;
                 note = Some(format!("sent command: {cmd}"));
+            }
+            if walk.is_some() {
+                // Begin walking after the join burst; server traffic (time
+                // updates, position syncs) paces the steps below.
+                last_walk_at = std::time::Instant::now();
+            }
+        }
+        // Walk pacing: one move_player_pos (0x1e: f64 x3 + flags u8) per
+        // 400ms once walking has begun, crossing one chunk per step.
+        if let Some(steps) = walk {
+            if play_started
+                && !commands_pending
+                && steps_done < steps
+                && last_walk_at.elapsed() >= Duration::from_millis(400)
+            {
+                let x = 8.5 + (steps_done as f64 + 1.0) * 16.0;
+                let mut mv = Vec::with_capacity(25);
+                mv.extend_from_slice(&x.to_be_bytes());
+                mv.extend_from_slice(&(-59.0f64).to_be_bytes());
+                mv.extend_from_slice(&8.5f64.to_be_bytes());
+                mv.push(0x01); // on ground
+                conn.write_packet(0x1e, &mv)?;
+                steps_done += 1;
+                last_walk_at = std::time::Instant::now();
+                note = Some(format!("walk step {steps_done}: x={x}"));
             }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
