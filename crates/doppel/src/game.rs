@@ -83,10 +83,10 @@ pub struct CachedChunk {
 }
 
 pub struct Game {
-    chunks: HashMap<(i32, i32), CachedChunk>,
-    players: HashMap<ConnId, Player>,
+    chunks: std::collections::BTreeMap<(i32, i32), CachedChunk>,
+    players: std::collections::BTreeMap<ConnId, Player>,
     /// Inverse index: chunk column -> connections tracking it.
-    viewers: HashMap<(i32, i32), Vec<ConnId>>,
+    viewers: std::collections::BTreeMap<(i32, i32), Vec<ConnId>>,
     inbound: Receiver<Inbound>,
     outbounds: HashMap<ConnId, Sender<Outbound>>,
     world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
@@ -94,19 +94,28 @@ pub struct Game {
     next_conn: ConnId,
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
     /// (localPos, state) changes awaiting the tick-end broadcast.
-    dirty: HashMap<(i32, i32, i32), Vec<(u64, u32)>>,
+    dirty: std::collections::BTreeMap<(i32, i32, i32), Vec<(u64, u32)>>,
     /// Block-state registry (name+props -> id), loaded from pins/blocks.json.
     registry: Option<doppel_world::registry::BlockRegistry>,
     /// Monotonic game tick.
     tick: u64,
     /// Scheduled actions: fire at tick T with a behavior tag.
     scheduled: Vec<(u64, (i32, i32, i32), TickAction)>,
-    /// Torch state change awaiting its 1gt delay.
-    pending_torch: Option<((i32, i32, i32), u32)>,
-    /// Observers with a pending pulse (vanilla's hasScheduledTick guard).
-    pending_observers: std::collections::HashSet<(i32, i32, i32)>,
-    /// Repeaters with a pending toggle (vanilla's willTickThisTick guard).
-    pending_repeaters: std::collections::HashSet<(i32, i32, i32)>,
+    /// Unified pending-transition guard: (pos, kind). Replaces the
+    /// per-family sets and the single torch slot (review finding #3):
+    /// stale entries are skipped at fire time when the block no longer
+    /// matches — never eagerly purged.
+    pending: std::collections::BTreeSet<((i32, i32, i32), PendingKind)>,
+    /// Torch transitions: (pos, target_state, due_tick).
+    torch_queue: Vec<((i32, i32, i32), u32, u64)>,
+}
+
+/// Which family a pending guard belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PendingKind {
+    Torch,
+    Observer,
+    Repeater,
 }
 
 /// What a scheduled entry does when its tick arrives.
@@ -140,15 +149,15 @@ impl Game {
         blobs: Option<std::sync::Arc<Blobs>>,
     ) -> Game {
         Game {
-            chunks: HashMap::new(),
-            players: HashMap::new(),
-            viewers: HashMap::new(),
+            chunks: std::collections::BTreeMap::new(),
+            players: std::collections::BTreeMap::new(),
+            viewers: std::collections::BTreeMap::new(),
             inbound,
             outbounds: HashMap::new(),
             world,
             blobs,
             next_conn: 0,
-            dirty: HashMap::new(),
+            dirty: std::collections::BTreeMap::new(),
             registry: doppel_protocol::find_repo_root().ok().and_then(|r| {
                 let p = r.join("pins").join("blocks.json");
                 p.exists()
@@ -161,9 +170,8 @@ impl Game {
             }),
             tick: 0,
             scheduled: Vec::new(),
-            pending_torch: None,
-            pending_observers: std::collections::HashSet::new(),
-            pending_repeaters: std::collections::HashSet::new(),
+            pending: std::collections::BTreeSet::new(),
+            torch_queue: Vec::new(),
         }
     }
 
@@ -213,9 +221,22 @@ impl Game {
                 self.send(c, 0x73, &body);
             }
         }
-        // Apply the pending torch transition (1gt delay).
-        if let Some(((x, y, z), state)) = self.pending_torch.take() {
-            self.set_block(x, y, z, state, true);
+        // Torch transitions fire 1gt after their input change; stale
+        // entries (block replaced) are skipped at fire time.
+        let due_torches: Vec<((i32, i32, i32), u32)> = self
+            .torch_queue
+            .iter()
+            .filter(|(_, _, t)| *t <= self.tick)
+            .map(|(pos, state, _)| (*pos, *state))
+            .collect();
+        self.torch_queue.retain(|(_, _, t)| *t > self.tick);
+        for ((x, y, z), state) in due_torches {
+            self.pending.remove(&((x, y, z), PendingKind::Torch));
+            if let Some((n, _)) = self.get_block(x, y, z) {
+                if n.contains("redstone_torch") {
+                    self.set_block(x, y, z, state, true);
+                }
+            }
         }
         // Fire scheduled redstone actions due this tick.
         let due: Vec<((i32, i32, i32), TickAction)> = self
@@ -517,7 +538,12 @@ impl Game {
         let Some(new_state) = self.resolve_state(&spec) else {
             return;
         };
-        self.pending_torch = Some(((x, y, z), new_state));
+        // 1gt delay via the scheduled queue with the target state stashed
+        // on the torch queue (single active transition per position).
+        if !self.pending.contains(&((x, y, z), PendingKind::Torch)) {
+            self.pending.insert(((x, y, z), PendingKind::Torch));
+            self.torch_queue.push(((x, y, z), new_state, self.tick + 1));
+        }
     }
 
     /// Observer trigger (vanilla updateShape + startSignal): when an
@@ -527,10 +553,10 @@ impl Game {
         if props.contains("powered=true") {
             return;
         }
-        if self.pending_observers.contains(&(x, y, z)) {
+        if self.pending.contains(&((x, y, z), PendingKind::Observer)) {
             return;
         }
-        self.pending_observers.insert((x, y, z));
+        self.pending.insert(((x, y, z), PendingKind::Observer));
         self.scheduled
             .push((self.tick + 2, (x, y, z), TickAction::ObserverToggle));
     }
@@ -539,7 +565,7 @@ impl Game {
     /// the falling edge 2gt later; falling clears it. Both notify the
     /// block behind (opposite the facing).
     fn observer_toggle(&mut self, x: i32, y: i32, z: i32) {
-        self.pending_observers.remove(&(x, y, z));
+        self.pending.remove(&((x, y, z), PendingKind::Observer));
         let Some((name, props)) = self.get_block(x, y, z) else {
             return;
         };
@@ -559,7 +585,7 @@ impl Game {
         self.set_block(x, y, z, new_state, true);
         if !powered {
             // Chain the falling edge.
-            self.pending_observers.insert((x, y, z));
+            self.pending.insert(((x, y, z), PendingKind::Observer));
             self.scheduled
                 .push((self.tick + 2, (x, y, z), TickAction::ObserverToggle));
         }
@@ -627,11 +653,11 @@ impl Game {
         let facing = prop_dir(props);
         let should_on = self.repeater_input(x, y, z, facing) > 0;
         let on = props.contains("powered=true");
-        if on != should_on && !self.pending_repeaters.contains(&(x, y, z)) {
+        if on != should_on && !self.pending.contains(&((x, y, z), PendingKind::Repeater)) {
             let delay = doppel_world::registry::BlockRegistry::prop_int(props, "delay")
                 .unwrap_or(1)
                 .clamp(1, 4) as u64;
-            self.pending_repeaters.insert((x, y, z));
+            self.pending.insert(((x, y, z), PendingKind::Repeater));
             self.scheduled
                 .push((self.tick + delay * 2, (x, y, z), TickAction::RepeaterToggle));
         }
@@ -640,7 +666,7 @@ impl Game {
     /// Repeater tick edge (vanilla DiodeBlock.tick): turn off, or turn on
     /// and chain a turn-off for short pulses.
     fn repeater_toggle(&mut self, x: i32, y: i32, z: i32) {
-        self.pending_repeaters.remove(&(x, y, z));
+        self.pending.remove(&((x, y, z), PendingKind::Repeater));
         let Some((name, props)) = self.get_block(x, y, z) else {
             return;
         };
@@ -674,7 +700,7 @@ impl Game {
             let delay = doppel_world::registry::BlockRegistry::prop_int(&props, "delay")
                 .unwrap_or(1)
                 .clamp(1, 4) as u64;
-            self.pending_repeaters.insert((x, y, z));
+            self.pending.insert(((x, y, z), PendingKind::Repeater));
             self.scheduled
                 .push((self.tick + delay * 2, (x, y, z), TickAction::RepeaterToggle));
         }
@@ -800,7 +826,7 @@ impl Game {
         cx: i32,
         cz: i32,
     ) -> anyhow::Result<&CachedChunk> {
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.chunks.entry((cx, cz)) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.chunks.entry((cx, cz)) {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
             let Some(anvil) = w.dir.chunk(cx, cz)? else {
                 anyhow::bail!("chunk not generated");
