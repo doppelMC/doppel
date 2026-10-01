@@ -10,6 +10,26 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 
+pub mod chunk_codec;
+
+pub use chunk_codec::WireChunk;
+
+/// Minecraft protocol VarInt writer (shared with the codec module).
+pub fn write_varint(buf: &mut Vec<u8>, value: i32) {
+    let mut v = value as u32;
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
 /// A parsed Anvil chunk section.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Section {
