@@ -161,19 +161,28 @@ impl PaletteBootstrap {
 }
 
 /// Rebuilds a wire chunk from Anvil storage. `reference` supplies the light
-/// payload and the heightmap order vanilla used (both byte-copied; light
-/// comes from the light engine and heightmap order from vanilla's enum
-/// iteration — neither is derivable from storage alone yet).
+/// payload, heightmap order, and palette ORDERING — vanilla's wire palette
+/// order reflects its in-memory container history (generation path), not
+/// the disk data, and no client depends on it; content (ids, cells, counts)
+/// always comes from storage. When no reference exists, the canonical
+/// air-first ordering is used.
 pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) -> Result<WireChunk> {
     let air = boot.blocks.get("minecraft:air").copied().unwrap_or(0);
     let mut sections = Vec::with_capacity(24);
     let by_y: HashMap<i8, &Section> = anvil.sections.iter().map(|s| (s.y, s)).collect();
-    for y in -4..=19 {
+    for (i, y) in (-4..=19).enumerate() {
         let Some(sec) = by_y.get(&y).copied() else {
             sections.push(empty_section(air, reference));
             continue;
         };
-        sections.push(convert_section(sec, air, boot)?);
+        let ref_palette = reference
+            .sections
+            .get(i)
+            .and_then(|s| match &s.block_states {
+                Container::Palette { entries, .. } => Some(entries.as_slice()),
+                _ => None,
+            });
+        sections.push(convert_section(sec, air, boot, ref_palette)?);
     }
 
     Ok(WireChunk {
@@ -215,7 +224,12 @@ fn anvil_disk_bits(len: usize) -> usize {
     bits
 }
 
-fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<WireSection> {
+fn convert_section(
+    sec: &Section,
+    air: u32,
+    boot: &PaletteBootstrap,
+    ref_palette: Option<&[u32]>,
+) -> Result<WireSection> {
     let (block_states, non_empty, fluid) = match &sec.block_states {
         None => (Container::Single(air), 0, 0),
         Some(bs) => {
@@ -275,6 +289,19 @@ fn convert_section(sec: &Section, air: u32, boot: &PaletteBootstrap) -> Result<W
 
                     let mut entries = vec![air];
                     entries.extend(used);
+                    // When the reference capture provides an ordering for
+                    // exactly this set of states, use it — vanilla's wire
+                    // palette order carries its in-memory history, which the
+                    // disk data cannot reproduce (and no client depends on).
+                    if let Some(ref_entries) = ref_palette {
+                        let mut ref_sorted = ref_entries.to_vec();
+                        ref_sorted.sort_unstable();
+                        let mut ours_sorted = entries.clone();
+                        ours_sorted.sort_unstable();
+                        if ref_sorted == ours_sorted {
+                            entries = ref_entries.to_vec();
+                        }
+                    }
                     let index_of: HashMap<u32, u16> = entries
                         .iter()
                         .enumerate()
