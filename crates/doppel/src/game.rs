@@ -622,31 +622,6 @@ impl Game {
         }
     }
 
-    /// Wire power: max(source=15, adjacent wire - 1). Sources: lever on,
-    /// torch lit.
-    fn wire_power_from_neighbors(&self, x: i32, y: i32, z: i32) -> i32 {
-        let mut power = 0;
-        for (dx, dy, dz) in NEIGHBORS {
-            if let Some((n, p)) = self.get_block(x + dx, y + dy, z + dz) {
-                match n.as_str() {
-                    "minecraft:lever" if p.contains("powered=true") => return 15,
-                    "minecraft:redstone_torch" | "minecraft:redstone_wall_torch"
-                        if !p.contains("lit=false") =>
-                    {
-                        return 15;
-                    }
-                    "minecraft:redstone_wire" => {
-                        let lvl = doppel_world::registry::BlockRegistry::prop_int(&p, "power")
-                            .unwrap_or(0);
-                        power = power.max(lvl - 1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        power
-    }
-
     /// Recompute a wire's power; on change, update + notify neighbors.
     fn update_wire(&mut self, x: i32, y: i32, z: i32, props: &str) {
         wire::update_wire_cascade(self, x, y, z, props);
@@ -657,7 +632,7 @@ impl Game {
     /// pending_torch applied at next tick.
     fn update_torch(&mut self, x: i32, y: i32, z: i32, name: &str, props: &str) {
         let (ax, ay, az) = (x, y - 1, z);
-        let input_power = self.wire_power_from_neighbors(ax, ay, az);
+        let input_power = wire::signal_toward_consumer_above(self, ax, ay, az);
         let should_be_lit = input_power == 0;
         let lit = !props.contains("lit=false");
         if lit == should_be_lit {
