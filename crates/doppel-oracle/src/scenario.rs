@@ -20,11 +20,9 @@ pub fn run(out_path: &Path) -> Result<()> {
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
 
     let commands = vec![
-        "/help".to_string(),
-        "/tick freeze".to_string(),
         "/setblock 0 100 0 minecraft:stone".to_string(),
-        "/data get block 0 100 0".to_string(),
-        "/tick step 5".to_string(),
+        "/setblock 1 100 0 minecraft:dirt".to_string(),
+        "/setblock 2 100 0 minecraft:oak_planks".to_string(),
         "/data get block 0 100 0".to_string(),
     ];
     let login = crate::capture::login_start_c("Doppel");
@@ -37,7 +35,7 @@ pub fn run(out_path: &Path) -> Result<()> {
             idle_timeout: Some(Duration::from_secs(12)),
             max_packets: Some(320),
             commands: &commands,
-            walk_chunks: Some(8),
+            walk_chunks: Some(2),
             ..Default::default()
         },
     )
