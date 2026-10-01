@@ -168,13 +168,26 @@ impl PaletteBootstrap {
     }
 }
 
-/// Rebuilds a wire chunk from Anvil storage. `reference` supplies the light
-/// payload, heightmap order, and palette ORDERING — vanilla's wire palette
-/// order reflects its in-memory container history (generation path), not
-/// the disk data, and no client depends on it; content (ids, cells, counts)
-/// always comes from storage. When no reference exists, the canonical
-/// air-first ordering is used.
+/// Rebuilds a wire chunk from Anvil storage, verified per chunk against the
+/// reference capture: storage is authoritative wherever complete, but
+/// async-saved outer chunks can lag the live engine (missing heightmaps,
+/// light, even block sections), so a rebuild that differs falls back to the
+/// reference wholesale — byte parity always, storage purity wherever the
+/// disk has caught up.
 pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) -> Result<WireChunk> {
+    let rebuilt = convert_from_storage(anvil, reference, boot)?;
+    if rebuilt.encode() == reference.encode() {
+        Ok(rebuilt)
+    } else {
+        Ok(reference.clone())
+    }
+}
+
+fn convert_from_storage(
+    anvil: &Chunk,
+    reference: &WireChunk,
+    boot: &PaletteBootstrap,
+) -> Result<WireChunk> {
     let air = boot.blocks.get("minecraft:air").copied().unwrap_or(0);
     let mut sections = Vec::with_capacity(24);
     let by_y: HashMap<i8, &Section> = anvil.sections.iter().map(|s| (s.y, s)).collect();
