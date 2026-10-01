@@ -48,7 +48,7 @@ pub struct Section {
 pub struct Biomes {
     pub palette: Vec<String>,
     #[serde(default)]
-    pub data: Option<Vec<i64>>,
+    pub data: Option<fastnbt::LongArray>,
 }
 
 /// Paletted block state storage for one section.
@@ -56,7 +56,7 @@ pub struct Biomes {
 pub struct BlockStates {
     pub palette: Vec<PaletteEntry>,
     #[serde(default)]
-    pub data: Option<Vec<i64>>,
+    pub data: Option<fastnbt::LongArray>,
 }
 
 /// One palette entry: a block type, plus optional state properties.

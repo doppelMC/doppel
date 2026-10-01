@@ -119,7 +119,8 @@ impl PaletteBootstrap {
                     } = &ws.biomes
                     {
                         if let Some(ab) = &as_.biomes {
-                            let abl = ab.data.as_deref().unwrap_or_default();
+                            let empty: Vec<i64> = Vec::new();
+                            let abl = ab.data.as_deref().unwrap_or(&empty);
                             let same = ab.palette.len() == be.len()
                                 && !bl.is_empty()
                                 && bl.iter().map(|&v| v as i64).eq(abl.iter().copied());
