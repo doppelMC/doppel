@@ -778,7 +778,7 @@ pub fn parity_redstone() -> Result<bool> {
     // top wire recomputes that wire's line shape.
     let commands: Vec<String> = [
         "tick freeze",
-        "setblock 10 100 10 minecraft:lever[face=floor,powered=false]",
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
         "tick step 1",
         "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 1",
@@ -790,7 +790,7 @@ pub fn parity_redstone() -> Result<bool> {
         "tick step 1",
         "setblock 15 100 10 minecraft:redstone_torch",
         "tick step 1",
-        "setblock 10 100 10 minecraft:lever[face=floor,powered=true]",
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=true]",
         "tick step 1",
         "setblock 16 100 10 minecraft:repeater[facing=west,delay=1]",
         "tick step 1",
