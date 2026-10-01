@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Minecraft protocol VarInt: LEB128-style, 7 bits per byte, max 5 bytes.
