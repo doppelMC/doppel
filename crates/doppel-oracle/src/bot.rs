@@ -141,7 +141,9 @@ pub fn login_capture(
             compression_on = true;
             note = Some(format!("set compression threshold={threshold}"));
         }
-        let head = &body[..body.len().min(64)];
+        // Keep plenty of headroom: decoder-error messages arrive inside
+        // disconnect packets.
+        let head = &body[..body.len().min(4096)];
         packets.push(CapturedPacket {
             id,
             body_len: body.len(),
