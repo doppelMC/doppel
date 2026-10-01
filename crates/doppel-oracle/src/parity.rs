@@ -768,7 +768,10 @@ pub fn parity_redstone() -> Result<bool> {
 
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
-    // Circuit on a free platform: lever, 4 wire, torch on the far block.
+    // Circuit on a free platform: lever, 4 wire, torch on the far block;
+    // then a repeater/observer stage; then a piston stage — two stones to
+    // push, a piston facing east, its lever behind, extend + land, retract
+    // + land, all stepped so each phase lands on known ticks.
     let commands: Vec<String> = [
         "tick freeze",
         "setblock 10 100 10 minecraft:lever[face=floor,powered=false]",
@@ -784,6 +787,15 @@ pub fn parity_redstone() -> Result<bool> {
         "setblock 21 100 10 minecraft:redstone_wire",
         "setblock 19 100 10 minecraft:stone",
         "setblock 19 100 10 minecraft:oak_planks",
+        "tick step 10",
+        "setblock 25 100 10 minecraft:stone",
+        "setblock 24 100 10 minecraft:stone",
+        "setblock 23 100 10 minecraft:piston[extended=false,facing=east]",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=false]",
+        "tick step 3",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=true]",
+        "tick step 5",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=false]",
         "tick step 10",
     ]
     .iter()

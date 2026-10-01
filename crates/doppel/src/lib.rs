@@ -5,6 +5,9 @@
 pub mod blobs;
 pub mod game;
 
+#[cfg(test)]
+mod piston_tests;
+
 use anyhow::{bail, Context, Result};
 use blobs::Blobs;
 use doppel_protocol::{frame_packet, read_packet, write_string, write_varint, Conn, Pin, Reader};
@@ -321,6 +324,13 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                         z,
                         name: parts[4].to_string(),
                     });
+                }
+            }
+            // `tick step N` is the differential harness's sequencing
+            // barrier: later commands must land on later ticks.
+            if parts.len() == 3 && parts[0] == "tick" && parts[1] == "step" {
+                if let Ok(steps) = parts[2].parse::<u32>() {
+                    return Some(game::Inbound::TickStep { conn, steps });
                 }
             }
             None
