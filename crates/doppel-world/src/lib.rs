@@ -41,6 +41,10 @@ pub struct Section {
     pub block_states: Option<BlockStates>,
     #[serde(rename = "biomes", default)]
     pub biomes: Option<Biomes>,
+    #[serde(rename = "BlockLight", default)]
+    pub block_light: Option<fastnbt::ByteArray>,
+    #[serde(rename = "SkyLight", default)]
+    pub sky_light: Option<fastnbt::ByteArray>,
 }
 
 /// Paletted biome storage for one section (quart positions).
@@ -211,6 +215,8 @@ mod tests {
                     data: None,
                 }),
                 biomes: None,
+                block_light: None,
+                sky_light: None,
             }],
             heightmaps: None,
         };

@@ -196,11 +196,109 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
     Ok(WireChunk {
         x: anvil.x,
         z: anvil.z,
-        heightmaps: reference.heightmaps.clone(),
+        heightmaps: build_heightmaps(anvil),
         sections,
         block_entities: reference.block_entities.clone(),
-        light: clone_light(&reference.light),
+        light: build_light(anvil),
     })
+}
+
+/// Heightmaps from storage: the three client-facing maps in vanilla's wire
+/// order (MOTION_BLOCKING=4, MOTION_BLOCKING_NO_LEAVES=5, WORLD_SURFACE=1),
+/// values copied verbatim (same packed 9-bit longs on disk and wire).
+fn build_heightmaps(anvil: &Chunk) -> Vec<(u32, Vec<u64>)> {
+    let mut out = Vec::new();
+    let Some(fastnbt::Value::Compound(map)) = &anvil.heightmaps else {
+        return out;
+    };
+    for (ty, key) in [
+        (4u32, "MOTION_BLOCKING"),
+        (5, "MOTION_BLOCKING_NO_LEAVES"),
+        (1, "WORLD_SURFACE"),
+    ] {
+        if let Some(fastnbt::Value::LongArray(longs)) = map.get(key) {
+            out.push((ty, longs.iter().map(|&v| v as u64).collect()));
+        }
+    }
+    out
+}
+
+/// Light from storage, mirroring vanilla's prepareSectionData: a stored
+/// all-zero layer sets the EMPTY mask (no payload); a non-zero layer sets
+/// the mask and carries its 2048 nibble-packed bytes; absent layers are
+/// not represented. Bit index = light section index (section y + 5).
+fn build_light(anvil: &Chunk) -> WireLight {
+    const LIGHT_SECTIONS: usize = 30; // light sections -5..=24 inclusive
+    let mut sky_mask = vec![false; LIGHT_SECTIONS];
+    let mut block_mask = vec![false; LIGHT_SECTIONS];
+    let mut empty_sky = vec![false; LIGHT_SECTIONS];
+    let mut empty_block = vec![false; LIGHT_SECTIONS];
+    let mut sky_updates: Vec<Vec<u8>> = Vec::new();
+    let mut block_updates: Vec<Vec<u8>> = Vec::new();
+
+    // Layers attach to masks in ascending section order.
+    let mut lights: Vec<(
+        usize,
+        Option<&fastnbt::ByteArray>,
+        Option<&fastnbt::ByteArray>,
+    )> = anvil
+        .sections
+        .iter()
+        .map(|s| {
+            (
+                ((s.y as isize + 5).max(0) as usize),
+                s.sky_light.as_ref(),
+                s.block_light.as_ref(),
+            )
+        })
+        .collect();
+    lights.sort_by_key(|(idx, _, _)| *idx);
+
+    for (idx, sky, block) in lights {
+        if idx >= LIGHT_SECTIONS {
+            continue;
+        }
+        if let Some(layer) = sky {
+            if layer.iter().all(|&b| b == 0) {
+                empty_sky[idx] = true;
+            } else {
+                sky_mask[idx] = true;
+                sky_updates.push(layer.iter().map(|&b| b as u8).collect());
+            }
+        }
+        if let Some(layer) = block {
+            if layer.iter().all(|&b| b == 0) {
+                empty_block[idx] = true;
+            } else {
+                block_mask[idx] = true;
+                block_updates.push(layer.iter().map(|&b| b as u8).collect());
+            }
+        }
+    }
+
+    WireLight {
+        sky_mask: mask_bytes(&sky_mask),
+        block_mask: mask_bytes(&block_mask),
+        empty_sky_mask: mask_bytes(&empty_sky),
+        empty_block_mask: mask_bytes(&empty_block),
+        sky_updates,
+        block_updates,
+    }
+}
+
+/// Java BitSet.toByteArray: bit k lives in byte k/8, LSB-first, trailing
+/// zero bytes trimmed.
+fn mask_bytes(bits: &[bool]) -> Vec<u8> {
+    let Some(last) = bits.iter().rposition(|b| *b) else {
+        return Vec::new();
+    };
+    let mut out = vec![0u8; last / 8 + 1];
+    for (k, &b) in bits.iter().enumerate().take(last + 1) {
+        if b {
+            out[k / 8] |= 1 << (k % 8);
+        }
+    }
+    out
 }
 
 fn empty_section(air: u32, reference: &WireChunk) -> WireSection {
@@ -370,10 +468,6 @@ fn convert_section(
         block_states,
         biomes,
     })
-}
-
-fn clone_light(l: &WireLight) -> WireLight {
-    l.clone()
 }
 
 /// A lazily-opened set of region files under a world's region directory.
