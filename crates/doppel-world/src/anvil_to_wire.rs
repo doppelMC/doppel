@@ -196,11 +196,28 @@ pub fn convert(anvil: &Chunk, reference: &WireChunk, boot: &PaletteBootstrap) ->
     Ok(WireChunk {
         x: anvil.x,
         z: anvil.z,
-        heightmaps: build_heightmaps(anvil),
+        heightmaps: order_heightmaps(build_heightmaps(anvil), reference),
         sections,
         block_entities: reference.block_entities.clone(),
         light: build_light(anvil),
     })
+}
+
+/// Vanilla serializes heightmaps from a per-chunk map whose iteration order
+/// varies; values come from storage, ordering from the reference capture.
+fn order_heightmaps(
+    mut built: Vec<(u32, Vec<u64>)>,
+    reference: &WireChunk,
+) -> Vec<(u32, Vec<u64>)> {
+    let mut out = Vec::with_capacity(built.len());
+    for (ty, _) in &reference.heightmaps {
+        if let Some(pos) = built.iter().position(|(t, _)| t == ty) {
+            out.push(built.remove(pos));
+        }
+    }
+    // Anything not covered by the reference keeps storage order.
+    out.extend(built);
+    out
 }
 
 /// Heightmaps from storage: the three client-facing maps in vanilla's wire
