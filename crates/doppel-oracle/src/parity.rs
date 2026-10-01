@@ -745,3 +745,166 @@ pub fn parity_blocks() -> Result<bool> {
         Ok(false)
     }
 }
+
+/// The differential redstone test: freeze time, build a lever-wire-torch
+/// circuit, flip the lever, step ticks, and diff every broadcast per tick
+/// between vanilla and Doppel. This is the M3 referee: wire power levels,
+/// torch timing (the 1gt delay), and update ordering all face it.
+pub fn parity_redstone() -> Result<bool> {
+    use crate::capture;
+
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs");
+    let world_dir = root
+        .join("target")
+        .join("vanilla")
+        .join("run")
+        .join("world");
+    if blobs_dir.exists() {
+        std::fs::remove_dir_all(&blobs_dir)?;
+    }
+
+    let login = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    // Circuit on a free platform: lever, 4 wire, torch on the far block.
+    let commands: Vec<String> = [
+        "tick freeze",
+        "setblock 10 100 10 minecraft:lever[face=floor,powered=false]",
+        "setblock 11 100 10 minecraft:redstone_wire",
+        "setblock 12 100 10 minecraft:redstone_wire",
+        "setblock 13 100 10 minecraft:redstone_wire",
+        "setblock 14 100 10 minecraft:redstone_wire",
+        "setblock 15 100 10 minecraft:redstone_torch",
+        "setblock 10 100 10 minecraft:lever[face=floor,powered=true]",
+        "tick step 6",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // 1. Vanilla.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(6)),
+            max_packets: Some(400),
+            dump_dir: Some(&blobs_dir),
+            commands: &commands,
+            walk_chunks: None,
+        },
+    )
+    .context("capturing vanilla redstone")?;
+    drop(server);
+    capture::write_manifest(&v, &blobs_dir)?;
+
+    // 2. Doppel.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &world_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let d = bot::login_capture(
+        "127.0.0.1",
+        DOPPEL_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(6)),
+            max_packets: Some(400),
+            dump_dir: None,
+            commands: &commands,
+            walk_chunks: None,
+        },
+    )
+    .context("capturing doppel redstone")?;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // 3. Diff every 0x56/0x08 (ignoring the placement setblocks themselves
+    //    — the LAST placement (lever on) plus tick-stepped changes must
+    //    match; initial placements compare too but connection props may
+    //    differ on the first divergence, which is the data we want).
+    let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
+    let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
+    let v_updates: Vec<_> = vr.iter().filter(|p| p.id == 0x56 || p.id == 0x08).collect();
+    let d_updates: Vec<_> = dr.iter().filter(|p| p.id == 0x56 || p.id == 0x08).collect();
+    println!(
+        "[oracle] redstone updates: vanilla {} doppel {}",
+        v_updates.len(),
+        d_updates.len()
+    );
+
+    let decode = |p: &&bot::CapturedPacket| -> String {
+        let raw = hex::decode(&p.head_hex).unwrap_or_default();
+        if p.id == 0x08 {
+            return format!("08 {:?}", &raw[..8.min(raw.len())]);
+        }
+        if raw.len() < 8 {
+            return "56 short".to_string();
+        }
+        let mut o = 8usize;
+        let read_varlong = |o: &mut usize| -> u64 {
+            let mut v: u64 = 0;
+            let mut sh = 0u32;
+            while *o < raw.len() {
+                let b = raw[*o];
+                *o += 1;
+                v |= u64::from(b & 0x7f) << sh;
+                sh += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            v
+        };
+        let count = read_varlong(&mut o);
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            let v = read_varlong(&mut o);
+            entries.push(format!("{:03x}:{:x}", v & 0xfff, v >> 12));
+        }
+        format!("56 sec={:x?} n={} {:?}", &raw[..8], count, entries)
+    };
+
+    let mut failures = Vec::new();
+    let n = v_updates.len().max(d_updates.len());
+    for i in 0..n {
+        let a = v_updates.get(i).map(|p| decode(p));
+        let b = d_updates.get(i).map(|p| decode(p));
+        if a != b {
+            failures.push(format!("update {i}:\n    vanilla {a:?}\n    doppel  {b:?}"));
+        }
+    }
+    if v_updates.len() != d_updates.len() {
+        failures.push(format!(
+            "count: vanilla {} vs doppel {}",
+            v_updates.len(),
+            d_updates.len()
+        ));
+    }
+
+    if failures.is_empty() {
+        println!("PASS: redstone circuits match");
+        Ok(true)
+    } else {
+        println!("FAIL: {} redstone difference(s):", failures.len());
+        for f in failures.iter().take(8) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}
