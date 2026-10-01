@@ -342,7 +342,7 @@ impl Connections {
     }
 
     pub fn from_props(props: &str) -> Connections {
-        let side = |key: &str| prop(props, key).map(Side::parse).unwrap_or(Side::None);
+        let side = |key: &str| prop(props, key).map_or(Side::None, Side::parse);
         Connections {
             north: side("north"),
             east: side("east"),
@@ -533,12 +533,10 @@ fn own_weak_signal(
         {
             15
         }
-        _ if name.ends_with("_button") || name.ends_with("_pressure_plate") => {
-            if prop_bool(props, "powered") {
-                15
-            } else {
-                0
-            }
+        _ if (name.ends_with("_button") || name.ends_with("_pressure_plate"))
+            && prop_bool(props, "powered") =>
+        {
+            15
         }
         _ => 0,
     }
