@@ -176,9 +176,20 @@ fn handle_login(stream: TcpStream, pin: &Pin, blobs: Option<&Blobs>) -> Result<(
     }
 
     // --- play state: replay the full captured join sequence in order ---
+    // Chunk packets round-trip through the codec: decode to our data
+    // structures, re-encode, send. The parity harness therefore proves the
+    // codec byte-exact against live vanilla on every push — and the world
+    // is one step from being backed by real storage instead of blobs.
     if let Some(b) = blobs {
         for (id, body) in &b.play {
-            conn.write_packet(*id, body)?;
+            let body = if *id == 0x2e {
+                let chunk = doppel_world::WireChunk::decode(body)
+                    .with_context(|| format!("decoding chunk ({}, {})", 0, 0))?;
+                chunk.encode()
+            } else {
+                body.clone()
+            };
+            conn.write_packet(*id, &body)?;
         }
     }
 

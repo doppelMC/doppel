@@ -112,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "doppel-protocol",
+ "doppel-world",
  "md-5",
  "serde",
  "serde_json",

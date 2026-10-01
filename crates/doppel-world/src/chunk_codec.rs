@@ -124,13 +124,15 @@ pub struct WireBlockEntity {
     pub tag: Option<Vec<u8>>,
 }
 
-/// The light payload of a chunk packet.
+/// The light payload of a chunk packet. Masks use `ByteBufCodecs.BIT_SET`:
+/// VarInt byte-length + `BitSet.toByteArray()` (little-endian bit order) —
+/// NOT the long-count encoding used elsewhere.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WireLight {
-    pub sky_mask: Vec<u64>,
-    pub block_mask: Vec<u64>,
-    pub empty_sky_mask: Vec<u64>,
-    pub empty_block_mask: Vec<u64>,
+    pub sky_mask: Vec<u8>,
+    pub block_mask: Vec<u8>,
+    pub empty_sky_mask: Vec<u8>,
+    pub empty_block_mask: Vec<u8>,
     pub sky_updates: Vec<Vec<u8>>,
     pub block_updates: Vec<Vec<u8>>,
 }
@@ -336,20 +338,14 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn read_bitset(r: &mut Reader) -> Result<Vec<u64>> {
-    let longs = r.read_varint().context("bitset length")? as usize;
-    let mut out = Vec::with_capacity(longs);
-    for _ in 0..longs {
-        out.push(r.read_u64().context("bitset long")?);
-    }
-    Ok(out)
+fn read_bitset(r: &mut Reader) -> Result<Vec<u8>> {
+    let len = r.read_varint().context("bitset length")? as usize;
+    r.read_bytes(len).context("bitset bytes")
 }
 
-fn write_bitset(out: &mut Vec<u8>, longs: &[u64]) {
-    crate::write_varint(out, longs.len() as i32);
-    for l in longs {
-        out.extend_from_slice(&l.to_be_bytes());
-    }
+fn write_bitset(out: &mut Vec<u8>, bytes: &[u8]) {
+    crate::write_varint(out, bytes.len() as i32);
+    out.extend_from_slice(bytes);
 }
 
 fn read_light_arrays(r: &mut Reader) -> Result<Vec<Vec<u8>>> {
@@ -489,10 +485,10 @@ mod tests {
                 tag: None,
             }],
             light: WireLight {
-                sky_mask: vec![0xffff],
+                sky_mask: vec![0x06],
                 block_mask: vec![],
-                empty_sky_mask: vec![],
-                empty_block_mask: vec![],
+                empty_sky_mask: vec![0x01],
+                empty_block_mask: vec![0x07],
                 sky_updates: vec![vec![0x0f; 2048]],
                 block_updates: vec![],
             },
@@ -512,7 +508,6 @@ mod tests {
     /// the capture directory is present (local dev machines; CI proves the
     /// same property live via parity-through-codec).
     #[test]
-    #[ignore = "light region wire layout pending source confirmation"]
     fn chunk_roundtrip_captured_blob() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scratch");
         let manifest_path = root.join("captures/blobs/manifest.json");
