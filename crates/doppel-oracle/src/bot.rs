@@ -111,16 +111,16 @@ pub fn client_information_body() -> Vec<u8> {
 
 /// Connects as an offline-mode login client and records every packet the
 /// server sends from the moment of login until the stream goes idle.
-/// `login_start_body` is the pre-built serverbound `minecraft:hello` body;
-/// `config_probe` is the (packet id, body) the bot sends as its first
-/// configuration-state packet — probing ids maps vanilla's serverbound
-/// configuration state empirically.
+/// Confirmed choreography: after Login Success the client sends an empty
+/// Login Acknowledged (config id 0x03); vanilla replies with brand +
+/// Known Packs request (S->C 0x0f); the client must then answer Known
+/// Packs — `known_packs_probe` is the (id, body) candidate for that reply.
 pub fn login_capture(
     host: &str,
     port: u16,
     protocol: i32,
     login_start_body: &[u8],
-    config_probe: (i32, Vec<u8>),
+    known_packs_probe: (i32, Vec<u8>),
     idle_timeout: Duration,
     max_packets: usize,
 ) -> Result<Vec<CapturedPacket>> {
@@ -146,6 +146,7 @@ pub fn login_capture(
     let mut packets = Vec::new();
     let mut compression_on = false;
     let mut config_started = false;
+    let mut packs_answered = false;
     let started = std::time::Instant::now();
     for _ in 0..max_packets {
         let (id, body) = match conn.read_packet() {
@@ -174,16 +175,22 @@ pub fn login_capture(
             compression_on = true;
             note = Some(format!("set compression threshold={threshold}"));
         }
-        // After Login Success the connection enters the configuration state,
-        // where the CLIENT speaks first. We send the probe packet; vanilla's
-        // reaction (registry burst, named decoder error, or silent close)
-        // maps the serverbound configuration state.
+        // After Login Success the connection enters the configuration
+        // state: the client confirms with an empty Login Acknowledged
+        // (serverbound config 0x03 — oracle-confirmed).
         if !config_started && id == 0x02 {
-            conn.write_packet(config_probe.0, &config_probe.1)?;
+            conn.write_packet(0x03, &[])?;
             config_started = true;
+            note = Some("login success; sent login acknowledged (0x03)".into());
+        }
+        // Known Packs request (S->C 0x0f): answer with the probe candidate
+        // (expected: an array of pack entries; empty array = send everything).
+        if !packs_answered && config_started && id == 0x0f {
+            conn.write_packet(known_packs_probe.0, &known_packs_probe.1)?;
+            packs_answered = true;
             note = Some(format!(
-                "login success; probed config packet id 0x{:02x}",
-                config_probe.0
+                "known packs request; probed reply id 0x{:02x}",
+                known_packs_probe.0
             ));
         }
         // Keep plenty of headroom: decoder-error messages arrive inside

@@ -41,25 +41,24 @@ pub fn run(out_path: &Path) -> Result<()> {
     // before anything else. Empty body under each candidate id: the true
     // ack id survives (idle-wait or a registry burst), everything else
     // closes silently.
+    // Probe the Known Packs reply: Login Acknowledged is confirmed (0x03
+    // empty); vanilla's next wait point is its Known Packs request (S->C
+    // 0x0f). Candidate replies: empty array body (VarInt 0) under each
+    // serverbound id. The true id unlocks the registry burst.
     struct Probe {
         label: String,
         login: Vec<u8>,
-        config: (i32, Vec<u8>),
+        packs_reply: (i32, Vec<u8>),
     }
     let login_body = login_start_c("Doppel");
-    let mut variants: Vec<Probe> = (0x00..=0x0a)
+    let empty_array = vec![0x00]; // VarInt count = 0
+    let variants: Vec<Probe> = (0x00..=0x0a)
         .map(|id| Probe {
-            label: format!("ack0x{id:02x}"),
+            label: format!("packs0x{id:02x}"),
             login: login_body.clone(),
-            config: (id, Vec::new()),
+            packs_reply: (id, empty_array.clone()),
         })
         .collect();
-    // Control: garbage id, still empty body.
-    variants.push(Probe {
-        label: "ctrl-garbage-id".into(),
-        login: login_body.clone(),
-        config: (0x63, Vec::new()),
-    });
 
     let mut lines: Vec<String> = Vec::new();
     for probe in &variants {
@@ -68,7 +67,7 @@ pub fn run(out_path: &Path) -> Result<()> {
             VANILLA_PORT,
             pin.protocol.unwrap_or(0),
             &probe.login,
-            probe.config.clone(),
+            probe.packs_reply.clone(),
             Duration::from_secs(5),
             120,
         )
