@@ -131,6 +131,7 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
     // Server") — matching the default is exactly what parity means.
     let properties = format!(
         "online-mode=false\n\
+         white-list=false\n\
          server-port={port}\n\
          level-type=minecraft\\:flat\n\
          generate-structures=false\n\
