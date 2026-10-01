@@ -452,7 +452,11 @@ impl Game {
         if target == current {
             return;
         }
-        let spec = format!("minecraft:redstone_wire[power={target}]");
+        // Wire states carry mandatory connection props (east/north/south/
+        // west); preserve them and swap only power.
+        let new_props =
+            doppel_world::registry::BlockRegistry::with_prop(props, "power", &target.to_string());
+        let spec = format!("minecraft:redstone_wire[{new_props}]");
         let Some(new_state) = self.resolve_state(&spec) else {
             return;
         };

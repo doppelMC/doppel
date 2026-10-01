@@ -57,12 +57,21 @@ impl BlockRegistry {
     }
 
     /// Looks up a state id; empty props falls back to the block's default.
+    /// Partial props are filled from the default state's props (vanilla
+    /// setblock semantics), then the exact match resolves.
     pub fn state_id(&self, name: &str, props: &str) -> Option<u32> {
         let props = canonical_props(props);
         if props.is_empty() {
             return self.defaults.get(name).copied();
         }
-        self.by_key.get(&key(name, &props)).copied()
+        if let Some(id) = self.by_key.get(&key(name, &props)) {
+            return Some(*id);
+        }
+        // Fill unspecified props from the block's default state.
+        let default_id = *self.defaults.get(name)?;
+        let (_, default_props) = self.by_id.get(&default_id)?;
+        let merged = merge_props(default_props, &props);
+        self.by_key.get(&key(name, &merged)).copied()
     }
 
     /// Splits "name[k=v,k=v]" into parts.
@@ -101,6 +110,27 @@ impl BlockRegistry {
         pairs.push(format!("{name}={value}"));
         canonical_props(&pairs.join(","))
     }
+}
+
+/// Merges explicit `k=v` pairs over a base props string (canonical order).
+pub fn merge_props(base: &str, explicit: &str) -> String {
+    let mut map: std::collections::BTreeMap<String, String> = base
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    for pair in explicit.split(',').filter(|p| !p.is_empty()) {
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(k.to_string(), v.to_string());
+        }
+    }
+    map.into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
