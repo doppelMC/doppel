@@ -4,6 +4,7 @@
 
 pub mod blobs;
 pub mod game;
+pub mod wire;
 
 use anyhow::{bail, Context, Result};
 use blobs::Blobs;

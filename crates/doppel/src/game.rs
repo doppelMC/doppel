@@ -379,8 +379,16 @@ impl Game {
             return;
         }
         let dirty = std::mem::take(&mut self.dirty);
-        for ((cx, cz, sy), mut changes) in dirty {
-            changes.sort_unstable_by_key(|(local, _)| *local);
+        for ((cx, cz, sy), changes) in dirty {
+            // One entry per position per tick, last write wins — the same
+            // merge vanilla's per-section tracker map performs before the
+            // broadcast (wire cascades can rewrite a position mid-tick).
+            let mut merged: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
+            for (local, state) in changes {
+                merged.insert(local, state);
+            }
+            let changes: Vec<(u64, u32)> = merged.into_iter().collect();
             let sec_pos = (((cx as i64) & 0x3f_ffff) << 42)
                 | (((cz as i64) & 0x3f_ffff) << 20)
                 | ((sy as i64) & 0xf_ffff);
@@ -475,47 +483,20 @@ impl Game {
         }
     }
 
-    /// Wire power: max(source=15, adjacent wire - 1). Sources: lever on,
-    /// torch lit.
+    /// The signal the block at (x, y, z) passes to a consumer directly
+    /// above it — vanilla `getSignal(pos, DOWN)`: the block's own
+    /// emission toward that consumer, escalated through it when it is a
+    /// redstone conductor. `update_torch` wants exactly this for
+    /// `hasSignal(pos.below(), DOWN)`. All semantics live in `wire.rs`.
     fn wire_power_from_neighbors(&self, x: i32, y: i32, z: i32) -> i32 {
-        let mut power = 0;
-        for (dx, dy, dz) in NEIGHBORS {
-            if let Some((n, p)) = self.get_block(x + dx, y + dy, z + dz) {
-                match n.as_str() {
-                    "minecraft:lever" if p.contains("powered=true") => return 15,
-                    "minecraft:redstone_torch" | "minecraft:redstone_wall_torch"
-                        if !p.contains("lit=false") =>
-                    {
-                        return 15;
-                    }
-                    "minecraft:redstone_wire" => {
-                        let lvl = doppel_world::registry::BlockRegistry::prop_int(&p, "power")
-                            .unwrap_or(0);
-                        power = power.max(lvl - 1);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        power
+        crate::wire::signal_toward_consumer_above(self, x, y, z)
     }
 
-    /// Recompute a wire's power; on change, update + notify neighbors.
+    /// Wire power + connection recompute (DefaultRedstoneWireEvaluator,
+    /// wire-spec -): same-tick depth-first cascade, no scheduled
+    /// ticks. Delegates to `wire.rs`.
     fn update_wire(&mut self, x: i32, y: i32, z: i32, props: &str) {
-        let target = self.wire_power_from_neighbors(x, y, z).clamp(0, 15);
-        let current = doppel_world::registry::BlockRegistry::prop_int(props, "power").unwrap_or(0);
-        if target == current {
-            return;
-        }
-        // Wire states carry mandatory connection props (east/north/south/
-        // west); preserve them and swap only power.
-        let new_props =
-            doppel_world::registry::BlockRegistry::with_prop(props, "power", &target.to_string());
-        let spec = format!("minecraft:redstone_wire[{new_props}]");
-        let Some(new_state) = self.resolve_state(&spec) else {
-            return;
-        };
-        self.set_block(x, y, z, new_state, true);
+        crate::wire::update_wire_cascade(self, x, y, z, props);
     }
 
     /// Torch: lit unless its supporting block carries power. Simple model:
@@ -994,4 +975,31 @@ fn prop_dir(props: &str) -> &str {
         }
     }
     "north"
+}
+
+/// Wire-engine glue: the game thread as a wire host. Every semantic
+/// decision lives in `wire.rs`; this only adapts the engine's block
+/// store, registry, and neighbor-dispatch.
+impl crate::wire::BlockView for Game {
+    fn block_at(&self, x: i32, y: i32, z: i32) -> Option<(String, String)> {
+        self.get_block(x, y, z)
+    }
+}
+
+impl crate::wire::WireHost for Game {
+    fn set_wire_state(&mut self, x: i32, y: i32, z: i32, state: u32) {
+        // setBlock flags = 2 (UPDATE_CLIENTS only): broadcast the change,
+        // schedule nothing — the evaluator performs its own fan-out
+        // (wire-spec ).
+        self.set_block(x, y, z, state, false)
+    }
+
+    fn resolve_wire_state(&self, conn: &crate::wire::Connections, power: i32) -> Option<u32> {
+        let spec = format!("minecraft:redstone_wire[{}]", conn.props_string(power));
+        self.resolve_state(&spec)
+    }
+
+    fn dispatch_neighbor_changed(&mut self, x: i32, y: i32, z: i32) {
+        self.update_block(x, y, z)
+    }
 }

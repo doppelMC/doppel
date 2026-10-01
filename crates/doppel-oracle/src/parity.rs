@@ -769,6 +769,13 @@ pub fn parity_redstone() -> Result<bool> {
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
     // Circuit on a free platform: lever, 4 wire, torch on the far block.
+    // The L-shaped branch off wire 12 exercises the same-Y corner
+    // (connection recompute + signal around the bend). The step places
+    // the top wire BEFORE the stone under it so the climbing wire's
+    // UP-connection (diagonal rules, §1.4b/§2.2) is recomputed by
+    // vanilla's own updateShape when the stone lands; the stone above
+    // the branch wire cuts its UP connections; the terminator beside the
+    // top wire recomputes that wire's line shape.
     let commands: Vec<String> = [
         "tick freeze",
         "setblock 10 100 10 minecraft:lever[face=floor,powered=false]",
@@ -784,6 +791,14 @@ pub fn parity_redstone() -> Result<bool> {
         "setblock 21 100 10 minecraft:redstone_wire",
         "setblock 19 100 10 minecraft:stone",
         "setblock 19 100 10 minecraft:oak_planks",
+        "setblock 12 100 11 minecraft:redstone_wire",
+        "setblock 12 100 12 minecraft:redstone_wire",
+        "setblock 13 100 12 minecraft:redstone_wire",
+        "setblock 14 100 12 minecraft:redstone_wire",
+        "setblock 15 101 12 minecraft:redstone_wire",
+        "setblock 15 100 12 minecraft:stone",
+        "setblock 13 101 12 minecraft:stone",
+        "setblock 16 101 12 minecraft:stone",
         "tick step 10",
     ]
     .iter()
@@ -799,7 +814,7 @@ pub fn parity_redstone() -> Result<bool> {
         &login,
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(6)),
-            max_packets: Some(400),
+            max_packets: Some(600),
             dump_dir: Some(&blobs_dir),
             commands: &commands,
             walk_chunks: None,
@@ -830,7 +845,7 @@ pub fn parity_redstone() -> Result<bool> {
         &login,
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(6)),
-            max_packets: Some(400),
+            max_packets: Some(600),
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
