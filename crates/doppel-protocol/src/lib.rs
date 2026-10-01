@@ -225,6 +225,11 @@ impl<S: Read + Write> Conn<S> {
         self.threshold = Some(threshold);
     }
 
+    /// The active compression threshold, if any.
+    pub fn compression_threshold(&self) -> Option<i32> {
+        self.threshold
+    }
+
     pub fn into_inner(self) -> S {
         self.stream
     }

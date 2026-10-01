@@ -19,33 +19,6 @@ const MAX_FRAME: usize = 1024 * 1024;
 const DEFAULT_MAX_PLAYERS: i64 = 20;
 const COMPRESSION_THRESHOLD: i32 = 256;
 
-/// 26.3 clientbound play ids. The 26.3-vs-26.2 clientbound shift is NOT
-/// uniform (see scratch/protocol-26.3.md); keep_alive follows the +1 model
-/// from the initialize_border anchor — pin empirically against the oracle
-/// before trusting position-dependent behavior.
-const CB_KEEP_ALIVE: i32 = 0x2d;
-
-/// Vanilla keep-alive cadence (ServerCommonPacketListenerImpl): send every
-/// 15 s; a challenge unanswered at the next 15 s check disconnects.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Per-connection player state for the play phase.
-struct PlayState {
-    name: String,
-    x: f64,
-    y: f64,
-    z: f64,
-    yaw: f32,
-    pitch: f32,
-    pending_keep_alive: Option<(i64, std::time::Instant)>,
-    /// View center (chunk coords) once the first position is known.
-    center: Option<(i32, i32)>,
-    /// Chunk columns already sent to this client.
-    sent: std::collections::HashSet<(i32, i32)>,
-    /// Monotonic teleport id for our player_position syncs.
-    teleport_id: i32,
-}
-
 /// Shared world state: Anvil regions plus the learned palette maps.
 pub struct WorldState {
     pub dir: doppel_world::WorldDir,
@@ -53,35 +26,6 @@ pub struct WorldState {
 }
 
 type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
-
-/// Streams a chunk the client just entered: storage-verified against the
-/// capture when vanilla sent one, otherwise the reference-free conversion.
-/// TODO(chunk-store): lock currently spans region IO + conversion; the
-/// tick-loop rework moves region reads to positional shared-file reads and
-/// learned maps to immutable Arcs, dissolving this lock.
-fn stream_chunk(world: &SharedWorld, cx: i32, cz: i32, blobs: &Blobs) -> Result<Option<WireChunk>> {
-    let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(anvil) = w.dir.chunk(cx, cz)? else {
-        return Ok(None);
-    };
-    let reference = blobs.play.iter().find_map(|(id, body)| {
-        if *id != 0x2e {
-            return None;
-        }
-        WireChunk::decode(body)
-            .ok()
-            .filter(|c| c.x == cx && c.z == cz)
-    });
-    let chunk = match reference {
-        Some(reference) => {
-            w.boot.learn(&reference, &anvil);
-            doppel_world::anvil_to_wire::convert(&anvil, &reference, &w.boot)?
-        }
-        None => doppel_world::anvil_to_wire::convert_uncaptured(&anvil, &w.boot)?,
-    };
-    drop(w);
-    Ok(Some(chunk))
-}
 
 /// Rebuilds a chunk from Anvil storage when the world has it; the wire
 /// capture bootstraps palette maps and supplies light. Falls back to the
@@ -162,6 +106,8 @@ fn handle_login(
     pin: &Pin,
     blobs: Option<&Blobs>,
     world: Option<&SharedWorld>,
+    game_tx: &std::sync::mpsc::Sender<game::Inbound>,
+    game_handle: &std::sync::Arc<std::sync::Mutex<game::Game>>,
 ) -> Result<()> {
     let mut conn = Conn::new(stream);
 
@@ -260,136 +206,101 @@ fn handle_login(
         }
     }
 
-    // Steady state: poll with a short read timeout so the server can
-    // schedule its own work (keep-alives) between client packets. A read
-    // timeout is a tick, not an error; anything else ends the connection.
-    // Known limitation (revisit with async IO): a client stalling longer
-    // than one poll INSIDE a frame would desync the stream — frame size
-    // caps turn that into a safe disconnect, never corruption.
-    conn.get_mut()
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .context("setting poll timeout")?;
-    let mut state = PlayState {
-        name: name.clone(),
-        x: 0.0,
-        y: 0.0,
-        z: 0.0,
-        yaw: 0.0,
-        pitch: 0.0,
-        pending_keep_alive: None,
-        center: None,
-        sent: std::collections::HashSet::new(),
-        teleport_id: 1,
-    };
+    // Steady state: the connection becomes an IO actor. The reader loop
+    // forwards Inbound events to the game thread; a writer thread drains
+    // Outbound frames onto a cloned socket. All world/streaming/keep-alive
+    // decisions live in the game thread.
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<game::Outbound>();
+    let conn_id = game_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register(tx_out);
+    let threshold = conn.compression_threshold();
+    let write_stream = conn
+        .get_ref()
+        .try_clone()
+        .context("cloning socket for writer")?;
+    let writer = std::thread::spawn(move || {
+        use std::io::Write as _;
+        let mut stream = write_stream;
+        for out in rx_out {
+            match out {
+                game::Outbound::Frame { id, body } => {
+                    let frame = doppel_protocol::encode_frame(threshold, id, &body);
+                    if stream.write_all(&frame).is_err() {
+                        break;
+                    }
+                }
+                game::Outbound::Disconnect => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+            }
+        }
+    });
+
     // The replayed join burst already delivered these chunks.
+    let mut sent = Vec::new();
     if let Some(b) = blobs {
         for (pid, body) in &b.play {
             if *pid == 0x2e {
                 if let Ok(chunk) = WireChunk::decode(body) {
-                    state.sent.insert((chunk.x, chunk.z));
+                    sent.push((chunk.x, chunk.z));
                 }
             }
         }
     }
-    loop {
-        match conn.read_packet() {
-            Ok((id, body)) => {
-                if let Err(e) = handle_play_packet(&mut conn, &mut state, id, &body, world, blobs) {
-                    eprintln!("[doppel] {}: {e:#}", state.name);
-                    break;
-                }
-            }
-            Err(e) => {
-                let timed_out = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                    matches!(
-                        io.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    )
-                });
-                if !timed_out {
-                    break; // EOF or protocol error: connection over
-                }
-            }
-        }
-        // Keep-alive scheduling on every poll tick.
-        match state.pending_keep_alive {
-            None => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let mut challenge = Vec::with_capacity(8);
-                challenge.extend_from_slice(&now.to_be_bytes());
-                if conn.write_packet(CB_KEEP_ALIVE, &challenge).is_err() {
-                    break;
-                }
-                state.pending_keep_alive = Some((now, std::time::Instant::now()));
-            }
-            Some((_, sent)) if sent.elapsed() > KEEP_ALIVE_INTERVAL => {
-                eprintln!("[doppel] {}: keep-alive timeout", state.name);
+    let _ = game_tx.send(game::Inbound::Joined {
+        conn: conn_id,
+        name: name.clone(),
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        sent,
+    });
+
+    // Reader: blocking reads, forwarding to the game thread. Reads continue
+    // until the writer disconnects us (socket shutdown breaks read too).
+    while let Ok((id, body)) = conn.read_packet() {
+        let event = play_event(conn_id, id, &body);
+        if let Some(event) = event {
+            if game_tx.send(event).is_err() {
                 break;
             }
-            Some(_) => {}
         }
     }
+    let _ = game_tx.send(game::Inbound::Left { conn: conn_id });
+    let _ = writer.join();
     Ok(())
 }
 
-/// Handles one serverbound play packet (26.x serverbound ids are stable
-/// across the 26.2→26.3 clientbound shifts). Unknown packets are ignored,
-/// matching vanilla's tolerance for forward-compat channels.
-fn handle_play_packet(
-    conn: &mut Conn<TcpStream>,
-    state: &mut PlayState,
-    id: i32,
-    body: &[u8],
-    world: Option<&SharedWorld>,
-    blobs: Option<&Blobs>,
-) -> Result<()> {
+/// Translates one serverbound play packet into a game-thread event.
+/// 26.x serverbound ids are stable across the 26.2→26.3 clientbound
+/// shifts. Unknown packets are ignored, matching vanilla's tolerance for
+/// forward-compat channels.
+fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound> {
     let mut r = Reader::new(body);
     match id {
         0x1c => {
-            // keep_alive: must echo the pending challenge exactly.
-            let answer = r.read_i64().context("keep alive id")?;
-            match state.pending_keep_alive {
-                Some((challenge, _)) if challenge == answer => {
-                    state.pending_keep_alive = None;
-                }
-                _ => bail!("keep-alive mismatch: answered {answer}"),
-            }
+            let answer = r.read_i64().ok()?;
+            Some(game::Inbound::KeepAliveAnswer { conn, id: answer })
         }
         0x1e => {
-            // move_player_pos
-            state.x = r.read_f64().context("x")?;
-            state.y = r.read_f64().context("y")?;
-            state.z = r.read_f64().context("z")?;
-            r.read_u8().context("flags")?;
-            stream_if_moved(conn, state, world, blobs)?;
+            let x = r.read_f64().ok()?;
+            let y = r.read_f64().ok()?;
+            let z = r.read_f64().ok()?;
+            Some(game::Inbound::Moved { conn, x, y, z })
         }
         0x1f => {
-            // move_player_pos_rot
-            state.x = r.read_f64().context("x")?;
-            state.y = r.read_f64().context("y")?;
-            state.z = r.read_f64().context("z")?;
-            state.yaw = r.read_f32().context("yaw")?;
-            state.pitch = r.read_f32().context("pitch")?;
-            r.read_u8().context("flags")?;
-            stream_if_moved(conn, state, world, blobs)?;
-        }
-        0x20 => {
-            // move_player_rot
-            state.yaw = r.read_f32().context("yaw")?;
-            state.pitch = r.read_f32().context("pitch")?;
-            r.read_u8().context("flags")?;
-        }
-        0x00 => {
-            // accept_teleportation (teleport id consumed for now)
-            r.read_varint().context("teleport id")?;
+            let x = r.read_f64().ok()?;
+            let y = r.read_f64().ok()?;
+            let z = r.read_f64().ok()?;
+            Some(game::Inbound::Moved { conn, x, y, z })
         }
         0x07 => {
             // chat_command (unsigned, no leading slash). Minimal /tp so the
             // walk-parity bot can drive Doppel exactly like vanilla.
-            let cmd = r.read_string(1024).context("command")?;
+            let cmd = r.read_string(1024).ok()?;
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if parts.len() == 5 && parts[0] == "tp" && parts[1] == "@s" {
                 if let (Ok(x), Ok(y), Ok(z)) = (
@@ -397,107 +308,26 @@ fn handle_play_packet(
                     parts[3].parse::<f64>(),
                     parts[4].parse::<f64>(),
                 ) {
-                    state.x = x;
-                    state.y = y;
-                    state.z = z;
-                    // Mirror vanilla's teleport: position sync the client
-                    // must acknowledge, then stream around the new position.
-                    let mut sync = Vec::with_capacity(64);
-                    write_varint(&mut sync, state.teleport_id);
-                    sync.extend_from_slice(&x.to_be_bytes());
-                    sync.extend_from_slice(&y.to_be_bytes());
-                    sync.extend_from_slice(&z.to_be_bytes());
-                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta x
-                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta y
-                    sync.extend_from_slice(&0.0f64.to_be_bytes()); // delta z
-                    sync.extend_from_slice(&state.yaw.to_be_bytes());
-                    sync.extend_from_slice(&state.pitch.to_be_bytes());
-                    sync.extend_from_slice(&0i32.to_be_bytes()); // relatives
-                    conn.write_packet(0x49, &sync)?;
-                    state.teleport_id += 1;
-                    stream_if_moved(conn, state, world, blobs)?;
+                    return Some(game::Inbound::Tp { conn, x, y, z });
                 }
             }
+            None
         }
-        _ => {
-            // movement-status-only (0x21), client_information, custom
-            // payloads and everything else: tolerated, unhandled.
-        }
+        _ => None,
     }
-    Ok(())
-}
-
-/// Vanilla's chunk-streaming choreography on view-center change, exactly as
-/// captured: cache center, forget leaving columns, then one batch of new
-/// chunks closed by batch_finished.
-fn stream_if_moved(
-    conn: &mut Conn<TcpStream>,
-    state: &mut PlayState,
-    world: Option<&SharedWorld>,
-    blobs: Option<&Blobs>,
-) -> Result<()> {
-    let (Some(world), Some(blobs)) = (world, blobs) else {
-        return Ok(());
-    };
-    let cx = state.x.floor().div_euclid(16.0) as i32;
-    let cz = state.z.floor().div_euclid(16.0) as i32;
-    if state.center == Some((cx, cz)) {
-        return Ok(());
-    }
-    state.center = Some((cx, cz));
-
-    // set_chunk_cache_center: VarInt chunkX, VarInt chunkZ
-    let mut center = Vec::new();
-    write_varint(&mut center, cx);
-    write_varint(&mut center, cz);
-    conn.write_packet(0x60, &center)?;
-
-    // View square around the new center.
-    const RADIUS: i32 = 4;
-    let desired: std::collections::HashSet<(i32, i32)> = (-RADIUS..=RADIUS)
-        .flat_map(move |dx| (-RADIUS..=RADIUS).map(move |dz| (cx + dx, cz + dz)))
-        .collect();
-
-    // forget_level_chunk for columns leaving view (packed chunk pos i64).
-    let leaving: Vec<(i32, i32)> = state.sent.difference(&desired).copied().collect();
-    for (x, z) in leaving {
-        let packed = ((x as i64 & 0x3ff_ffff) << 38) | ((z as i64 & 0x3ff_ffff) << 12);
-        conn.write_packet(0x26, &packed.to_be_bytes())?;
-        state.sent.remove(&(x, z));
-    }
-
-    // New columns in vanilla's observed order: nearest-first by ring.
-    let mut entering: Vec<(i32, i32)> = desired.difference(&state.sent).copied().collect();
-    entering.sort_by_key(|(x, z)| (x - cx).abs() + (z - cz).abs());
-    if entering.is_empty() {
-        return Ok(());
-    }
-    conn.write_packet(0x0c, &[])?; // batch start
-    let mut sent_now = 0u32;
-    for (x, z) in entering {
-        // A failed chunk must never abort the batch: skip it,
-        // always close with the count actually sent.
-        match stream_chunk(world, x, z, blobs) {
-            Ok(Some(chunk)) => {
-                conn.write_packet(0x2e, &chunk.encode())?;
-                state.sent.insert((x, z));
-                sent_now += 1;
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("[doppel] chunk ({x},{z}) skipped: {e:#}"),
-        }
-    }
-    let mut finished = Vec::new();
-    write_varint(&mut finished, sent_now as i32);
-    conn.write_packet(0x0b, &finished)?; // batch finished: VarInt count
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Connection dispatch
 // ---------------------------------------------------------------------------
 
-fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>, world: Option<SharedWorld>) {
+fn handle_conn(
+    stream: TcpStream,
+    pin: Pin,
+    blobs: Option<Arc<Blobs>>,
+    world: Option<SharedWorld>,
+    game: GameChannels,
+) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -521,7 +351,14 @@ fn handle_conn(stream: TcpStream, pin: Pin, blobs: Option<Arc<Blobs>>, world: Op
         let next_state = r.read_varint().context("next state")?;
         match next_state {
             1 => handle_status(&mut stream, &pin, client_protocol),
-            2 => handle_login(stream, &pin, blobs.as_deref(), world.as_ref()),
+            2 => handle_login(
+                stream,
+                &pin,
+                blobs.as_deref(),
+                world.as_ref(),
+                &game.tx,
+                &game.handle,
+            ),
             n => bail!("invalid next state {n}"),
         }
     })();
@@ -538,18 +375,42 @@ pub fn serve_on(
     blobs: Option<Arc<Blobs>>,
     world: Option<SharedWorld>,
 ) -> Result<()> {
+    // The game thread: single owner of world/streaming/keep-alive state.
+    let (tx, rx) = std::sync::mpsc::channel::<game::Inbound>();
+    let handle = std::sync::Arc::new(std::sync::Mutex::new(game::Game::new(
+        rx,
+        world.clone(),
+        blobs.clone(),
+    )));
+    {
+        let game = handle.clone();
+        std::thread::spawn(move || {
+            let mut game = game.lock().unwrap_or_else(|e| e.into_inner());
+            game.run();
+        });
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let pin = pin.clone();
                 let blobs = blobs.clone();
                 let world = world.clone();
-                std::thread::spawn(move || handle_conn(stream, pin, blobs, world));
+                let game = GameChannels {
+                    tx: tx.clone(),
+                    handle: handle.clone(),
+                };
+                std::thread::spawn(move || handle_conn(stream, pin, blobs, world, game));
             }
             Err(e) => eprintln!("[doppel] accept error: {e}"),
         }
     }
     Ok(())
+}
+
+/// Per-connection handle into the game thread.
+struct GameChannels {
+    tx: std::sync::mpsc::Sender<game::Inbound>,
+    handle: std::sync::Arc<std::sync::Mutex<game::Game>>,
 }
 
 /// Convenience for the binary: load pin (+ blobs from DOPPEL_BLOBS if set),
