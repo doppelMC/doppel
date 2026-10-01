@@ -107,7 +107,6 @@ fn handle_login(
     blobs: Option<&Blobs>,
     world: Option<&SharedWorld>,
     game_tx: &std::sync::mpsc::Sender<game::Inbound>,
-    game_handle: &std::sync::Arc<std::sync::Mutex<game::Game>>,
 ) -> Result<()> {
     let mut conn = Conn::new(stream);
 
@@ -211,10 +210,7 @@ fn handle_login(
     // Outbound frames onto a cloned socket. All world/streaming/keep-alive
     // decisions live in the game thread.
     let (tx_out, rx_out) = std::sync::mpsc::channel::<game::Outbound>();
-    let conn_id = game_handle
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .register(tx_out);
+    let conn_id = game::next_conn_id();
     let threshold = conn.compression_threshold();
     let write_stream = conn
         .get_ref()
@@ -257,6 +253,7 @@ fn handle_login(
         y: 0.0,
         z: 0.0,
         sent,
+        tx: tx_out,
     });
 
     // Reader: blocking reads, forwarding to the game thread. Reads continue
@@ -366,14 +363,7 @@ fn handle_conn(
         let next_state = r.read_varint().context("next state")?;
         match next_state {
             1 => handle_status(&mut stream, &pin, client_protocol),
-            2 => handle_login(
-                stream,
-                &pin,
-                blobs.as_deref(),
-                world.as_ref(),
-                &game.tx,
-                &game.handle,
-            ),
+            2 => handle_login(stream, &pin, blobs.as_deref(), world.as_ref(), &game.tx),
             n => bail!("invalid next state {n}"),
         }
     })();
@@ -391,18 +381,11 @@ pub fn serve_on(
     world: Option<SharedWorld>,
 ) -> Result<()> {
     // The game thread: single owner of world/streaming/keep-alive state.
+    // It owns the Game outright — no shared lock.
     let (tx, rx) = std::sync::mpsc::channel::<game::Inbound>();
-    let handle = std::sync::Arc::new(std::sync::Mutex::new(game::Game::new(
-        rx,
-        world.clone(),
-        blobs.clone(),
-    )));
     {
-        let game = handle.clone();
-        std::thread::spawn(move || {
-            let mut game = game.lock().unwrap_or_else(|e| e.into_inner());
-            game.run();
-        });
+        let mut game = game::Game::new(rx, world.clone(), blobs.clone());
+        std::thread::spawn(move || game.run());
     }
     for stream in listener.incoming() {
         match stream {
@@ -410,10 +393,7 @@ pub fn serve_on(
                 let pin = pin.clone();
                 let blobs = blobs.clone();
                 let world = world.clone();
-                let game = GameChannels {
-                    tx: tx.clone(),
-                    handle: handle.clone(),
-                };
+                let game = GameChannels { tx: tx.clone() };
                 std::thread::spawn(move || handle_conn(stream, pin, blobs, world, game));
             }
             Err(e) => eprintln!("[doppel] accept error: {e}"),
@@ -425,7 +405,6 @@ pub fn serve_on(
 /// Per-connection handle into the game thread.
 struct GameChannels {
     tx: std::sync::mpsc::Sender<game::Inbound>,
-    handle: std::sync::Arc<std::sync::Mutex<game::Game>>,
 }
 
 /// Convenience for the binary: load pin (+ blobs from DOPPEL_BLOBS if set),

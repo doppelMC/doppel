@@ -13,6 +13,15 @@ use crate::WireChunk;
 
 pub type ConnId = u64;
 
+/// Connection ids are self-assigned by the IO actors; the game thread only
+/// learns of them via `Inbound::Joined` (no shared lock anywhere).
+pub static CONN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Allocates a fresh connection id.
+pub fn next_conn_id() -> ConnId {
+    CONN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Events from connection actors to the game thread.
 pub enum Inbound {
     /// A player finished the join burst; `sent` lists chunks already
@@ -24,6 +33,9 @@ pub enum Inbound {
         y: f64,
         z: f64,
         sent: Vec<(i32, i32)>,
+        /// The connection actor's outbound channel; the game thread is the
+        /// sole writer once registration completes.
+        tx: Sender<Outbound>,
     },
     Moved {
         conn: ConnId,
@@ -91,7 +103,6 @@ pub struct Game {
     outbounds: HashMap<ConnId, Sender<Outbound>>,
     world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
     blobs: Option<std::sync::Arc<Blobs>>,
-    next_conn: ConnId,
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
     /// (localPos, state) changes awaiting the tick-end broadcast.
     dirty: std::collections::BTreeMap<(i32, i32, i32), Vec<(u64, u32)>>,
@@ -156,7 +167,6 @@ impl Game {
             outbounds: HashMap::new(),
             world,
             blobs,
-            next_conn: 0,
             dirty: std::collections::BTreeMap::new(),
             registry: doppel_protocol::find_repo_root().ok().and_then(|r| {
                 let p = r.join("pins").join("blocks.json");
@@ -173,13 +183,6 @@ impl Game {
             pending: std::collections::BTreeSet::new(),
             torch_queue: Vec::new(),
         }
-    }
-
-    pub fn register(&mut self, tx: Sender<Outbound>) -> ConnId {
-        let id = self.next_conn;
-        self.next_conn += 1;
-        self.outbounds.insert(id, tx);
-        id
     }
 
     /// The event loop. The 1s recv timeout doubles as the coarse keep-alive
@@ -264,7 +267,9 @@ impl Game {
                 y,
                 z,
                 sent,
+                tx,
             } => {
+                self.outbounds.insert(conn, tx);
                 // Register the viewer index for chunks the join burst
                 // already delivered — without this, block broadcasts skip
                 // players who never triggered movement streaming.
