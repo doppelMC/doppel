@@ -1000,7 +1000,7 @@ pub fn parity_redstone() -> Result<bool> {
                 failures.push(format!("pos {:?}: vanilla {st} != doppel {ds}", pos));
                 // History: every vanilla/doppel update packet mentioning
                 // the lever's coordinate bytes, in order.
-                let hist = |pkts: &[&bot::CapturedPacket]| -> Vec<String> {
+                let _hist = |pkts: &[&bot::CapturedPacket]| -> Vec<String> {
                     let mut out = Vec::new();
                     for (i, p) in pkts.iter().enumerate() {
                         let raw = hex::decode(&p.head_hex).unwrap_or_default();
@@ -1021,8 +1021,15 @@ pub fn parity_redstone() -> Result<bool> {
                     }
                     out
                 };
-                println!("  vanilla pkts: {:?}", hist(v_updates.as_slice()));
-                println!("  doppel pkts: {:?}", hist(d_updates.as_slice()));
+                let listing = |pkts: &[&bot::CapturedPacket]| -> String {
+                    pkts.iter()
+                        .enumerate()
+                        .map(|(i, p)| format!("#{i}:0x{:02x}/{}", p.id, p.body_len))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                println!("  vanilla all: {}", listing(v_updates.as_slice()));
+                println!("  doppel all: {}", listing(d_updates.as_slice()));
             }
             None => failures.push(format!("pos {:?}: vanilla {st}, missing in doppel", pos)),
         }
