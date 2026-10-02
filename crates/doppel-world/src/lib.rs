@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub mod anvil_to_wire;
 pub mod chunk_codec;
+pub mod noise;
 pub mod registry;
 pub mod worldgen;
 
