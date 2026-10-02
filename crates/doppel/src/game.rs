@@ -545,6 +545,7 @@ impl Game {
                 p.teleport_id += 1;
                 self.send(conn, 0x49, &sync);
                 self.stream_if_moved(conn);
+                self.send_command_feedback(conn);
             }
             Inbound::KeepAliveAnswer { conn, id } => {
                 if let Some(p) = self.players.get_mut(&conn) {

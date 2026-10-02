@@ -343,12 +343,7 @@ pub fn login_capture(
                 conn.get_ref().set_read_timeout(Some(idle_timeout))?;
                 if !raw_sent && !raw_packets.is_empty() {
                     raw_sent = true;
-                    for (i, (id, body)) in raw_packets.iter().enumerate() {
-                        if i > 0 {
-                            // Space the interactions apart so a decoder
-                            // rejection is attributable to one packet.
-                            std::thread::sleep(Duration::from_millis(1500));
-                        }
+                    for (id, body) in raw_packets {
                         conn.write_packet(*id, body)?;
                     }
                     note = Some("sent raw interaction packets".to_string());
