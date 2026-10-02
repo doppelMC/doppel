@@ -1261,6 +1261,29 @@ pub fn parity_placement() -> Result<bool> {
         let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
         decode_update_writes(&refs)
     };
+    for (who, pkts) in [("vanilla", &v), ("doppel", &d)] {
+        let total = pkts.len();
+        let ended = pkts.iter().rev().find(|p| p.id < 0);
+        let ids: Vec<String> = pkts
+            .iter()
+            .filter(|p| p.id >= 0)
+            .take(12)
+            .map(|p| format!("0x{:02x}", p.id))
+            .collect();
+        let tail: Vec<String> = pkts
+            .iter()
+            .filter(|p| p.id >= 0)
+            .rev()
+            .take(8)
+            .map(|p| format!("0x{:02x}", p.id))
+            .collect();
+        println!(
+            "[oracle] {who}: {total} frames, head [{:?}] tail [{:?}], end-note: {:?}",
+            ids.join(" "),
+            tail.join(" "),
+            ended.and_then(|p| p.note.clone()).unwrap_or_default()
+        );
+    }
     let vw = updates(&v);
     let dw = updates(&d);
     println!(
