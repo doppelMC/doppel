@@ -307,7 +307,7 @@ fn run_sessions(
             },
         )
     });
-    std::thread::sleep(Duration::from_secs(8));
+    std::thread::sleep(Duration::from_secs(5));
     let login = capture::login_start_c("Doppel");
     let digger = bot::login_capture(
         "127.0.0.1",
@@ -404,8 +404,9 @@ pub fn parity_survival() -> Result<bool> {
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
     // Vanilla reference sessions; the deadline ends the idle-fed
-    // captures, and with them the random tick window.
-    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    // captures, and with them the random tick window. The peaceful boot
+    // keeps monsters out of the scenario window entirely.
+    let server = vanilla::boot_peaceful(&pin, &jar, VANILLA_PORT)?;
     let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
     let vdeadline = std::time::Instant::now() + Duration::from_secs(40);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {

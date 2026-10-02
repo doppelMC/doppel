@@ -129,6 +129,28 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
     boot_with_properties(pin, jar, port, &properties)
 }
 
+/// Boots vanilla for the survival gate: the flat configuration plus
+/// peaceful difficulty. Spawner gamerules only stop future spawns, so a
+/// normal boot keeps whatever mob swarm built up before the scripted
+/// volley lands - and a swarm can shove or kill the scenario's player.
+/// Peaceful difficulty holds monsters out entirely; drops, pickup, and
+/// random ticks are difficulty-independent.
+pub fn boot_peaceful(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer> {
+    let properties = format!(
+        "online-mode=false\n\
+         white-list=false\n\
+         server-port={port}\n\
+         level-type=minecraft\\:flat\n\
+         generate-structures=false\n\
+         view-distance=4\n\
+         simulation-distance=4\n\
+         spawn-protection=0\n\
+         sync-chunk-writes=false\n\
+         difficulty=peaceful\n"
+    );
+    boot_with_properties(pin, jar, port, &properties)
+}
+
 /// Boots vanilla with a pinned seed and normal terrain generation, for
 /// worldgen parity comparisons.
 pub fn boot_seeded(
