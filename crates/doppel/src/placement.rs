@@ -710,7 +710,6 @@ mod tests {
     // -- placement -----------------------------------------------------
 
     #[test]
-    #[test]
     fn tp_then_place_repro() {
         let (mut g, rx) = harness();
         g.handle(crate::game::Inbound::Tp {
@@ -725,6 +724,7 @@ mod tests {
         let _ = rx;
     }
 
+    #[test]
     fn places_on_every_face() {
         let (mut g, rx) = harness();
         give(&mut g, "minecraft:stone", 64);
