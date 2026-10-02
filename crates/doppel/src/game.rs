@@ -219,6 +219,13 @@ pub enum PendingKind {
 pub enum TickAction {
     /// Recompute redstone behavior at the position (neighbor notified).
     NeighborUpdate,
+    /// A block changed at pos + dir: wires recompute that one side (the
+    /// reference's directional updateShape); others recompute behavior.
+    ShapeUpdate {
+        dx: i32,
+        dy: i32,
+        dz: i32,
+    },
     /// Observer pulse edge: toggle powered, maybe chain the falling edge.
     ObserverToggle,
     /// Repeater output edge: apply the scheduled input change.
@@ -368,6 +375,9 @@ impl Game {
         for ((x, y, z), action) in due {
             match action {
                 TickAction::NeighborUpdate => self.update_block(x, y, z),
+                TickAction::ShapeUpdate { dx, dy, dz } => {
+                    self.update_block_from(x, y, z, dx, dy, dz)
+                }
                 TickAction::ObserverToggle => self.observer_toggle(x, y, z),
                 TickAction::RepeaterToggle => self.repeater_toggle(x, y, z),
                 TickAction::ComparatorToggle => self.comparator_toggle(x, y, z),
@@ -669,7 +679,11 @@ impl Game {
                 self.scheduled.push((
                     self.tick,
                     (x + dx, y + dy, z + dz),
-                    TickAction::NeighborUpdate,
+                    TickAction::ShapeUpdate {
+                        dx: -dx,
+                        dy: -dy,
+                        dz: -dz,
+                    },
                 ));
             }
             self.scheduled
@@ -762,6 +776,22 @@ impl Game {
     /// Recompute a wire's power; on change, update + notify neighbors.
     fn update_wire(&mut self, x: i32, y: i32, z: i32, props: &str) {
         wire::update_wire_cascade(self, x, y, z, props);
+    }
+
+    /// A block changed at (x + dx, y + dy, z + dz): the reference's
+    /// directional updateShape. Wires recompute the one side facing the
+    /// change (a connectivity flip triggers the full re-derive; a visual
+    /// up/side flip just swaps the side); everything else falls through
+    /// to the undirected recompute.
+    fn update_block_from(&mut self, x: i32, y: i32, z: i32, dx: i32, dy: i32, dz: i32) {
+        let Some((name, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        if name == "minecraft:redstone_wire" {
+            wire::update_wire_side(self, (x, y, z), &props, dx, dy, dz);
+            return;
+        }
+        self.update_block(x, y, z);
     }
 
     /// Torch: lit unless its supporting block carries power. Simple model:

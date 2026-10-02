@@ -351,6 +351,23 @@ impl Connections {
         }
     }
 
+    fn get(self, d: Dir) -> Side {
+        match d {
+            Dir::North => self.north,
+            Dir::East => self.east,
+            Dir::South => self.south,
+            Dir::West => self.west,
+            _ => Side::None,
+        }
+    }
+
+    fn is_cross(self) -> bool {
+        self.north.is_connected()
+            && self.east.is_connected()
+            && self.south.is_connected()
+            && self.west.is_connected()
+    }
+
     fn is_dot(self) -> bool {
         !self.north.is_connected()
             && !self.east.is_connected()
@@ -395,6 +412,25 @@ impl Connections {
 /// Per-block connection rules.
 /// `direction` is from the wire toward the candidate block; the diagonal
 /// probes pass `None`, for which only wires answer true.
+/// The horizontal direction for a unit offset, if it is one.
+fn dir_from_offset(dx: i32, dy: i32, dz: i32) -> Option<Dir> {
+    if dy != 0 || dx.abs() + dz.abs() != 1 {
+        return None;
+    }
+    match (dx, dz) {
+        (1, 0) => Some(Dir::East),
+        (-1, 0) => Some(Dir::West),
+        (0, 1) => Some(Dir::South),
+        (0, -1) => Some(Dir::North),
+        _ => None,
+    }
+}
+
+/// A wire may climb when nothing conductive sits directly above it.
+fn can_connect_up(view: &impl BlockView, p: Pos) -> bool {
+    !get(view, at(p, Dir::Up)).is_some_and(|(name, _)| is_conductor(&name))
+}
+
 fn should_connect_to(view: &impl BlockView, p: Pos, direction: Option<Dir>) -> bool {
     let Some((name, props)) = get(view, p) else {
         return false;
@@ -791,7 +827,6 @@ fn update_wire_strength(host: &mut impl WireHost, p: Pos, props: &str, queue: &m
 fn execute_update(host: &mut impl WireHost, queue: &mut NeighborQueue, p: Pos) {
     if let Some((name, props)) = get(host, p) {
         if is_wire(&name) {
-            let props = refresh_wire_shape(host, p, &props);
             update_wire_strength(host, p, &props, queue);
         } else {
             host.dispatch_neighbor_changed(p.0, p.1, p.2);
@@ -831,6 +866,35 @@ pub fn update_wire_cascade(host: &mut impl WireHost, x: i32, y: i32, z: i32, pro
     let props = refresh_wire_shape(host, (x, y, z), props);
     update_wire_strength(host, (x, y, z), &props, &mut queue);
     queue.drain(host);
+}
+
+/// The directional shape update: recompute only the side facing the
+/// change. A connectivity flip (or a current cross) re-derives the whole
+/// state; a plain up/side visual flip swaps the one side.
+pub fn update_wire_side(host: &mut impl WireHost, p: Pos, props: &str, dx: i32, dy: i32, dz: i32) {
+    let (x, y, z) = p;
+    let Some(dir) = dir_from_offset(dx, dy, dz) else {
+        refresh_wire_shape(host, p, props);
+        return;
+    };
+    let stored = Connections::from_props(props);
+    let was_cross = stored.is_cross();
+    let side = get_connecting_side(host, p, dir, can_connect_up(host, p));
+    let current = stored.get(dir);
+    if side.is_connected() == current.is_connected() && !was_cross {
+        if side != current {
+            let mut c = stored;
+            c.set(dir, side);
+            let power = wire_power_of(props);
+            if let Some(state) = host.resolve_wire_state(&c, power) {
+                if get(host, p).is_some_and(|(n, _)| is_wire(&n)) {
+                    host.set_wire_state(x, y, z, state);
+                }
+            }
+        }
+        return;
+    }
+    refresh_wire_shape(host, p, props);
 }
 
 // ----------------------------------------------------------------------
