@@ -20,11 +20,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --workspace
 
-  parity-status:
-    name: parity - status ping vs vanilla
+  parity:
+    name: parity - ${{ matrix.gate }} vs vanilla
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [status, login, walk, blocks, redstone, placement]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@v1
@@ -39,18 +43,8 @@ jobs:
         run: cargo build --release
       - name: Pin latest vanilla release
         run: cargo run --release -p doppel-oracle -- pin
-      - name: Differential status test
-        run: cargo run --release -p doppel-oracle -- parity-status
-      - name: Differential login test
-        run: cargo run --release -p doppel-oracle -- parity-login
-      - name: Differential walk test
-        run: cargo run --release -p doppel-oracle -- parity-walk
-      - name: Differential block test
-        run: cargo run --release -p doppel-oracle -- parity-blocks
-      - name: Differential redstone test
-        run: cargo run --release -p doppel-oracle -- parity-redstone
-      - name: Differential placement test
-        run: cargo run --release -p doppel-oracle -- parity-placement
+      - name: Differential ${{ matrix.gate }} test
+        run: cargo run --release -p doppel-oracle -- parity-${{ matrix.gate }}
 
   capture-vanilla:
     name: capture - vanilla login transcript
