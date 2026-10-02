@@ -131,6 +131,17 @@ pub enum Inbound {
         hand: u8,
         sequence: i32,
     },
+    // --- breaking hooks (placement.rs) ---
+    /// `player_action`: dig lifecycle, drops, and the offhand swap.
+    PlayerAction {
+        conn: ConnId,
+        act: crate::placement::PlayerAction,
+    },
+    /// `punch`: the arm swing. The reference resets its last-action clock
+    /// and swings; the broadcast back is client-cosmetic animation.
+    Punch {
+        conn: ConnId,
+    },
     // --- containers hooks (containers.rs) ---
     /// `opencontainer x y z` (harness driver): open the container menu
     /// at a block position.
@@ -177,6 +188,39 @@ pub(crate) struct Player {
     // --- containers hooks (containers.rs) ---
     pub(crate) menu: Option<containers::OpenMenu>,
     pub(crate) container_counter: i32,
+    // --- breaking hooks (placement.rs) ---
+    /// The wire identity destruction overlays key on. Vanilla assigns
+    /// incremental entity ids; this build has no entity model, so a
+    /// server-side counter fills the slot.
+    entity_id: i32,
+    /// An active dig (vanilla's destroying-block state).
+    dig: Option<DigState>,
+    /// Vanilla's delayed destroy: a STOP below the finish threshold
+    /// keeps grinding with the dig's start tick as the spent-tick count.
+    delayed_destroy: Option<DelayedDestroy>,
+    /// The last destruction stage sent for this player (dedup guard;
+    /// -1 means no overlay).
+    last_stage: i32,
+    /// Ticks since this player joined: the counter dig progress runs on
+    /// (vanilla's per-player game-mode ticks, not world time).
+    game_ticks: u64,
+}
+
+/// One active dig. `start_tick` is the digger's own tick count when the
+/// dig began (vanilla's destroyProgressStart).
+#[derive(Clone, Copy)]
+struct DigState {
+    pos: (i32, i32, i32),
+    start_tick: u64,
+    direction: u8,
+}
+
+/// A destroy that STOPped below the finish threshold: it completes on a
+/// later tick with the ORIGINAL dig's start tick as the multiplier.
+#[derive(Clone, Copy)]
+struct DelayedDestroy {
+    pos: (i32, i32, i32),
+    tick_start: u64,
 }
 
 /// One cached, versioned chunk. `wire` is the sendable form; block
@@ -232,6 +276,8 @@ pub struct Game {
     comparator_outputs: std::collections::HashMap<(i32, i32, i32), i32>,
     // --- containers hooks (containers.rs) ---
     containers: containers::ContainersState,
+    /// Per-join entity ids for destruction overlays (see Player).
+    next_entity_id: i32,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -347,6 +393,7 @@ impl Game {
             moving: Vec::new(),
             comparator_outputs: std::collections::HashMap::new(),
             containers: Default::default(),
+            next_entity_id: 1,
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -398,6 +445,13 @@ impl Game {
     /// One game tick (50ms): fire scheduled actions, then housekeeping.
     fn game_tick(&mut self) {
         self.tick += 1;
+        // Dig progress advances with the tick counter (the reference's
+        // per-player game mode tick); breaks land in this tick's flush.
+        self.advance_digs();
+        // --- inventory hooks (inventory.rs) ---
+        // The per-tick menu broadcast: non-click inventory changes sync
+        // here unless a container menu masks them.
+        self.broadcast_pending_inventory();
         if self.tick.is_multiple_of(20) {
             // set_time (0x73): gameTime i64 + day counter. Static world
             // placeholder until time simulation lands.
@@ -483,6 +537,8 @@ impl Game {
                 for chunk in &sent {
                     self.viewers.entry(*chunk).or_default().push(conn);
                 }
+                let entity_id = self.next_entity_id;
+                self.next_entity_id += 1;
                 self.players.insert(
                     conn,
                     Player {
@@ -500,6 +556,11 @@ impl Game {
                         inv: Default::default(),
                         menu: None,
                         container_counter: 0,
+                        entity_id,
+                        dig: None,
+                        delayed_destroy: None,
+                        last_stage: -1,
+                        game_ticks: 0,
                     },
                 );
             }
@@ -599,6 +660,11 @@ impl Game {
                 hand,
                 ..
             } => self.place_from_hand(conn, x, y, z, face, hand),
+            // --- breaking hooks (placement.rs) ---
+            Inbound::PlayerAction { conn, act } => self.player_action(conn, act),
+            // The swing has no server-visible effect yet: the reference
+            // only resets an idle clock that this build never reads.
+            Inbound::Punch { conn: _ } => {}
             // --- containers hooks (containers.rs) ---
             Inbound::OpenContainer { conn, x, y, z } => {
                 self.open_container(conn, x, y, z);
@@ -668,6 +734,22 @@ impl Game {
     /// clicked face, place it, and spend one item (survival). The parse
     /// and the per-family geometry live in placement.rs.
     fn place_from_hand(&mut self, conn: ConnId, x: i32, y: i32, z: i32, face: u8, hand: u8) {
+        // The clicked block's use runs first (the reference's
+        // block-before-item rule): a container right-click opens the menu
+        // and consumes the click whether or not the menu actually opens
+        // (a blocked chest answers success without opening). The held
+        // item neither places nor spends.
+        if matches!(
+            self.get_block(x, y, z),
+            Some((ref n, _)) if matches!(n.as_str(), "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:hopper")
+        ) {
+            self.open_container(conn, x, y, z);
+            return;
+        }
+        // NOTE(breaking): the other menu-providing blocks (barrel,
+        // furnace, dispenser, dropper, ender chest, shulker box,
+        // crafting table) also consume the click in the reference; their
+        // menus are future work and placement still wins here.
         let (slot, block, form, yaw, pitch, creative) = {
             let Some(p) = self.players.get(&conn) else {
                 return;
@@ -728,30 +810,366 @@ impl Game {
         if creative {
             return;
         }
-        let body = {
+        // The spent stack queues for the per-tick menu broadcast: a
+        // container menu open by broadcast time masks the sync (its open
+        // snapshot already carries the new count).
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        let remaining = p
+            .inv
+            .inventory
+            .get(slot)
+            .map(|s| s.with_count(s.count() - 1))
+            .filter(|s| !s.is_empty());
+        p.inv.inventory.set(slot, remaining);
+        p.inv.pending_sync.insert(slot);
+    }
+
+    // --- breaking hooks (placement.rs) ---
+
+    /// One serverbound player_action: dig lifecycle, drops, swaps.
+    fn player_action(&mut self, conn: ConnId, act: crate::placement::PlayerAction) {
+        let crate::placement::PlayerAction {
+            action,
+            x,
+            y,
+            z,
+            direction,
+            sequence,
+        } = act;
+        // The sequence would echo in a block_changed_ack; this build
+        // sends none (the NOTE(placement) wire gap).
+        let _ = sequence;
+        match action {
+            crate::placement::ACTION_START_DESTROY
+            | crate::placement::ACTION_CHANGE_DESTROY_DIRECTION
+            | crate::placement::ACTION_ABORT_DESTROY
+            | crate::placement::ACTION_STOP_DESTROY => {
+                self.handle_block_break_action(conn, action, (x, y, z), direction)
+            }
+            crate::placement::ACTION_DROP_ALL => self.drop_held(conn, true),
+            crate::placement::ACTION_DROP_ITEM => self.drop_held(conn, false),
+            // STAB (piercing weapons), the offhand swap, and item release
+            // have no models yet; parse-accept matches the wire contract.
+            _ => {}
+        }
+    }
+
+    /// The dig state machine (start / redirect / stop / abort), with the
+    /// interaction-range gate every arm shares.
+    fn handle_block_break_action(
+        &mut self,
+        conn: ConnId,
+        action: i32,
+        pos: (i32, i32, i32),
+        direction: u8,
+    ) {
+        if !self.within_reach(conn, pos) {
+            // An abort is the one arm that still runs out of range, and
+            // only against the dig it interrupts.
+            if action == crate::placement::ACTION_ABORT_DESTROY
+                && self.players.get(&conn).is_some_and(|p| p.dig.is_some())
+            {
+                self.abort_destroy(conn, pos);
+            }
+            return;
+        }
+        if pos.1 > WORLD_MAX_Y {
+            // The reference echoes the block back to the actor here; no
+            // per-actor block-update path exists yet.
+            return;
+        }
+        match action {
+            crate::placement::ACTION_START_DESTROY => self.start_destroy(conn, pos, direction),
+            crate::placement::ACTION_CHANGE_DESTROY_DIRECTION => {
+                if let Some(p) = self.players.get_mut(&conn) {
+                    if let Some(dig) = p.dig.as_mut() {
+                        dig.direction = direction;
+                    }
+                }
+            }
+            crate::placement::ACTION_STOP_DESTROY => self.stop_destroy(conn, pos),
+            crate::placement::ACTION_ABORT_DESTROY => self.abort_destroy(conn, pos),
+            _ => {}
+        }
+    }
+
+    /// Interaction reach: distance from the eye (feet + 1.62) to the
+    /// target's unit cube, inside block range + 1.0 of slack. Creative
+    /// reaches 5.0, survival 4.5.
+    fn within_reach(&self, conn: ConnId, pos: (i32, i32, i32)) -> bool {
+        let Some(p) = self.players.get(&conn) else {
+            return false;
+        };
+        let axis = |v: f64, lo: f64| (lo - v).max(0.0).max(v - (lo + 1.0));
+        let (ex, ey, ez) = (p.x, p.y + 1.62, p.z);
+        let dx = axis(ex, pos.0 as f64);
+        let dy = axis(ey, pos.1 as f64);
+        let dz = axis(ez, pos.2 as f64);
+        let range = if p.inv.creative { 5.0 } else { 4.5 } + 1.0;
+        dx * dx + dy * dy + dz * dz < range * range
+    }
+
+    fn start_destroy(&mut self, conn: ConnId, pos: (i32, i32, i32), direction: u8) {
+        let creative = self.players.get(&conn).is_some_and(|p| p.inv.creative);
+        let block = self.get_block(pos.0, pos.1, pos.2);
+        let name = block.as_ref().map(|(n, _)| n.clone());
+        // Unloaded reads count as air: the reference always sees a block.
+        let is_air = !matches!(name.as_deref(), Some(n) if n != "minecraft:air");
+        if creative {
+            self.break_block(conn, pos);
+            return;
+        }
+        // One tick of progress: bare hand, the block's own hardness.
+        let (dt, tool) = name
+            .as_deref()
+            .filter(|_| !is_air)
+            .map(crate::placement::hardness)
+            .unwrap_or((0.0, false));
+        let progress = if is_air {
+            1.0f32
+        } else {
+            crate::placement::per_tick_progress(dt, tool)
+        };
+        if !is_air && progress >= 1.0 {
+            // Insta-break (destroyTime 0 divides to infinity).
+            self.break_block(conn, pos);
+            return;
+        }
+        {
             let Some(p) = self.players.get_mut(&conn) else {
                 return;
             };
-            let remaining = p
-                .inv
-                .inventory
-                .get(slot)
-                .map(|s| s.with_count(s.count() - 1))
-                .filter(|s| !s.is_empty());
-            p.inv.inventory.set(slot, remaining);
-            let state_id = p.inv.session.next_state_id();
-            match crate::inventory::container_to_menu(slot) {
-                Some(menu) => crate::inventory::encode_container_set_slot(
-                    0,
-                    state_id,
-                    menu as i16,
-                    p.inv.inventory.get(slot).as_ref(),
-                ),
-                None => Vec::new(),
-            }
+            // NOTE(breaking): interrupting a different dig echoes the old
+            // target's block to the actor in the reference; skipped.
+            let start_tick = p.game_ticks;
+            p.dig = Some(DigState {
+                pos,
+                start_tick,
+                direction,
+            });
+        }
+        let stage = crate::placement::destroy_stage(progress);
+        self.broadcast_destruction(conn, pos, stage);
+        if let Some(p) = self.players.get_mut(&conn) {
+            p.last_stage = stage;
+        }
+    }
+
+    fn stop_destroy(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
+        let Some((start_tick, now)) = self.players.get(&conn).and_then(|p| {
+            p.dig
+                .filter(|d| d.pos == pos)
+                .map(|d| (d.start_tick, p.game_ticks))
+        }) else {
+            return;
         };
-        if !body.is_empty() {
-            self.send(conn, crate::inventory::PACKET_CONTAINER_SET_SLOT, &body);
+        let Some((name, _)) = self.get_block(pos.0, pos.1, pos.2) else {
+            return;
+        };
+        if name == "minecraft:air" {
+            return;
+        }
+        let (dt, tool) = crate::placement::hardness(&name);
+        let progress =
+            crate::placement::per_tick_progress(dt, tool) * (now - start_tick + 1) as f32;
+        if progress >= 0.7 {
+            if let Some(p) = self.players.get_mut(&conn) {
+                p.dig = None;
+            }
+            self.broadcast_destruction(conn, pos, -1);
+            self.break_block(conn, pos);
+            return;
+        }
+        // Below threshold the dig converts to a delayed destroy that
+        // keeps the original start tick as its spent-tick count.
+        if let Some(p) = self.players.get_mut(&conn) {
+            if p.delayed_destroy.is_none() {
+                p.dig = None;
+                p.delayed_destroy = Some(DelayedDestroy {
+                    pos,
+                    tick_start: start_tick,
+                });
+            }
+        }
+    }
+
+    fn abort_destroy(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
+        let old = self
+            .players
+            .get_mut(&conn)
+            .and_then(|p| p.dig.take())
+            .map(|d| d.pos);
+        if let Some(old) = old {
+            if old != pos {
+                self.broadcast_destruction(conn, old, -1);
+            }
+        }
+        self.broadcast_destruction(conn, pos, -1);
+    }
+
+    /// Removes the block (air + neighbor notifications + broadcast);
+    /// the surrounding removal choreography (pairing, drops) is the
+    /// set_block path's own.
+    fn break_block(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
+        let _ = conn;
+        // NOTE(breaking): drops are discarded (no item entities yet);
+        // the survival loop's pickup half waits on them.
+        self.set_block(pos.0, pos.1, pos.2, AIR_STATE, true);
+    }
+
+    /// Spends the held stack: whole stack for drop-all, one item for the
+    /// single drop. The discarded half is the same gap as break drops.
+    /// The slot change queues for the per-tick menu broadcast like any
+    /// other non-click change.
+    fn drop_held(&mut self, conn: ConnId, all: bool) {
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        let slot = p.inv.inventory.selected() as usize;
+        let held = p.inv.inventory.get(slot);
+        if held.is_none() {
+            return;
+        }
+        let remaining = if all {
+            None
+        } else {
+            held.map(|s| s.with_count(s.count() - 1))
+                .filter(|s| !s.is_empty())
+        };
+        p.inv.inventory.set(slot, remaining);
+        p.inv.pending_sync.insert(slot);
+    }
+
+    /// Per-tick dig advance: delayed destroys finish, active digs deepen
+    /// their overlay. The two are exclusive per player (a pending delayed
+    /// destroy starves the active dig). Breaks land in this tick's flush.
+    fn advance_digs(&mut self) {
+        enum Step {
+            ClearDelayed,
+            DelayedStage((i32, i32, i32), i32),
+            DelayedBreak((i32, i32, i32), i32, bool),
+            ClearDig((i32, i32, i32)),
+            DigStage((i32, i32, i32), i32),
+        }
+        let conns: Vec<ConnId> = self.players.keys().copied().collect();
+        for conn in conns {
+            // The dig clock is per player and counts every tick, dig or
+            // not (the reference increments its counter before branching).
+            if let Some(p) = self.players.get_mut(&conn) {
+                p.game_ticks += 1;
+            }
+            let step = {
+                let Some(p) = self.players.get(&conn) else {
+                    continue;
+                };
+                if let Some(d) = p.delayed_destroy {
+                    match self.get_block(d.pos.0, d.pos.1, d.pos.2) {
+                        Some((n, _)) if n != "minecraft:air" => {
+                            let (dt, tool) = crate::placement::hardness(&n);
+                            // The delayed path passes the START tick, not
+                            // the ticks since the STOP: progress is frozen
+                            // unless the dig began late in the session.
+                            let progress = crate::placement::per_tick_progress(dt, tool)
+                                * (d.tick_start + 1) as f32;
+                            let stage = crate::placement::destroy_stage(progress);
+                            if progress >= 1.0 {
+                                Step::DelayedBreak(d.pos, stage, stage != p.last_stage)
+                            } else if stage != p.last_stage {
+                                Step::DelayedStage(d.pos, stage)
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => Step::ClearDelayed,
+                    }
+                } else if let Some(dig) = p.dig {
+                    match self.get_block(dig.pos.0, dig.pos.1, dig.pos.2) {
+                        Some((n, _)) if n != "minecraft:air" => {
+                            let (dt, tool) = crate::placement::hardness(&n);
+                            let spent = (p.game_ticks - dig.start_tick) as f32;
+                            let progress =
+                                crate::placement::per_tick_progress(dt, tool) * (spent + 1.0);
+                            let stage = crate::placement::destroy_stage(progress);
+                            if stage != p.last_stage {
+                                Step::DigStage(dig.pos, stage)
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => Step::ClearDig(dig.pos),
+                    }
+                } else {
+                    continue;
+                }
+            };
+            match step {
+                Step::ClearDelayed => {
+                    if let Some(p) = self.players.get_mut(&conn) {
+                        p.delayed_destroy = None;
+                    }
+                }
+                Step::DelayedStage(pos, stage) => {
+                    self.broadcast_destruction(conn, pos, stage);
+                    if let Some(p) = self.players.get_mut(&conn) {
+                        p.last_stage = stage;
+                    }
+                }
+                Step::DelayedBreak(pos, stage, changed) => {
+                    if changed {
+                        self.broadcast_destruction(conn, pos, stage);
+                    }
+                    if let Some(p) = self.players.get_mut(&conn) {
+                        p.last_stage = stage;
+                        p.delayed_destroy = None;
+                    }
+                    self.break_block(conn, pos);
+                }
+                Step::ClearDig(pos) => {
+                    self.broadcast_destruction(conn, pos, -1);
+                    if let Some(p) = self.players.get_mut(&conn) {
+                        p.last_stage = -1;
+                        p.dig = None;
+                    }
+                }
+                Step::DigStage(pos, stage) => {
+                    self.broadcast_destruction(conn, pos, stage);
+                    if let Some(p) = self.players.get_mut(&conn) {
+                        p.last_stage = stage;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The destruction overlay broadcast: every player within 32 blocks
+    /// of the block's origin except the digger, whose own client renders
+    /// the overlay locally.
+    fn broadcast_destruction(&mut self, digger: ConnId, pos: (i32, i32, i32), stage: i32) {
+        let entity_id = self.players.get(&digger).map(|p| p.entity_id).unwrap_or(0);
+        let packed = (((pos.0 as i64) & 0x3ff_ffff) << 38)
+            | (((pos.2 as i64) & 0x3ff_ffff) << 12)
+            | ((pos.1 as i64) & 0xfff);
+        let mut body = Vec::with_capacity(14);
+        doppel_protocol::write_varint(&mut body, entity_id);
+        body.extend_from_slice(&packed.to_be_bytes());
+        // writeByte semantics: the low 8 bits of the stage int.
+        body.push(stage as u8);
+        let targets: Vec<ConnId> = self
+            .players
+            .iter()
+            .filter(|(&conn, p)| {
+                if conn == digger {
+                    return false;
+                }
+                let (dx, dy, dz) = (pos.0 as f64 - p.x, pos.1 as f64 - p.y, pos.2 as f64 - p.z);
+                dx * dx + dy * dy + dz * dz < 1024.0
+            })
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in targets {
+            self.send(conn, crate::placement::CLIENTBOUND_BLOCK_DESTRUCTION, &body);
         }
     }
 
@@ -2154,6 +2572,8 @@ impl Game {
         tx: Sender<Outbound>,
     ) {
         self.outbounds.insert(conn, tx);
+        let entity_id = self.next_entity_id;
+        self.next_entity_id += 1;
         self.players.insert(
             conn,
             Player {
@@ -2171,6 +2591,11 @@ impl Game {
                 inv: Default::default(),
                 menu: None,
                 container_counter: 0,
+                entity_id,
+                dig: None,
+                delayed_destroy: None,
+                last_stage: -1,
+                game_ticks: 0,
             },
         );
         for c in chunks {

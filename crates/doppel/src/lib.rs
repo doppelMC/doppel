@@ -198,8 +198,30 @@ fn handle_login(
     // directory is configured, chunks are REBUILT from Anvil storage (the
     // capture only bootstraps the name->id palette maps and supplies light
     // data). Parity proves the Anvil-built bytes identical to vanilla's.
+    //
+    // The burst's player_position (0x49) carries the spawn coordinates
+    // the reference stands every joining player at; tracking them keeps
+    // position-dependent rules (reach, overlay radius) honest before the
+    // first move or tp.
+    let mut join_pos = (0.0f64, 0.0f64, 0.0f64);
     if let Some(b) = blobs {
         for (id, body) in &b.play {
+            if *id == 0x49 {
+                let mut r = Reader::new(body);
+                if r.read_varint().is_ok() {
+                    if let (Ok(x), Ok(y), Ok(z)) = (r.read_f64(), r.read_f64(), r.read_f64()) {
+                        let relative = r.read_f64().is_err()
+                            || r.read_f64().is_err()
+                            || r.read_f64().is_err()
+                            || r.read_f32().is_err()
+                            || r.read_f32().is_err()
+                            || !matches!(r.read_varint(), Ok(0));
+                        if !relative {
+                            join_pos = (x, y, z);
+                        }
+                    }
+                }
+            }
             let body = if *id == 0x2e {
                 let chunk =
                     doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
@@ -255,9 +277,9 @@ fn handle_login(
     let _ = game_tx.send(game::Inbound::Joined {
         conn: conn_id,
         name: name.clone(),
-        x: 0.0,
-        y: 0.0,
-        z: 0.0,
+        x: join_pos.0,
+        y: join_pos.1,
+        z: join_pos.2,
         sent,
         tx: tx_out,
     });
@@ -475,6 +497,26 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                 hand: hit.hand,
                 sequence: hit.sequence,
             })
+        }
+        // --- breaking hooks (placement.rs) ---
+        // player_action: dig lifecycle, drops, offhand swap.
+        0x29 => {
+            let act = match placement::parse_player_action(body) {
+                Ok(act) => act,
+                Err(e) => {
+                    eprintln!("[doppel] player_action: {e:#}");
+                    return None;
+                }
+            };
+            Some(game::Inbound::PlayerAction { conn, act })
+        }
+        // punch: the arm swing, empty body.
+        0x2e => {
+            if !body.is_empty() {
+                eprintln!("[doppel] punch: {} trailing bytes", body.len());
+                return None;
+            }
+            Some(game::Inbound::Punch { conn })
         }
         _ => None,
     }

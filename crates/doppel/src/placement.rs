@@ -11,10 +11,8 @@ use doppel_protocol::Reader;
 
 use crate::game::{DIR_DOWN, DIR_EAST, DIR_NORTH, DIR_SOUTH, DIR_UP, DIR_WEST};
 
-/// Serverbound `use_item_on`, play state. The 26.2 protocol notes list
-/// 0x42; 26.3 inserts `punch` at 0x2e, shifting every later serverbound id
-/// +1 (the same shift that moves set_carried_item 0x35 -> 0x36). The
-/// registration order in the pinned 26.3 jar confirms 0x43.
+/// Serverbound `use_item_on`, play state: registration order 66 in the
+/// pinned 26.3 template (26.2's 0x41 + the insertions before it).
 pub const SERVERBOUND_USE_ITEM_ON: i32 = 0x42;
 
 /// Serverbound `move_player_rot`: yaw f32, pitch f32, flags u8.
@@ -457,6 +455,135 @@ pub fn block_item_form(item: i32) -> Option<(&'static str, Form)> {
         .copied()
 }
 
+// --- breaking hooks ---
+
+/// Serverbound `player_action`, play state: registration order 41 in the
+/// pinned 26.3 template (26.2's 0x28 + the insertions before it).
+pub const SERVERBOUND_PLAYER_ACTION: i32 = 0x29;
+
+/// Serverbound `punch` (the arm swing), play state: registration order
+/// 46. Empty body; the broadcast back is client-cosmetic animation.
+pub const SERVERBOUND_PUNCH: i32 = 0x2e;
+
+/// Clientbound `block_destruction`: registration order 5, directly ahead
+/// of the pinned block_entity_data (6) / block_event (7) / block_update
+/// (8) trio.
+pub const CLIENTBOUND_BLOCK_DESTRUCTION: i32 = 0x05;
+
+/// player_action action ordinals (the reference enum order).
+pub const ACTION_START_DESTROY: i32 = 0;
+pub const ACTION_CHANGE_DESTROY_DIRECTION: i32 = 1;
+pub const ACTION_ABORT_DESTROY: i32 = 2;
+pub const ACTION_STOP_DESTROY: i32 = 3;
+pub const ACTION_DROP_ALL: i32 = 4;
+pub const ACTION_DROP_ITEM: i32 = 5;
+pub const ACTION_RELEASE_USE: i32 = 6;
+pub const ACTION_SWAP_OFFHAND: i32 = 7;
+pub const ACTION_STAB: i32 = 8;
+
+/// One decoded player_action.
+pub struct PlayerAction {
+    pub action: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Direction 3D data value (0=down .. 5=east).
+    pub direction: u8,
+    pub sequence: i32,
+}
+
+/// Parses a serverbound player_action body (after the packet id):
+/// action VarInt, pos i64 (packed BlockPos), direction VarInt,
+/// sequence VarInt. The drop/swap arms carry a pos too (ignored there);
+/// every arm shares the one body layout.
+pub fn parse_player_action(body: &[u8]) -> Result<PlayerAction> {
+    let mut r = Reader::new(body);
+    let action = r.read_varint().context("action")?;
+    if !(0..=8).contains(&action) {
+        bail!("player_action action {action}");
+    }
+    let packed = r.read_i64().context("block pos")?;
+    let direction = r.read_varint().context("direction")?;
+    if !(0..=5).contains(&direction) {
+        bail!("player_action direction {direction}");
+    }
+    let sequence = r.read_varint().context("sequence")?;
+    if r.remaining() != 0 {
+        bail!("{} trailing bytes in player_action", r.remaining());
+    }
+    let (x, y, z) = unpack_block_pos(packed);
+    Ok(PlayerAction {
+        action,
+        x,
+        y,
+        z,
+        direction: direction as u8,
+        sequence,
+    })
+}
+
+/// The per-tick destroy progress for a bare hand (the only holder this
+/// build models): speed 1.0 / destroyTime / (30 when the block drops
+/// without a tool, else 100). destroyTime 0 divides to infinity
+/// (insta-break); a negative time returns 0.0 (the reference's
+/// unbreakable short-circuit).
+pub fn per_tick_progress(destroy_time: f32, requires_tool: bool) -> f32 {
+    if destroy_time < 0.0 {
+        return 0.0;
+    }
+    let modifier = if requires_tool { 100.0f32 } else { 30.0 };
+    1.0f32 / destroy_time / modifier
+}
+
+/// The wire-progress stage for a progress fraction: (int)(p * 10).
+pub fn destroy_stage(progress: f32) -> i32 {
+    (progress * 10.0f32) as i32
+}
+
+/// (destroyTime, requiresCorrectToolForDrops) for the families the
+/// circuits and the survival loop touch. Unlisted blocks read 0.0/false:
+/// the reference's float-field default, which insta-breaks.
+///
+/// NOTE(breaking): the full per-block table is future registry work.
+pub fn hardness(name: &str) -> (f32, bool) {
+    match name {
+        "minecraft:torch"
+        | "minecraft:wall_torch"
+        | "minecraft:redstone_torch"
+        | "minecraft:redstone_wall_torch"
+        | "minecraft:redstone_wire"
+        | "minecraft:repeater"
+        | "minecraft:comparator" => (0.0, false),
+        "minecraft:glass" => (0.3, false),
+        "minecraft:dirt" => (0.5, false),
+        "minecraft:lever" => (0.5, false),
+        "minecraft:grass_block" => (0.6, false),
+        "minecraft:piston" | "minecraft:sticky_piston" => (1.5, false),
+        "minecraft:stone"
+        | "minecraft:granite"
+        | "minecraft:polished_granite"
+        | "minecraft:diorite"
+        | "minecraft:polished_diorite"
+        | "minecraft:andesite"
+        | "minecraft:polished_andesite" => (1.5, true),
+        "minecraft:oak_planks" | "minecraft:oak_log" | "minecraft:shulker_box" => (2.0, false),
+        "minecraft:cobblestone" => (2.0, true),
+        "minecraft:chest"
+        | "minecraft:trapped_chest"
+        | "minecraft:crafting_table"
+        | "minecraft:barrel" => (2.5, false),
+        "minecraft:deepslate" | "minecraft:hopper" | "minecraft:observer" => (3.0, true),
+        "minecraft:cobbled_deepslate" => (3.5, false),
+        "minecraft:furnace" | "minecraft:dispenser" | "minecraft:dropper" => (3.5, true),
+        "minecraft:redstone_block" => (5.0, true),
+        "minecraft:ender_chest" => (22.5, false),
+        "minecraft:obsidian" => (50.0, true),
+        // destroyTime -1: unbreakable (progress pins at zero).
+        "minecraft:bedrock" | "minecraft:barrier" | "minecraft:moving_piston" => (-1.0, false),
+        _ => (0.0, false),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
@@ -744,13 +871,11 @@ mod tests {
         use_on(&mut g, 5, 100, 5, DIR_DOWN, 0);
         assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
         // Five placements consumed five items; the refused click did not.
-        // Each placement queues its own slot sync; the last shows the
-        // final count.
-        let mut last_slot_sync = None;
-        while let Some(frame) = next_set_slot(&rx) {
-            last_slot_sync = Some(frame);
-        }
-        let (container_id, _, slot, stack) = last_slot_sync.expect("slot syncs queued");
+        // The spent stack syncs on the next tick's menu broadcast, which
+        // runs ahead of that tick's world flush; the one frame carries
+        // the final count.
+        g.tick_once_for_test();
+        let (container_id, _, slot, stack) = next_set_slot(&rx).expect("slot sync queued");
         assert_eq!(container_id, 0);
         assert_eq!(slot, 36, "hotbar 0 presents as menu slot 36");
         let stack = stack.expect("59 left after five placements");
@@ -758,7 +883,8 @@ mod tests {
             (stack.count(), stack.item()),
             (59, item_id("minecraft:stone").unwrap())
         );
-        // The flush broadcasts the placements like any setblock.
+        // The flush queued the five placement broadcasts behind the slot
+        // sync; the drain helper's own tick adds nothing.
         let frames = tick(&mut g, &rx);
         assert_eq!(frames.len(), 5, "{frames:?}");
     }
@@ -769,6 +895,7 @@ mod tests {
         give(&mut g, "minecraft:stone", 2);
         use_on(&mut g, 5, 99, 5, DIR_UP, 0);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (_, _, _, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(stack.map(|s| s.count()), Some(1));
         // Click the same floor face again: the target holds the first block.
@@ -786,6 +913,7 @@ mod tests {
         give(&mut g, "minecraft:stone", 1);
         use_on(&mut g, 5, 99, 5, DIR_UP, 0);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (container_id, _, slot, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(container_id, 0);
         assert_eq!(slot, 36);
@@ -931,6 +1059,7 @@ mod tests {
         click_swap(&mut g, 37, 40);
         use_on(&mut g, 5, 99, 5, DIR_UP, 1);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (_, _, slot, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(slot, 45, "offhand presents as menu slot 45");
         assert_eq!(stack.map(|s| s.count()), Some(4));
@@ -965,6 +1094,9 @@ mod tests {
             at(&g, 6, 101, 5),
             "minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=none]"
         );
+        // The spent dust syncs and the pop fires in the same tick: the
+        // menu broadcast runs ahead of the world flush.
+        g.tick_once_for_test();
         let (_, _, _, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(stack, None, "the dust was consumed");
         let frames = tick(&mut g, &rx);
@@ -1001,5 +1133,478 @@ mod tests {
         give(&mut g, "minecraft:diamond", 5);
         use_on(&mut g, 5, 99, 5, DIR_UP, 0);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:air[]");
+    }
+
+    // -- breaking ------------------------------------------------------
+
+    fn action_bytes(action: i32, x: i32, y: i32, z: i32, dir: i32, sequence: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        doppel_protocol::write_varint(&mut body, action);
+        body.extend(&packed_pos(x, y, z).to_be_bytes());
+        doppel_protocol::write_varint(&mut body, dir);
+        doppel_protocol::write_varint(&mut body, sequence);
+        body
+    }
+
+    #[test]
+    fn parse_player_action_golden_and_negative() {
+        let a = parse_player_action(&action_bytes(0, 10, 100, 7, 1, 42)).unwrap();
+        assert_eq!((a.action, a.direction, a.sequence), (0, 1, 42));
+        assert_eq!((a.x, a.y, a.z), (10, 100, 7));
+        let a = parse_player_action(&action_bytes(8, -5, -70, -33, 5, 1)).unwrap();
+        assert_eq!((a.x, a.y, a.z), (-5, -70, -33));
+        assert_eq!(a.action, 8);
+        assert_eq!(a.direction, 5);
+    }
+
+    #[test]
+    fn parse_player_action_rejects_bad_fields() {
+        assert!(parse_player_action(&action_bytes(9, 0, 0, 0, 1, 1)).is_err());
+        assert!(parse_player_action(&action_bytes(0, 0, 0, 0, 6, 1)).is_err());
+        let mut trailing = action_bytes(0, 0, 0, 0, 1, 1);
+        trailing.push(0);
+        assert!(parse_player_action(&trailing).is_err());
+        assert!(parse_player_action(&[0x00]).is_err());
+    }
+
+    /// Stone bare-handed: speed 1.0 / 1.5 destroyTime / 100 (wrong tool)
+    /// = one tick of progress in 150; dirt carries no tool requirement,
+    /// so its divisor is 30.
+    #[test]
+    fn destroy_progress_math() {
+        let stone = per_tick_progress(1.5, true);
+        assert!(stone > 0.00666 && stone < 0.00667, "{stone}");
+        assert!(stone * 149.0 < 1.0);
+        assert!(stone * 150.0 >= 1.0);
+        let dirt = per_tick_progress(0.5, false);
+        assert!(dirt > 0.0666 && dirt < 0.0667, "{dirt}");
+        assert!(dirt * 14.0 < 1.0 && dirt * 15.0 >= 1.0);
+        // destroyTime 0 divides to infinity: the insta-break family.
+        assert!(per_tick_progress(0.0, false) >= 1.0);
+        // Negative destroyTime is the unbreakable short-circuit.
+        assert_eq!(per_tick_progress(-1.0, false), 0.0);
+        // Stage boundaries over the stone dig (ticks spent 0..=149).
+        assert_eq!(destroy_stage(stone * 1.0), 0);
+        assert_eq!(destroy_stage(stone * 15.0), 1);
+        assert_eq!(destroy_stage(stone * 149.0), 9);
+        assert_eq!(destroy_stage(stone * 150.0), 10);
+        // The hardness table spot-checks: requires-tool stone family,
+        // tool-free chests, unbreakable-looking obsidian at 50.
+        assert_eq!(hardness("minecraft:stone"), (1.5, true));
+        assert_eq!(hardness("minecraft:chest"), (2.5, false));
+        assert_eq!(hardness("minecraft:obsidian"), (50.0, true));
+        assert_eq!(hardness("minecraft:redstone_wire"), (0.0, false));
+        // Unlisted blocks read the float-field default: insta-break.
+        assert_eq!(hardness("minecraft:whatever"), (0.0, false));
+    }
+
+    /// A second player near the dig site receives the overlay frames.
+    fn dig_harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
+        let (mut g, _rx0) = harness();
+        // Put the digger above the target and bring a witness in range.
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.0,
+            y: 101.0,
+            z: 5.0,
+        });
+        let (tx1, rx1) = std::sync::mpsc::channel::<Outbound>();
+        g.join_viewer_for_test(1, &[(-1, 0), (0, 0), (1, 0), (2, 0)], tx1);
+        g.handle(Inbound::Tp {
+            conn: 1,
+            x: 5.0,
+            y: 101.0,
+            z: 6.0,
+        });
+        (g, rx1)
+    }
+
+    fn act(g: &mut Game, action: i32, x: i32, y: i32, z: i32) {
+        g.handle(Inbound::PlayerAction {
+            conn: 0,
+            act: PlayerAction {
+                action,
+                x,
+                y,
+                z,
+                direction: DIR_UP,
+                sequence: 1,
+            },
+        });
+    }
+
+    /// The witness's block_destruction frames as (entity, pos, stage).
+    fn dig_frames(rx: &std::sync::mpsc::Receiver<Outbound>) -> Vec<(i32, (i32, i32, i32), i32)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, body } = frame else {
+                continue;
+            };
+            if id != CLIENTBOUND_BLOCK_DESTRUCTION {
+                continue;
+            }
+            let mut o = 0usize;
+            let mut entity = 0i32;
+            let mut sh = 0u32;
+            while o < body.len() {
+                let b = body[o];
+                o += 1;
+                entity |= i32::from(b & 0x7f) << sh;
+                sh += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            if body.len() < o + 9 {
+                continue;
+            }
+            let packed = i64::from_be_bytes(body[o..o + 8].try_into().unwrap());
+            let x = (packed >> 38) as i32;
+            let z = ((packed >> 12) & 0x3ff_ffff) as i32;
+            let y = (packed & 0xfff) as i32;
+            out.push((entity, (x, y, z), body[o + 8] as i8 as i32));
+        }
+        out
+    }
+
+    #[test]
+    fn dig_broadcasts_stages_and_holds() {
+        let (mut g, rx1) = dig_harness();
+        // Bare-hand stone floor: stage 0 first, deepening one step per
+        // 15 ticks. A held dig never breaks on its own: the client ends
+        // digs, not the server.
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        let frames = dig_frames(&rx1);
+        assert_eq!(frames, vec![(1, (5, 99, 5), 0)], "{frames:?}");
+        for _ in 0..35 {
+            g.tick_once_for_test();
+        }
+        let frames = dig_frames(&rx1);
+        let stages: Vec<i32> = frames.iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![1, 2], "{frames:?}");
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        // Hold past 0.7 (105 ticks of progress), then STOP: the break
+        // lands immediately with a -1 clear first.
+        for _ in 0..75 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]");
+        let frames = dig_frames(&rx1);
+        assert_eq!(frames.last(), Some(&(1, (5, 99, 5), -1)), "{frames:?}");
+    }
+
+    #[test]
+    fn stop_below_threshold_breaks_next_tick() {
+        let (mut g, rx1) = dig_harness();
+        // The digger has been in the world 200 ticks when the dig starts;
+        // the delayed pass multiplies progress by that per-player counter.
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        // START and STOP in the same tick: below 0.7 progress the dig
+        // converts to a delayed destroy that finishes on the next tick.
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]");
+        let frames = dig_frames(&rx1);
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0], (1, (5, 99, 5), 0));
+        // The delayed pass multiplies by the dig's start tick, so the
+        // closing stage wraps past the byte's 0..10 overlay range.
+        assert!(frames[1].2 != 0 && frames[1].2 != -1, "{frames:?}");
+    }
+
+    #[test]
+    fn stop_below_threshold_arms_frozen_delayed_destroy() {
+        let (mut g, rx1) = dig_harness();
+        // Sixty ticks in the world when the dig starts: the delayed pass
+        // multiplies one tick of stone progress by the start tick.
+        for _ in 0..60 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        g.tick_once_for_test();
+        // Start stage 0, then the frozen delayed stage (61/150 -> 4); the
+        // progress never grows again, so nothing more broadcasts.
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0, 4], "{stages:?}");
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        for _ in 0..40 {
+            g.tick_once_for_test();
+        }
+        assert!(dig_frames(&rx1).is_empty());
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+    }
+
+    #[test]
+    fn armed_delayed_destroy_starves_held_dig() {
+        let (mut g, rx1) = dig_harness();
+        // Release a fresh dig below the threshold: the pending delayed
+        // destroy owns the per-tick pass, so a later dig never deepens.
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0]);
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0]);
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        assert!(dig_frames(&rx1).is_empty());
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+    }
+
+    #[test]
+    fn abort_clears_the_overlay() {
+        let (mut g, rx1) = dig_harness();
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_ABORT_DESTROY, 5, 99, 5);
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0, -1]);
+        for _ in 0..40 {
+            g.tick_once_for_test();
+        }
+        // Nothing further broadcasts and the block stands.
+        assert!(dig_frames(&rx1).is_empty());
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+    }
+
+    #[test]
+    fn creative_breaks_instantly_without_overlay() {
+        let (mut g, rx1) = dig_harness();
+        g.set_creative_for_test(0, true);
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]");
+        assert!(dig_frames(&rx1).is_empty(), "no overlay for insta-breaks");
+    }
+
+    #[test]
+    fn insta_break_family_breaks_without_creative() {
+        let (mut g, rx1) = dig_harness();
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 6,
+            y: 100,
+            z: 6,
+            name: "minecraft:torch".to_string(),
+        });
+        assert_eq!(at(&g, 6, 100, 6), "minecraft:torch[]");
+        act(&mut g, ACTION_START_DESTROY, 6, 100, 6);
+        assert_eq!(at(&g, 6, 100, 6), "minecraft:air[]");
+        assert!(dig_frames(&rx1).is_empty());
+    }
+
+    #[test]
+    fn unbreakable_never_breaks() {
+        let (mut g, rx1) = dig_harness();
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 7,
+            y: 100,
+            z: 7,
+            name: "minecraft:bedrock".to_string(),
+        });
+        act(&mut g, ACTION_START_DESTROY, 7, 100, 7);
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_STOP_DESTROY, 7, 100, 7);
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        assert_eq!(at(&g, 7, 100, 7), "minecraft:bedrock[]");
+        // Only the stage-0 start ever went out.
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0]);
+    }
+
+    /// A finished dirt dig removes its support: the redstone torch on
+    /// top pops through the same neighbor-update path setblock drives.
+    #[test]
+    fn break_pops_attached_torch() {
+        let (mut g, rx1) = dig_harness();
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 5,
+            y: 100,
+            z: 5,
+            name: "minecraft:dirt".to_string(),
+        });
+        give(&mut g, "minecraft:redstone_torch", 1);
+        use_on(&mut g, 5, 100, 5, DIR_UP, 0);
+        assert_eq!(at(&g, 5, 101, 5), "minecraft:redstone_torch[lit=true]");
+        // Dirt bare-handed: 1.0/0.5/30 -> 0.7 at 11 ticks spent.
+        act(&mut g, ACTION_START_DESTROY, 5, 100, 5);
+        for _ in 0..10 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_STOP_DESTROY, 5, 100, 5);
+        assert_eq!(at(&g, 5, 100, 5), "minecraft:air[]");
+        // The support loss schedules the torch's pop for the next tick.
+        g.tick_once_for_test();
+        assert_eq!(at(&g, 5, 101, 5), "minecraft:air[]");
+        let _ = dig_frames(&rx1);
+    }
+
+    #[test]
+    fn chest_right_click_opens_menu_without_placing() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 8.0,
+            y: 101.0,
+            z: 8.0,
+        });
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 8,
+            y: 100,
+            z: 8,
+            name: "minecraft:chest[facing=north,type=single,waterlogged=false]".to_string(),
+        });
+        // Flush the setblock write before the interaction.
+        let _ = tick(&mut g, &rx);
+        give(&mut g, "minecraft:stone", 64);
+        use_on(&mut g, 8, 100, 8, DIR_UP, 0);
+        // The menu opened and the held block neither placed nor spent.
+        let mut opened = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let Outbound::Frame { id, body } = frame {
+                if id == 0x3c {
+                    opened = true;
+                    assert_eq!(body.first(), Some(&0x01), "container id 1");
+                }
+                assert!(id != PACKET_CONTAINER_SET_SLOT, "no stack sync");
+            }
+        }
+        assert!(opened, "open_screen went out");
+        assert_eq!(at(&g, 8, 101, 8), "minecraft:air[]");
+        // The lid block_event fires on the next tick, carrying the chest
+        // position, event id 1, and the viewer count; no placement
+        // writes flush.
+        g.tick_once_for_test();
+        let mut lid = None;
+        let mut writes = 0;
+        while let Ok(frame) = rx.try_recv() {
+            if let Outbound::Frame { id, body } = frame {
+                if id == 0x07 && body.len() >= 10 {
+                    let packed = i64::from_be_bytes(body[0..8].try_into().unwrap());
+                    let z = ((packed >> 12) & 0x3ff_ffff) as i32;
+                    let x = (packed >> 38) as i32;
+                    let y = (packed & 0xfff) as i32;
+                    lid = Some(((x, y, z), body[8], body[9]));
+                }
+                if id == 0x56 || id == 0x08 {
+                    writes += 1;
+                }
+            }
+        }
+        assert_eq!(writes, 0, "no placement writes");
+        assert_eq!(lid, Some(((8, 100, 8), 1, 1)), "{lid:?}");
+    }
+
+    #[test]
+    fn drop_all_then_drop_item() {
+        let (mut g, rx) = harness();
+        // A drop's slot change rides the next tick's menu broadcast, not
+        // the drop itself.
+        let held_count = |g: &Game| {
+            let inv = g.player_inv_state_for_test(0).unwrap();
+            let slot = inv.inventory.selected() as usize;
+            inv.inventory.get(slot).map(|s| s.count())
+        };
+        give(&mut g, "minecraft:stone", 5);
+        assert_eq!(held_count(&g), Some(5));
+        g.handle(Inbound::PlayerAction {
+            conn: 0,
+            act: PlayerAction {
+                action: ACTION_DROP_ALL,
+                x: 0,
+                y: 0,
+                z: 0,
+                direction: DIR_UP,
+                sequence: 1,
+            },
+        });
+        assert_eq!(held_count(&g), None, "drop-all empties the slot");
+        assert!(
+            next_set_slot(&rx).is_none(),
+            "the sync waits for the next tick"
+        );
+        g.tick_once_for_test();
+        let (_, _, slot, stack) = next_set_slot(&rx).unwrap();
+        assert_eq!(slot, 36);
+        assert_eq!(stack, None, "the broadcast shows the emptied slot");
+        // Dropping from an empty hand changes nothing.
+        g.handle(Inbound::PlayerAction {
+            conn: 0,
+            act: PlayerAction {
+                action: ACTION_DROP_ITEM,
+                x: 0,
+                y: 0,
+                z: 0,
+                direction: DIR_UP,
+                sequence: 2,
+            },
+        });
+        assert_eq!(held_count(&g), None);
+        g.tick_once_for_test();
+        assert!(next_set_slot(&rx).is_none());
+        // The single drop spends one item.
+        give(&mut g, "minecraft:stone", 3);
+        g.handle(Inbound::PlayerAction {
+            conn: 0,
+            act: PlayerAction {
+                action: ACTION_DROP_ITEM,
+                x: 0,
+                y: 0,
+                z: 0,
+                direction: DIR_UP,
+                sequence: 3,
+            },
+        });
+        assert_eq!(held_count(&g), Some(2));
+        g.tick_once_for_test();
+        let (_, _, _, stack) = next_set_slot(&rx).unwrap();
+        assert_eq!(stack.map(|s| s.count()), Some(2));
+    }
+
+    #[test]
+    fn out_of_reach_dig_is_ignored() {
+        let (mut g, rx1) = dig_harness();
+        // Stand the digger away from the target (survival reach 4.5+1).
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 30.0,
+            y: 101.0,
+            z: 5.0,
+        });
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        for _ in 0..5 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        for _ in 0..5 {
+            g.tick_once_for_test();
+        }
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        assert!(dig_frames(&rx1).is_empty());
+    }
+
+    #[test]
+    fn punch_is_accepted_without_effects() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::Punch { conn: 0 });
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, .. } = frame else {
+                continue;
+            };
+            panic!("punch broadcast 0x{id:02x}");
+        }
     }
 }

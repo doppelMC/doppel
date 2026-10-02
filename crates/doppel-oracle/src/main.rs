@@ -3,6 +3,7 @@
 mod bot;
 mod capture;
 mod parity;
+mod parity_break;
 mod parity_worldgen;
 mod registry;
 mod scenario;
@@ -59,6 +60,11 @@ fn run() -> Result<()> {
         }
         Some("parity-placement") => {
             if !parity::parity_placement()? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-break") => {
+            if !parity_break::parity_break()? {
                 std::process::exit(1);
             }
         }
