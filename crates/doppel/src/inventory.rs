@@ -364,6 +364,7 @@ const ITEM_IDS: &[(&str, i32)] = &[
     ("minecraft:dirt", 55),
     ("minecraft:cobblestone", 62),
     ("minecraft:oak_planks", 63),
+    ("minecraft:glass", 231),
     ("minecraft:oak_log", 163),
     ("minecraft:oak_slab", 341),
     ("minecraft:crafting_table", 405),
@@ -1315,7 +1316,7 @@ fn read_i32be(r: &mut Reader) -> Result<i32> {
 
 impl PlayerInvState {
     /// The menu sync counter, wrapping at 0x7FFF (`incrementStateId`).
-    fn next_state_id(&mut self) -> i32 {
+    pub(crate) fn next_state_id(&mut self) -> i32 {
         self.state_id = (self.state_id + 1) & 0x7fff;
         self.state_id
     }

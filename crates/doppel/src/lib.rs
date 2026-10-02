@@ -5,6 +5,7 @@
 pub mod blobs;
 pub mod game;
 pub mod inventory;
+pub mod placement;
 pub mod wire;
 
 #[cfg(test)]
@@ -287,17 +288,42 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
             let answer = r.read_i64().ok()?;
             Some(game::Inbound::KeepAliveAnswer { conn, id: answer })
         }
+        // move_player_pos: x y z f64 + flags u8 (flags carry no state).
         0x1e => {
             let x = r.read_f64().ok()?;
             let y = r.read_f64().ok()?;
             let z = r.read_f64().ok()?;
-            Some(game::Inbound::Moved { conn, x, y, z })
+            Some(game::Inbound::Moved {
+                conn,
+                x,
+                y,
+                z,
+                yaw: None,
+                pitch: None,
+            })
         }
+        // move_player_pos_rot: x y z f64, yaw pitch f32, flags u8.
         0x1f => {
             let x = r.read_f64().ok()?;
             let y = r.read_f64().ok()?;
             let z = r.read_f64().ok()?;
-            Some(game::Inbound::Moved { conn, x, y, z })
+            let yaw = r.read_f32().ok()?;
+            let pitch = r.read_f32().ok()?;
+            Some(game::Inbound::Moved {
+                conn,
+                x,
+                y,
+                z,
+                yaw: Some(yaw),
+                pitch: Some(pitch),
+            })
+        }
+        // move_player_rot: yaw pitch f32 + flags u8 — the view direction
+        // placement geometry reads.
+        0x20 => {
+            let yaw = r.read_f32().ok()?;
+            let pitch = r.read_f32().ok()?;
+            Some(game::Inbound::Rotated { conn, yaw, pitch })
         }
         0x07 => {
             // chat_command (unsigned, no leading slash). Minimal /tp so the
@@ -381,6 +407,30 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         0x12 => {
             let click = inventory::parse_container_click(body).ok()?;
             Some(game::Inbound::ContainerClick { conn, click })
+        }
+        // --- placement hooks (placement.rs) ---
+        // use_item_on: right-click a block face. Id is 26.3's (26.2's
+        // 0x42 + the inserted-punch shift); see placement.rs.
+        0x43 => {
+            let hit = match placement::parse_use_item_on(body) {
+                Ok(hit) => hit,
+                Err(e) => {
+                    eprintln!("[doppel] use_item_on: {e:#}");
+                    return None;
+                }
+            };
+            Some(game::Inbound::UseItemOn {
+                conn,
+                x: hit.x,
+                y: hit.y,
+                z: hit.z,
+                face: hit.face,
+                cursor_x: hit.cursor_x,
+                cursor_y: hit.cursor_y,
+                cursor_z: hit.cursor_z,
+                hand: hit.hand,
+                sequence: hit.sequence,
+            })
         }
         _ => None,
     }

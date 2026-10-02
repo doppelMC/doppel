@@ -43,6 +43,10 @@ pub enum Inbound {
         x: f64,
         y: f64,
         z: f64,
+        /// View rotation when the move packet carries it (the pos+rot
+        /// form); None for the position-only form.
+        yaw: Option<f32>,
+        pitch: Option<f32>,
     },
     /// `tp @s x y z` (the walk-parity bot's vehicle).
     Tp {
@@ -94,6 +98,28 @@ pub enum Inbound {
         conn: ConnId,
         item: String,
         count: i32,
+    },
+    // --- placement hooks (placement.rs) ---
+    /// `move_player_rot`: view rotation without movement.
+    Rotated {
+        conn: ConnId,
+        yaw: f32,
+        pitch: f32,
+    },
+    /// `use_item_on`: right-click a block face with the held item.
+    UseItemOn {
+        conn: ConnId,
+        x: i32,
+        y: i32,
+        z: i32,
+        /// Clicked face, Direction 3D id (0=down .. 5=east).
+        face: u8,
+        cursor_x: f32,
+        cursor_y: f32,
+        cursor_z: f32,
+        /// 0 = main hand, 1 = offhand.
+        hand: u8,
+        sequence: i32,
     },
     Left {
         conn: ConnId,
@@ -431,11 +457,24 @@ impl Game {
                     },
                 );
             }
-            Inbound::Moved { conn, x, y, z } => {
+            Inbound::Moved {
+                conn,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
                 if let Some(p) = self.players.get_mut(&conn) {
                     p.x = x;
                     p.y = y;
                     p.z = z;
+                    if let Some(yaw) = yaw {
+                        p.yaw = yaw;
+                    }
+                    if let Some(pitch) = pitch {
+                        p.pitch = pitch;
+                    }
                 }
                 self.stream_if_moved(conn);
             }
@@ -487,6 +526,22 @@ impl Game {
                 self.give_item(conn, &item, count);
                 self.send_command_feedback(conn);
             }
+            // --- placement hooks (placement.rs) ---
+            Inbound::Rotated { conn, yaw, pitch } => {
+                if let Some(p) = self.players.get_mut(&conn) {
+                    p.yaw = yaw;
+                    p.pitch = pitch;
+                }
+            }
+            Inbound::UseItemOn {
+                conn,
+                x,
+                y,
+                z,
+                face,
+                hand,
+                ..
+            } => self.place_from_hand(conn, x, y, z, face, hand),
             Inbound::Left { conn } => {
                 let Some(p) = self.players.remove(&conn) else {
                     return;
@@ -537,6 +592,91 @@ impl Game {
             return;
         };
         self.set_block(x, y, z, state, true);
+    }
+
+    // --- placement hooks (placement.rs) ---
+
+    /// Serverbound use_item_on: resolve the held block item against the
+    /// clicked face, place it, and spend one item (survival). The parse
+    /// and the per-family geometry live in placement.rs.
+    fn place_from_hand(&mut self, conn: ConnId, x: i32, y: i32, z: i32, face: u8, hand: u8) {
+        let (slot, block, form, yaw, pitch, creative) = {
+            let Some(p) = self.players.get(&conn) else {
+                return;
+            };
+            let selected = p.inv.inventory.selected() as usize;
+            let slot = if hand == 0 {
+                selected
+            } else {
+                // The offhand places only while the main hand holds no
+                // block item (the main hand always resolves first).
+                let main_holds_block = p
+                    .inv
+                    .inventory
+                    .get(selected)
+                    .is_some_and(|s| crate::placement::block_item_form(s.item()).is_some());
+                if main_holds_block {
+                    return;
+                }
+                crate::inventory::SLOT_OFFHAND
+            };
+            let Some((block, form)) = p
+                .inv
+                .inventory
+                .get(slot)
+                .as_ref()
+                .and_then(|s| crate::placement::block_item_form(s.item()))
+            else {
+                return;
+            };
+            (slot, block, form, p.yaw, p.pitch, p.inv.creative)
+        };
+        let Some(spec) = form.spec(block, face, yaw, pitch) else {
+            return;
+        };
+        let (dx, dy, dz) = crate::placement::face_step(face);
+        let (tx, ty, tz) = (x + dx, y + dy, z + dz);
+        // Only air accepts a placement; replaceable blocks (water, grass
+        // paths) arrive with the block-data pin.
+        if !matches!(self.get_block(tx, ty, tz), Some((n, _)) if n == "minecraft:air") {
+            return;
+        }
+        let Some(state) = self.resolve_state(&spec) else {
+            eprintln!("[game] placement: unknown state {spec}");
+            return;
+        };
+        // NOTE(placement): chest-family placements would create their
+        // block entity here; that lands with containers.rs, which owns
+        // block entities. Placement only sets the state.
+        self.set_block(tx, ty, tz, state, true);
+        if creative {
+            return;
+        }
+        let body = {
+            let Some(p) = self.players.get_mut(&conn) else {
+                return;
+            };
+            let remaining = p
+                .inv
+                .inventory
+                .get(slot)
+                .map(|s| s.with_count(s.count() - 1))
+                .filter(|s| !s.is_empty());
+            p.inv.inventory.set(slot, remaining);
+            let state_id = p.inv.next_state_id();
+            match crate::inventory::container_to_menu(slot) {
+                Some(menu) => crate::inventory::encode_container_set_slot(
+                    0,
+                    state_id,
+                    menu as i16,
+                    p.inv.inventory.get(slot).as_ref(),
+                ),
+                None => Vec::new(),
+            }
+        };
+        if !body.is_empty() {
+            self.send(conn, crate::inventory::PACKET_CONTAINER_SET_SLOT, &body);
+        }
     }
 
     /// Tick end: one broadcast per dirty section. Vanilla batches per
