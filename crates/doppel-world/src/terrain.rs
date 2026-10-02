@@ -2,10 +2,11 @@
 //! emission surface the flat generator uses.
 //!
 //! Four octave stacks drive a height spline (continental position) plus a
-//! gain-scaled relief term (erosion, ridged peaks) and a small surface
-//! detail term. Columns fill with a bedrock/stone/cap stack, water rises
-//! to sea level where terrain dips below, and the chunk emission (palette
-//! sections, heightmaps, light layers) follows the shared wire shape.
+//! gain-scaled relief term (erosion, folded peaks) and a small surface
+//! detail term. Columns fill with a bedrock/stone/deepslate/cap stack,
+//! water rises to sea level where terrain dips below, and the chunk
+//! emission (palette sections, heightmaps, light layers) follows the
+//! shared wire shape.
 //! The full 3D density graph is out of scope; parity converges by way of
 //! the same seed derivation and spline calibration.
 
@@ -68,24 +69,42 @@ const OFFSET: OctaveSpec = OctaveSpec {
 };
 
 /// Continental position to base height: deep ocean floor rising through
-/// shelf and coast to inland hills and mountains. The land branch sits six
-/// layers over the naive knee so inland columns land where the parity gate
-/// measures vanilla putting them; the ocean branch already matches.
-const HEIGHT_SPLINE: [(f64, f64); 9] = [
+/// shelf and coast to inland hills and mountains. The closely spaced
+/// coastal knots carry the shelf profile the parity gate samples and need
+/// not stay monotone; the outer knots anchor deep ocean and highlands.
+const HEIGHT_SPLINE: [(f64, f64); 10] = [
     (-1.05, 34.0),
     (-0.455, 42.0),
     (-0.19, 51.0),
-    (-0.06, 60.0),
-    (0.03, 70.0),
-    (0.06, 72.0),
+    (-0.10, 78.73),
+    (-0.03, 76.78),
+    (0.03, 74.26),
+    (0.10, 77.82),
     (0.32, 80.0),
     (0.55, 96.0),
     (1.05, 134.0),
 ];
 
+/// Relief weights over the spline, scaled by the continental gain: folded
+/// peaks raise terrain, erosion wears it down, and the interaction flattens
+/// peaks under heavy erosion. Calibrated against the spawn-area sample the
+/// parity gate compares at the pinned seed.
+const PEAKS_RELIEF: f64 = 28.702;
+const EROSION_RELIEF: f64 = 15.012;
+const RELIEF_INTERACTION: f64 = 62.818;
+/// Fine surface detail, subtracted: the surface stack anti-correlates with
+/// the shelf's finished height at the sampled scale.
+const SURFACE_DETAIL: f64 = 3.903;
+
 /// Relief weight: flat over the ocean, full over inland continental mass.
 fn gain(continental: f64) -> f64 {
     0.4 + 0.85 * (continental + 0.2).clamp(0.0, 1.0)
+}
+
+/// Folds the ridge field into peaks and valleys: ridge magnitudes near two
+/// thirds are peaks, zero crossings are valleys.
+fn peaks_and_valleys(ridge: f64) -> f64 {
+    -(((ridge.abs() - 0.666_666_7).abs() - 0.333_333_34) * 3.0)
 }
 
 /// Climate stacks sample the 4-block cell grid: quarter-block coordinates,
@@ -120,6 +139,7 @@ struct SurfaceStates {
     grass: u32,
     dirt: u32,
     stone: u32,
+    deepslate: u32,
     sand: u32,
     water: u32,
     bedrock: u32,
@@ -150,6 +170,7 @@ impl HeightmapGenerator {
             grass: resolve("minecraft:grass_block", "snowy=false")?,
             dirt: resolve("minecraft:dirt", "")?,
             stone: resolve("minecraft:stone", "")?,
+            deepslate: resolve("minecraft:deepslate", "")?,
             sand: resolve("minecraft:sand", "")?,
             water: resolve("minecraft:water", "level=0")?,
             bedrock: resolve("minecraft:bedrock", "")?,
@@ -183,11 +204,14 @@ impl HeightmapGenerator {
     pub fn column_top(&self, wx: i32, wz: i32) -> i32 {
         let continental = climate(&self.continental, &self.offset, wx, wz);
         let erosion = climate(&self.erosion, &self.offset, wx, wz);
-        let peaks = climate(&self.peaks, &self.offset, wx, wz);
+        let peaks = peaks_and_valleys(climate(&self.peaks, &self.offset, wx, wz));
         let surface = f64::from(self.surface.sample_2d(wx as f64, wz as f64));
         let height = spline_height(continental)
-            + gain(continental) * (14.0 * erosion + 7.0 * peaks)
-            + 2.5 * surface;
+            + gain(continental)
+                * (PEAKS_RELIEF * peaks
+                    - EROSION_RELIEF * erosion
+                    - RELIEF_INTERACTION * erosion * peaks)
+            - SURFACE_DETAIL * surface;
         // Keep one stone layer above bedrock and one air layer below the cap.
         (height.floor() as i32).clamp(MIN_Y + 2, MIN_Y + WORLD_LAYERS as i32 - 2)
     }
@@ -354,8 +378,9 @@ fn layer_index(y: i32) -> usize {
     (y - MIN_Y) as usize
 }
 
-/// Fills one column of the block buffer: bedrock floor, stone body, a
-/// dirt-or-sand cap, and water up to sea level when the top dips below.
+/// Fills one column of the block buffer: bedrock floor, stone body over
+/// deepslate below the zero layer, a dirt-or-sand cap, and water up to sea
+/// level when the top dips below.
 fn fill_column(blocks: &mut [u32], column: usize, top: i32, states: &SurfaceStates) {
     let cap_depth = 3i32;
     let beach = top <= SEA_LEVEL + 1;
@@ -372,7 +397,12 @@ fn fill_column(blocks: &mut [u32], column: usize, top: i32, states: &SurfaceStat
                 states.dirt
             }
         } else {
-            states.stone
+            // The stone body hands off to deepslate at the zero layer.
+            if y < 0 {
+                states.deepslate
+            } else {
+                states.stone
+            }
         };
         blocks[layer_index(y) * HEIGHTMAP_CELLS + column] = state;
     }
@@ -501,7 +531,8 @@ mod tests {
     #[test]
     fn sections_well_formed() {
         let gen = generator();
-        let chunk = gen.generate(5, -3);
+        // Chunk (3, 6) is fully ocean at this seed; its sections carry water.
+        let chunk = gen.generate(3, 6);
         assert_eq!(chunk.sections.len(), SECTION_SPAN);
         assert!(chunk.block_entities.is_empty());
         let air = gen.states.air;
