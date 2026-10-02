@@ -169,6 +169,9 @@ pub(crate) struct Player {
     sent: std::collections::HashSet<(i32, i32)>,
     teleport_id: i32,
     pending_keep_alive: Option<(i64, Instant)>,
+    /// When the last challenge was answered; spaces the next one an
+    /// interval out instead of firing every tick.
+    keep_alive_idle: Instant,
     // --- inventory hook (inventory.rs) ---
     pub(crate) inv: crate::inventory::PlayerInvState,
     // --- containers hooks (containers.rs) ---
@@ -493,6 +496,7 @@ impl Game {
                         sent: sent.into_iter().collect(),
                         teleport_id: 1,
                         pending_keep_alive: None,
+                        keep_alive_idle: Instant::now(),
                         inv: Default::default(),
                         menu: None,
                         container_counter: 0,
@@ -547,6 +551,7 @@ impl Game {
                     if let Some((challenge, _)) = p.pending_keep_alive {
                         if challenge == id {
                             p.pending_keep_alive = None;
+                            p.keep_alive_idle = Instant::now();
                         }
                     }
                 }
@@ -1854,11 +1859,12 @@ impl Game {
                 continue;
             };
             match p.pending_keep_alive {
-                None => {
+                None if p.keep_alive_idle.elapsed() >= KEEP_ALIVE_INTERVAL => {
                     let body = now_ms.to_be_bytes().to_vec();
                     p.pending_keep_alive = Some((now_ms, Instant::now()));
                     self.send(conn, 0x2d, &body);
                 }
+                None => {}
                 Some((_, sent)) if sent.elapsed() > KEEP_ALIVE_INTERVAL => {
                     eprintln!("[game] {}: keep-alive timeout", p.name);
                     self.send(conn, i32::MAX, &[]); // sentinel; Disconnect below
@@ -2160,6 +2166,7 @@ impl Game {
                 sent: chunks.iter().copied().collect(),
                 teleport_id: 1,
                 pending_keep_alive: None,
+                keep_alive_idle: Instant::now(),
                 inv: Default::default(),
                 menu: None,
                 container_counter: 0,
