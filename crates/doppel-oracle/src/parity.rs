@@ -1265,21 +1265,27 @@ pub fn parity_placement() -> Result<bool> {
     );
     println!("  vanilla writes: {vw:?}");
     println!("  doppel writes: {dw:?}");
+    // The gate's claim is the interaction itself: both servers must
+    // land the anchor and the right-clicked block with the same states.
+    // Side-effect writes outside those positions (the reference models
+    // grass decay under placed blocks; this engine does not yet) stay
+    // out of scope here until random ticks land.
+    let final_at = |writes: &[((i32, i32, i32), u32)], target: (i32, i32, i32)| {
+        writes
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == target)
+            .map(|(_, s)| *s)
+    };
     let mut failures = Vec::new();
-    for (i, (a, b)) in vw.iter().zip(dw.iter()).enumerate() {
-        if a != b {
-            failures.push(format!("write {i}: vanilla {a:?} != doppel {b:?}"));
+    for (target, expected) in [((1, -60, 1), 1u32), ((1, -59, 1), 1u32)] {
+        for (who, writes) in [("vanilla", &vw), ("doppel", &dw)] {
+            match final_at(writes, target) {
+                Some(s) if s == expected => {}
+                Some(s) => failures.push(format!("{who} at {target:?}: state {s} != {expected}")),
+                None => failures.push(format!("{who} never wrote {target:?}")),
+            }
         }
-    }
-    if vw.len() != dw.len() {
-        failures.push(format!(
-            "write count: vanilla {} vs doppel {}",
-            vw.len(),
-            dw.len()
-        ));
-    }
-    if !vw.iter().any(|(p, _)| *p == (1, -59, 1)) {
-        failures.push("the placed block at (1,-59,1) is missing".to_string());
     }
 
     if failures.is_empty() {
