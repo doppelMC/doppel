@@ -1244,7 +1244,7 @@ pub fn parity_placement() -> Result<bool> {
             .filter(|p| p.id >= 0)
             .rev()
             .take(8)
-            .map(|p| format!("0x{:02x}", p.id))
+            .map(|p| format!("0x{:02x}@{}ms", p.id, p.t_ms))
             .collect();
         println!(
             "[oracle] {who}: {total} frames, head [{:?}] tail [{:?}], end-note: {:?}",
