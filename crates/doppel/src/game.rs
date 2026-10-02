@@ -433,7 +433,10 @@ impl Game {
                 y,
                 z,
                 name,
-            } => self.setblock(conn, x, y, z, name),
+            } => {
+                self.setblock(conn, x, y, z, name);
+                self.send_command_feedback(conn);
+            }
             Inbound::Left { conn } => {
                 let Some(p) = self.players.remove(&conn) else {
                     return;
@@ -445,16 +448,18 @@ impl Game {
                     }
                 }
             }
-            Inbound::TickStep { conn: _, steps } => {
+            Inbound::TickStep { conn, steps } => {
                 // Run the stepped ticks inline: commands queued behind this
                 // event in the same channel batch land on later ticks,
                 // matching vanilla's `tick step` barrier.
                 for _ in 0..steps {
                     self.game_tick();
                 }
+                self.send_command_feedback(conn);
             }
-            Inbound::TickFreeze { conn: _, frozen } => {
+            Inbound::TickFreeze { conn, frozen } => {
                 self.frozen = frozen;
+                self.send_command_feedback(conn);
             }
         }
     }
@@ -568,6 +573,15 @@ impl Game {
         get_section_cell(&chunk.wire, sec_index, idx)
     }
 
+    /// Command feedback: an empty text component plus overlay=false.
+    /// The reference answers every scripted command; the differential
+    /// harness paces itself on these replies. Body parity (the exact
+    /// component) is future work against a captured reference.
+    fn send_command_feedback(&mut self, conn: ConnId) {
+        let body = [0x00u8, 0x00];
+        self.send(conn, 0x7c, &body);
+    }
+
     /// Logs a dropped world write, once per (chunk, reason).
     fn warn_dropped_write(&mut self, cx: i32, cz: i32, reason: &str) {
         if self.warned_writes.insert((cx, cz, reason.to_string())) {
@@ -631,10 +645,50 @@ impl Game {
     }
 
     /// A scheduled block update: recompute redstone behavior at this pos.
+    /// True when the block can bear a floor-mounted component. Mirrors
+    /// the reference's support rule for the redstone families: a full
+    /// solid face below. The non-support set covers everything the
+    /// circuits place that the reference treats as non-supporting.
+    fn is_support(&self, x: i32, y: i32, z: i32) -> bool {
+        match self.get_block(x, y, z) {
+            None => false,
+            Some((name, _)) => !matches!(
+                name.as_str(),
+                "minecraft:air"
+                    | "minecraft:redstone_wire"
+                    | "minecraft:redstone_torch"
+                    | "minecraft:redstone_wall_torch"
+                    | "minecraft:lever"
+                    | "minecraft:repeater"
+                    | "minecraft:comparator"
+            ),
+        }
+    }
+
+    /// The reference drops floor-mounted redstone components whose
+    /// support is gone (updateOrDestroy): wire, repeater, comparator,
+    /// standing torch, floor lever.
+    fn check_survival(&mut self, x: i32, y: i32, z: i32, name: &str, props: &str) -> bool {
+        let needs_floor_support = match name {
+            "minecraft:redstone_wire" | "minecraft:repeater" | "minecraft:comparator" => true,
+            "minecraft:redstone_torch" => true,
+            "minecraft:lever" => props.contains("face=floor"),
+            _ => false,
+        };
+        if needs_floor_support && !self.is_support(x, y - 1, z) {
+            self.set_block(x, y, z, 0, true);
+            return false;
+        }
+        true
+    }
+
     fn update_block(&mut self, x: i32, y: i32, z: i32) {
         let Some((name, props)) = self.get_block(x, y, z) else {
             return;
         };
+        if !self.check_survival(x, y, z, &name, &props) {
+            return;
+        }
         match name.as_str() {
             "minecraft:redstone_wire" => self.update_wire(x, y, z, &props),
             "minecraft:redstone_torch" | "minecraft:redstone_wall_torch" => {

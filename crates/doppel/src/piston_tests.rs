@@ -19,11 +19,31 @@ fn harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
             block_entities: Vec::new(),
             light: Default::default(),
         };
-        for _ in 0..24 {
+        for sy in 0..24 {
+            // A stone layer at y=99 (section 10, local y=3) floors every
+            // circuit: floor-mounted redstone needs support, and the
+            // reference pops it without one. Storage packing is YZX.
+            let block_states = if sy == 10 {
+                let mut longs = vec![0u64; 256];
+                for l in 0..256 {
+                    for j in 0..16 {
+                        let i = l * 16 + j;
+                        let v: u64 = if (i >> 8) == 3 { 1 } else { 0 };
+                        longs[l] |= v << (j * 4);
+                    }
+                }
+                doppel_world::chunk_codec::Container::Palette {
+                    bits: 4,
+                    entries: vec![0, 1],
+                    longs,
+                }
+            } else {
+                doppel_world::chunk_codec::Container::Single(0)
+            };
             w.sections.push(doppel_world::chunk_codec::WireSection {
-                non_empty: 0,
+                non_empty: if sy == 10 { 256 } else { 0 },
                 fluid: 0,
-                block_states: doppel_world::chunk_codec::Container::Single(0),
+                block_states,
                 biomes: doppel_world::chunk_codec::Container::Single(0),
             });
         }
@@ -346,12 +366,13 @@ fn piston_quasi_connectivity() {
         &mut g,
         "setblock 23 100 10 minecraft:piston[extended=false,facing=east]",
     );
+    cmd(&mut g, "setblock 23 100 9 minecraft:stone");
     cmd(
         &mut g,
         "setblock 23 101 9 minecraft:lever[face=floor,powered=true]",
     );
     let f = tick(&mut g, &rx);
-    assert_eq!(f.len(), 2, "placements: {f:?}");
+    assert_eq!(f.len(), 3, "placements: {f:?}");
     assert_eq!(
         at(&g, 23, 100, 10),
         "minecraft:piston[extended=true,facing=east]",
@@ -449,6 +470,38 @@ fn lever_state_ids() {
 fn serve_loop_burst_sim() {
     let script: Vec<&str> = vec![
         "tick freeze",
+        // Support platform: the reference pops floor-mounted redstone
+        // components whose support is missing, so every circuit position
+        // gets a stone footing before anything lands on it.
+        "setblock 10 99 10 minecraft:stone",
+        "setblock 11 99 10 minecraft:stone",
+        "setblock 12 99 10 minecraft:stone",
+        "setblock 13 99 10 minecraft:stone",
+        "setblock 14 99 10 minecraft:stone",
+        "setblock 15 99 10 minecraft:stone",
+        "setblock 16 99 10 minecraft:stone",
+        "setblock 17 99 10 minecraft:stone",
+        "setblock 18 99 10 minecraft:stone",
+        "setblock 19 99 10 minecraft:stone",
+        "setblock 20 99 10 minecraft:stone",
+        "setblock 21 99 10 minecraft:stone",
+        "tick step 1",
+        "setblock 12 99 11 minecraft:stone",
+        "tick step 1",
+        "setblock 10 99 12 minecraft:stone",
+        "setblock 11 99 12 minecraft:stone",
+        "setblock 12 99 12 minecraft:stone",
+        "setblock 13 99 12 minecraft:stone",
+        "setblock 14 99 12 minecraft:stone",
+        "setblock 15 99 12 minecraft:stone",
+        "setblock 16 99 12 minecraft:stone",
+        "tick step 1",
+        "setblock 13 99 13 minecraft:stone",
+        "setblock 14 99 13 minecraft:stone",
+        "setblock 15 99 13 minecraft:stone",
+        "setblock 16 99 13 minecraft:stone",
+        "setblock 17 99 13 minecraft:stone",
+        "tick step 5",
         "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
         "tick step 1",
         "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
@@ -503,9 +556,9 @@ fn serve_loop_burst_sim() {
         "tick step 1",
         "setblock 14 100 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 1",
-        "setblock 15 101 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
         "setblock 15 100 12 minecraft:stone",
+        "tick step 1",
+        "setblock 15 101 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 1",
         "setblock 13 101 12 minecraft:stone",
         "tick step 1",

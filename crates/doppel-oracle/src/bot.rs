@@ -109,6 +109,25 @@ pub fn client_information_body() -> Vec<u8> {
     b
 }
 
+/// Sends the next scripted command and arms the short response timeout:
+/// the session paces itself on the server's system_chat replies.
+fn send_commanded(
+    conn: &mut Conn<TcpStream>,
+    commands: &[String],
+    next_cmd: &mut usize,
+) -> Result<()> {
+    let cmd = &commands[*next_cmd];
+    let mut body = Vec::new();
+    doppel_protocol::write_string(&mut body, cmd.trim_start_matches('/'));
+    conn.write_packet(0x07, &body)?;
+    *next_cmd += 1;
+    // While awaiting the response, a short read timeout keeps a missing
+    // reply from ending the session at the idle threshold.
+    conn.get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))?;
+    Ok(())
+}
+
 /// Options for a login capture session.
 #[derive(Default)]
 pub struct CaptureOpts<'a> {
@@ -176,6 +195,7 @@ pub fn login_capture(
     let mut packs_answered = false;
     let mut play_started = false;
     let mut commands_pending = !commands.is_empty();
+    let mut next_cmd = 0usize;
     let walk = opts.walk_chunks;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
@@ -276,19 +296,26 @@ pub fn login_capture(
                 "teleport ({x:.1},{y:.1},{z:.1}) id={teleport_id}: acked"
             ));
         }
-        // Once the chunk batch closes, run any scripted commands (unsigned
-        // chat_command: serverbound play 0x07; the wire string has NO
-        // leading slash — clients strip it before sending).
+        // Once the chunk batch closes, run the scripted commands one at a
+        // time (unsigned chat_command: serverbound play 0x07; the wire
+        // string has NO leading slash — clients strip it before sending).
+        // Each command waits for the server's system_chat (0x7c) response
+        // before the next is sent: a blasted volley makes the reference's
+        // command->tick grouping racy, and the final circuit states with
+        // it. A short read timeout while awaiting keeps a missing response
+        // from stalling the session.
         if play_started && commands_pending && id == 0x0b {
             commands_pending = false; // only trigger on the first batch end
-            for cmd in commands {
-                let mut body = Vec::new();
-                doppel_protocol::write_string(&mut body, cmd.trim_start_matches('/'));
-                conn.write_packet(0x07, &body)?;
-                note = Some(format!("sent command: {cmd}"));
-            }
-            if walk.is_some() {
-                last_walk_at = std::time::Instant::now();
+            send_commanded(&mut conn, commands, &mut next_cmd)?;
+            note = Some(format!("sent command: {}", commands[0]));
+        }
+        if id == 0x7c && next_cmd > 0 {
+            if next_cmd < commands.len() {
+                send_commanded(&mut conn, commands, &mut next_cmd)?;
+                note = Some(format!("sent command: {}", commands[next_cmd - 1]));
+            } else {
+                // Volley complete: back to the session's idle threshold.
+                conn.get_ref().set_read_timeout(Some(idle_timeout))?;
             }
         }
         // Walk pacing: cross one chunk per step via /tp — vanilla's
