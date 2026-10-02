@@ -476,6 +476,26 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                 sequence: hit.sequence,
             })
         }
+        // --- breaking hooks (placement.rs) ---
+        // player_action: dig lifecycle, drops, offhand swap.
+        0x29 => {
+            let act = match placement::parse_player_action(body) {
+                Ok(act) => act,
+                Err(e) => {
+                    eprintln!("[doppel] player_action: {e:#}");
+                    return None;
+                }
+            };
+            Some(game::Inbound::PlayerAction { conn, act })
+        }
+        // punch: the arm swing, empty body.
+        0x2e => {
+            if !body.is_empty() {
+                eprintln!("[doppel] punch: {} trailing bytes", body.len());
+                return None;
+            }
+            Some(game::Inbound::Punch { conn })
+        }
         _ => None,
     }
 }
