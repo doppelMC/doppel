@@ -77,6 +77,24 @@ pub enum Inbound {
         conn: ConnId,
         frozen: bool,
     },
+    // --- inventory (implementation in inventory.rs) ---
+    /// `set_carried_item`: the client's selected hotbar slot.
+    SetCarriedItem {
+        conn: ConnId,
+        slot: i16,
+    },
+    /// `container_click` against an open menu (only the player's own
+    /// inventory menu exists so far).
+    ContainerClick {
+        conn: ConnId,
+        click: crate::inventory::ContainerClick,
+    },
+    /// `give @s <item> [count]` — the harness driver for inventory tests.
+    Give {
+        conn: ConnId,
+        item: String,
+        count: i32,
+    },
     Left {
         conn: ConnId,
     },
@@ -88,7 +106,9 @@ pub enum Outbound {
     Disconnect,
 }
 
-struct Player {
+/// Per-connection player state. `pub(crate)` + the `inv` field exist for
+/// the inventory module's `impl Game` hooks (inventory.rs).
+pub(crate) struct Player {
     name: String,
     x: f64,
     y: f64,
@@ -99,6 +119,8 @@ struct Player {
     sent: std::collections::HashSet<(i32, i32)>,
     teleport_id: i32,
     pending_keep_alive: Option<(i64, Instant)>,
+    // --- inventory hook (inventory.rs) ---
+    pub(crate) inv: crate::inventory::PlayerInvState,
 }
 
 /// One cached, versioned chunk. `wire` is the sendable form; block
@@ -111,7 +133,8 @@ pub struct CachedChunk {
 
 pub struct Game {
     chunks: std::collections::BTreeMap<(i32, i32), CachedChunk>,
-    players: std::collections::BTreeMap<ConnId, Player>,
+    // pub(crate) for the inventory module's Game hooks (inventory.rs).
+    pub(crate) players: std::collections::BTreeMap<ConnId, Player>,
     /// Inverse index: chunk column -> connections tracking it.
     viewers: std::collections::BTreeMap<(i32, i32), Vec<ConnId>>,
     inbound: Receiver<Inbound>,
@@ -394,6 +417,7 @@ impl Game {
                         sent: sent.into_iter().collect(),
                         teleport_id: 1,
                         pending_keep_alive: None,
+                        inv: Default::default(),
                     },
                 );
             }
@@ -444,6 +468,13 @@ impl Game {
                 name,
             } => {
                 self.setblock(conn, x, y, z, name);
+                self.send_command_feedback(conn);
+            }
+            // --- inventory hooks (inventory.rs) ---
+            Inbound::SetCarriedItem { conn, slot } => self.select_hotbar_slot(conn, slot),
+            Inbound::ContainerClick { conn, click } => self.container_clicked(conn, &click),
+            Inbound::Give { conn, item, count } => {
+                self.give_item(conn, &item, count);
                 self.send_command_feedback(conn);
             }
             Inbound::Left { conn } => {
@@ -1536,7 +1567,8 @@ impl Game {
         }
     }
 
-    fn send(&mut self, conn: ConnId, id: i32, body: &[u8]) {
+    // pub(crate) for the inventory module's broadcast helpers.
+    pub(crate) fn send(&mut self, conn: ConnId, id: i32, body: &[u8]) {
         if let Some(tx) = self.outbounds.get(&conn) {
             let _ = tx.send(Outbound::Frame {
                 id,
@@ -1822,6 +1854,7 @@ impl Game {
                 sent: chunks.iter().copied().collect(),
                 teleport_id: 1,
                 pending_keep_alive: None,
+                inv: Default::default(),
             },
         );
         for c in chunks {

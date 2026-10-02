@@ -815,32 +815,36 @@ pub fn parity_blocks() -> Result<bool> {
         vp.len(),
         dp.len()
     );
+    // Compare the write MULTISET, not the per-packet grouping: paced
+    // commands cross tick boundaries according to round-trip latency, so
+    // the reference itself splits the same writes 2+2 or 4 between runs.
+    // Exact batching is covered by the engine's own tick tests.
+    let mut vw: Vec<((i32, i32, i32), u32)> = vp.concat();
+    let mut dw: Vec<((i32, i32, i32), u32)> = dp.concat();
+    vw.sort();
+    dw.sort();
+    println!(
+        "[oracle] block writes: vanilla {} doppel {}",
+        vw.len(),
+        dw.len()
+    );
     let mut failures = Vec::new();
-    for (i, (a, b)) in vp.iter().zip(dp.iter()).enumerate() {
+    for (i, (a, b)) in vw.iter().zip(dw.iter()).enumerate() {
         if a != b {
-            failures.push(format!(
-                "packet {i}: vanilla {} entries vs doppel {} entries",
-                a.len(),
-                b.len()
-            ));
-            println!("  vanilla packet {i}: {a:?}");
-            println!("  doppel  packet {i}: {b:?}");
+            failures.push(format!("write {i}: vanilla {a:?} != doppel {b:?}"));
         }
     }
-    if vp.len() != dp.len() {
+    if vw.len() != dw.len() {
         failures.push(format!(
-            "packet count: vanilla {} vs doppel {}",
-            vp.len(),
-            dp.len()
+            "write count: vanilla {} vs doppel {}",
+            vw.len(),
+            dw.len()
         ));
-        println!(
-            "  vanilla packets: {:?}",
-            vp.iter().map(Vec::as_slice).collect::<Vec<_>>()
-        );
-        println!(
-            "  doppel packets: {:?}",
-            dp.iter().map(Vec::as_slice).collect::<Vec<_>>()
-        );
+        println!("  vanilla writes: {:?}", &vw[..vw.len().min(16)]);
+        println!("  doppel writes: {:?}", &dw[..dw.len().min(16)]);
+    }
+    if vw.is_empty() {
+        failures.push("vanilla produced no block writes".to_string());
     }
     let v_ok = vr.iter().filter(|p| p.id == 0x7c).count();
     let d_ok = dr.iter().filter(|p| p.id == 0x7c).count();
