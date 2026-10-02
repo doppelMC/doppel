@@ -218,7 +218,8 @@ pub fn generate_chunk(
             }
         }
     }
-    terrain.emit(cx, cz, &blocks)
+    let biomes = terrain.section_biomes(cx, cz);
+    terrain.emit_with(cx, cz, &blocks, biomes.as_ref())
 }
 
 #[cfg(test)]

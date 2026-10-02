@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::Path;
 
 pub mod anvil_to_wire;
+pub mod biome;
 pub mod chunk_codec;
 pub mod density;
 pub mod noise;

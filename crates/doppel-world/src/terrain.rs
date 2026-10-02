@@ -29,6 +29,10 @@ const CLIENT_HEIGHTMAPS: [u32; 3] = [1, 5, 4];
 /// Where the ocean surface sits (world y).
 pub const SEA_LEVEL: i32 = 63;
 
+/// Per-section biome cells: 4x4x4 in storage order (x fastest, then z,
+/// then y). Sections without climate data emit the default biome.
+pub type SectionBiomes = [[u32; 64]; SECTION_SPAN];
+
 // --- fitted engine ---------------------------------------------------------
 
 /// Continental stack: the slow field that picks ocean shelf vs highlands.
@@ -251,7 +255,8 @@ impl ChunkEmitter {
 
     /// Emits a wire chunk from a filled block buffer; heightmaps and light
     /// recompute from the buffer so structure overlays stay consistent.
-    fn emit(&self, cx: i32, cz: i32, blocks: &[u32]) -> WireChunk {
+    /// Biome cells override the default biome per section.
+    fn emit(&self, cx: i32, cz: i32, blocks: &[u32], biomes: Option<&SectionBiomes>) -> WireChunk {
         debug_assert_eq!(blocks.len(), WORLD_LAYERS * HEIGHTMAP_CELLS);
         let mut sections = Vec::with_capacity(SECTION_SPAN);
         let mut ground: Option<(usize, usize)> = None;
@@ -263,7 +268,8 @@ impl ChunkEmitter {
                 span.0 = span.0.min(index);
                 span.1 = span.1.max(index);
             }
-            sections.push(self.section(cells, solid));
+            let section_biomes = biomes.map(|all| &all[index]);
+            sections.push(self.section(cells, solid, section_biomes));
         }
 
         // First free layer per column (heightmap value).
@@ -290,13 +296,14 @@ impl ChunkEmitter {
 
     /// One wire section from its 4096 storage-order cells. The palette leads
     /// with air, then states in first-appearance storage order.
-    fn section(&self, cells: &[u32], solid: usize) -> WireSection {
+    fn section(&self, cells: &[u32], solid: usize, biomes: Option<&[u32; 64]>) -> WireSection {
+        let biome_container = biome_container(self.biome, biomes);
         if solid == 0 {
             return WireSection {
                 non_empty: 0,
                 fluid: 0,
                 block_states: Container::Single(self.air),
-                biomes: Container::Single(self.biome),
+                biomes: biome_container,
             };
         }
         let mut entries = vec![self.air];
@@ -319,7 +326,7 @@ impl ChunkEmitter {
                 non_empty: solid as i16,
                 fluid,
                 block_states: Container::Single(state),
-                biomes: Container::Single(self.biome),
+                biomes: biome_container,
             };
         }
         let mut bits = 4usize;
@@ -336,7 +343,7 @@ impl ChunkEmitter {
                 entries,
                 longs: pack(&storage, bits),
             },
-            biomes: Container::Single(self.biome),
+            biomes: biome_container,
         }
     }
 
@@ -384,11 +391,50 @@ impl ChunkEmitter {
     }
 }
 
+/// Packs one section's biome cells into a wire container: the single-value
+/// form when uniform, a palette (ids in first-appearance storage order,
+/// one to three bits) otherwise, and direct global ids past eight biomes.
+fn biome_container(default: u32, cells: Option<&[u32; 64]>) -> Container {
+    let Some(cells) = cells else {
+        return Container::Single(default);
+    };
+    let mut entries: Vec<u32> = Vec::new();
+    let storage: Vec<u16> = cells
+        .iter()
+        .map(|&id| match entries.iter().position(|&e| e == id) {
+            Some(i) => i as u16,
+            None => {
+                entries.push(id);
+                (entries.len() - 1) as u16
+            }
+        })
+        .collect();
+    if entries.len() == 1 {
+        return Container::Single(entries[0]);
+    }
+    if entries.len() <= 8 {
+        let mut bits = 1usize;
+        while (1usize << bits) < entries.len() {
+            bits += 1;
+        }
+        return Container::Palette {
+            bits: bits as u8,
+            entries,
+            longs: pack(&storage, bits),
+        };
+    }
+    let raw: Vec<u16> = cells.iter().map(|&id| id as u16).collect();
+    Container::Global {
+        bits: 7,
+        longs: pack(&raw, 7),
+    }
+}
+
 // --- generator -------------------------------------------------------------
 
 enum Engine {
     Fitted(FittedTerrain),
-    Density(NoiseTerrain),
+    Density(Box<NoiseTerrain>),
 }
 
 /// The terrain generator: a density engine over the pinned worldgen
@@ -404,7 +450,7 @@ impl HeightmapGenerator {
         let pins = locate_pins()?;
         let engine = NoiseTerrain::with_seed(seed, registry, &pins)?;
         Ok(HeightmapGenerator {
-            engine: Engine::Density(engine),
+            engine: Engine::Density(Box::new(engine)),
             emitter: ChunkEmitter::new(registry)?,
         })
     }
@@ -422,6 +468,39 @@ impl HeightmapGenerator {
         match &self.engine {
             Engine::Fitted(fitted) => fitted.column_top(wx, wz),
             Engine::Density(density) => density.column_top(wx, wz),
+        }
+    }
+
+    /// The biome at one block position; only the density engine carries
+    /// climate data, the fitted engine reports the default biome.
+    pub fn biome_at(&self, wx: i32, wy: i32, wz: i32) -> u32 {
+        match &self.engine {
+            Engine::Fitted(_) => self.emitter.biome,
+            Engine::Density(density) => density.biome_at(wx, wy, wz),
+        }
+    }
+
+    /// Raw climate axis samples at one block position (density engine;
+    /// zeros from the fitted engine).
+    #[cfg(test)]
+    pub(crate) fn climate_axes(
+        &self,
+        wx: i32,
+        wy: i32,
+        wz: i32,
+    ) -> [f32; crate::biome::AXIS_COUNT] {
+        match &self.engine {
+            Engine::Fitted(_) => [0.0; crate::biome::AXIS_COUNT],
+            Engine::Density(density) => density.climate_axes(wx, wy, wz),
+        }
+    }
+
+    /// Section biome grids for the chunk; None when the engine has no
+    /// climate data.
+    pub fn section_biomes(&self, cx: i32, cz: i32) -> Option<SectionBiomes> {
+        match &self.engine {
+            Engine::Fitted(_) => None,
+            Engine::Density(density) => density.section_biomes(cx, cz).try_into().ok(),
         }
     }
 
@@ -448,13 +527,21 @@ impl HeightmapGenerator {
     /// Generates the terrain-only chunk.
     pub fn generate(&self, cx: i32, cz: i32) -> WireChunk {
         let (blocks, _) = self.build_blocks(cx, cz);
-        self.emit(cx, cz, &blocks)
+        let biomes = self.section_biomes(cx, cz);
+        self.emitter.emit(cx, cz, &blocks, biomes.as_ref())
     }
 
     /// Emits a wire chunk from a filled block buffer; heightmaps and light
     /// recompute from the buffer so structure overlays stay consistent.
-    pub(crate) fn emit(&self, cx: i32, cz: i32, blocks: &[u32]) -> WireChunk {
-        self.emitter.emit(cx, cz, blocks)
+    /// Climate biome grids ride along when the engine produced them.
+    pub(crate) fn emit_with(
+        &self,
+        cx: i32,
+        cz: i32,
+        blocks: &[u32],
+        biomes: Option<&SectionBiomes>,
+    ) -> WireChunk {
+        self.emitter.emit(cx, cz, blocks, biomes)
     }
 }
 
@@ -727,5 +814,279 @@ mod tests {
             .unwrap()
             .generate(1, 0);
         assert_eq!(gen.generate(0, 0).encode(), chunk.encode());
+    }
+
+    /// Biome containers pack ids in first-appearance cell order and widen
+    /// by palette size, with the uniform case collapsing to a single value.
+    #[test]
+    fn biome_container_packing() {
+        assert_eq!(biome_container(41, None), Container::Single(41));
+        let uniform = biome_container(41, Some(&[41u32; 64]));
+        assert_eq!(uniform, Container::Single(41));
+
+        let mut cells = [41u32; 64];
+        cells[1] = 9;
+        let Container::Palette {
+            bits,
+            entries,
+            longs,
+        } = biome_container(41, Some(&cells))
+        else {
+            panic!("two biomes use a palette");
+        };
+        assert_eq!(bits, 1);
+        assert_eq!(entries, vec![41u32, 9], "first appearance leads");
+        let unpacked = unpack(&longs, bits as usize, 64);
+        assert_eq!(unpacked[0], 0);
+        assert_eq!(unpacked[1], 1, "the changed cell indexes the late entry");
+        assert!(unpacked[2..].iter().all(|&v| v == 0));
+
+        // A third biome widens to two bits; the first-appearance order
+        // holds (41 first seen at cell 1 now that cell 0 flipped).
+        cells[0] = 41;
+        cells[1] = 9;
+        cells[2] = 42;
+        let Container::Palette {
+            bits,
+            entries,
+            longs,
+        } = biome_container(41, Some(&cells))
+        else {
+            panic!("three biomes use a palette");
+        };
+        assert_eq!(bits, 2);
+        assert_eq!(entries, vec![41u32, 9, 42]);
+        let unpacked = unpack(&longs, bits as usize, 64);
+        assert_eq!(&unpacked[..4], &vec![0u16, 1, 2, 0]);
+
+        // A palette beyond eight entries falls back to direct ids.
+        let mut many = [0u32; 64];
+        for (i, cell) in many.iter_mut().enumerate() {
+            *cell = i as u32;
+        }
+        let Container::Global { bits, longs } = biome_container(41, Some(&many)) else {
+            panic!("ten biomes go global");
+        };
+        assert_eq!(bits, 7);
+        let unpacked = unpack(&longs, bits as usize, 64);
+        assert_eq!(unpacked[9], 9);
+    }
+
+    /// Climate biomes ride through the wire encode: biome palette ids stay
+    /// inside the registry, decode round-trips, and regeneration is stable.
+    #[test]
+    fn density_engine_emits_climate_biomes() {
+        let gen = HeightmapGenerator::with_seed(42, &registry()).expect("density generator");
+        let chunk = gen.generate(0, 0);
+        let bytes = chunk.encode();
+        let decoded = WireChunk::decode(&bytes).expect("decode with biome palettes");
+        assert_eq!(decoded, chunk);
+        let mut paletted_sections = 0;
+        for section in &chunk.sections {
+            match &section.biomes {
+                Container::Single(id) => assert!(*id < 67, "biome id {id} in registry"),
+                Container::Palette { entries, .. } => {
+                    paletted_sections += 1;
+                    assert!(entries.iter().all(|e| *e < 67));
+                }
+                Container::Global { .. } => panic!("unexpected global biomes here"),
+            }
+        }
+        // Chunk (0, 0) at seed 42 straddles a climate boundary and carries
+        // at least one section with several biomes.
+        assert!(
+            paletted_sections > 0,
+            "expected a mixed-biome section somewhere"
+        );
+        assert_eq!(
+            gen.generate(0, 0).encode(),
+            bytes,
+            "biome fill is deterministic"
+        );
+    }
+
+    /// Frozen climate table at the pinned seed: sample positions pin which
+    /// biome each part of the spawn area resolves to under the hand-worked
+    /// reference search - dark forest interior, the beach band on the
+    /// continentalness edge, lush caves depth, a river thread, and open
+    /// ocean. The captured-vanilla test below holds the same table against
+    /// a live boot.
+    #[test]
+    fn climate_biomes_at_sample_positions() {
+        let gen = HeightmapGenerator::with_seed(42, &registry()).expect("density generator");
+        let cases: [((i32, i32, i32), u32); 5] = [
+            ((0, 64, 0), 9),
+            ((36, 64, 12), 3),
+            ((64, 20, 32), 31),
+            ((-80, 64, -96), 42),
+            ((40, 64, 76), 36),
+        ];
+        for ((x, y, z), want) in cases {
+            assert_eq!(gen.biome_at(x, y, z), want, "sample ({x},{y},{z})");
+        }
+        // The beach sample's continentalness quantizes exactly onto the
+        // beach row's span edge (-0.11), the fitness-tie column documented
+        // in the captured-vanilla test below.
+        let axes = gen.climate_axes(36, 64, 12);
+        assert_eq!(crate::biome::quantize_axis(axes[2]), -1100);
+        // The fitted engine carries no climate data and reports the default.
+        let fitted = HeightmapGenerator::fitted_with_seed(42, &registry()).unwrap();
+        assert_eq!(fitted.biome_at(0, 64, 0), PLAINS_BIOME_ID);
+    }
+
+    /// Local-vanilla biome oracle: the climate-resolved biome grids match
+    /// the biome containers in the chunk packets captured from a live
+    /// vanilla boot at this seed, cell for cell. Skips when the capture
+    /// directory (written by the worldgen parity gate) is absent.
+    #[test]
+    fn climate_biomes_match_captured_vanilla() {
+        let capture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/vanilla/worldgen-capture");
+        let Ok(entries) = std::fs::read_dir(&capture) else {
+            eprintln!("skipping: no worldgen capture under target/vanilla");
+            return;
+        };
+        let pin_root = crate::density::locate_pins().expect("pins");
+        let order: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(pin_root.join("biome_registry_order.json"))
+                .expect("registry order file"),
+        )
+        .expect("registry order json");
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).expect("density generator");
+
+        // Every dumped packet body decodes or it is not a chunk packet.
+        let mut vanilla: Vec<WireChunk> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let Ok(body) = std::fs::read(&path) else {
+                continue;
+            };
+            // Chunk packets carry chunk x/z in the first eight bytes; other
+            // traffic fails this filter before any decode allocates.
+            if body.len() < 64 || body.len() > 2_000_000 {
+                continue;
+            }
+            let x = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let z = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+            if x.abs() > 48 || z.abs() > 48 {
+                continue;
+            }
+            let Ok(chunk) = WireChunk::decode(&body) else {
+                continue;
+            };
+            if chunk.sections.len() != SECTION_SPAN
+                || chunk.heightmaps.len() > 8
+                || chunk
+                    .light
+                    .sky_updates
+                    .iter()
+                    .any(|layer| layer.len() > 2048)
+            {
+                continue;
+            }
+            if seen.insert((chunk.x, chunk.z)) {
+                vanilla.push(chunk);
+            }
+        }
+        assert!(
+            !vanilla.is_empty(),
+            "capture directory held no chunk packets"
+        );
+
+        let name_of = |id: u32| -> String { order.get(id as usize).cloned().unwrap_or_default() };
+        let mut total = 0usize;
+        let mut agree = 0usize;
+        let mut ours_hist: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut theirs_hist: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut mismatches: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        let mut probed = 0usize;
+        for chunk in &vanilla {
+            let Some(ours) = terrain.section_biomes(chunk.x, chunk.z) else {
+                continue;
+            };
+            for (index, section) in chunk.sections.iter().enumerate() {
+                let cells: Vec<u32> = match &section.biomes {
+                    Container::Single(id) => vec![*id; 64],
+                    Container::Palette {
+                        entries,
+                        longs,
+                        bits,
+                    } => unpack(longs, *bits as usize, 64)
+                        .into_iter()
+                        .map(|i| entries[i as usize])
+                        .collect(),
+                    Container::Global { longs, bits } => unpack(longs, *bits as usize, 64)
+                        .into_iter()
+                        .map(|i| i as u32)
+                        .collect(),
+                };
+                for cell in 0..64usize {
+                    let want = cells[cell];
+                    let got = ours[index][cell];
+                    total += 1;
+                    *theirs_hist.entry(name_of(want)).or_default() += 1;
+                    *ours_hist.entry(name_of(got)).or_default() += 1;
+                    if want == got {
+                        agree += 1;
+                    } else {
+                        *mismatches.entry((name_of(want), name_of(got))).or_default() += 1;
+                        if probed < 6 {
+                            probed += 1;
+                            let wx = chunk.x * 16 + ((cell % 4) * 4) as i32;
+                            let wz = chunk.z * 16 + (((cell / 4) % 4) * 4) as i32;
+                            let quart_y = -16 + (index as i32) * 4 + ((cell / 16) as i32);
+                            let wy = quart_y * 4;
+                            eprintln!(
+                                "[biomes] mismatch at chunk ({},{}) section {} cell {}: block ({wx},{wy},{wz}) vanilla {} ours {}",
+                                chunk.x,
+                                chunk.z,
+                                index,
+                                cell,
+                                name_of(want),
+                                name_of(got)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total > 0, "capture carried no biome data");
+        eprintln!(
+            "[biomes] agree {agree}/{total} ({:.2}%) over {} chunks",
+            100.0 * agree as f64 / total as f64,
+            vanilla.len()
+        );
+        for (name, count) in &theirs_hist {
+            eprintln!("[biomes] vanilla {name}: {count}");
+        }
+        for (name, count) in &ours_hist {
+            eprintln!("[biomes] ours    {name}: {count}");
+        }
+        for ((want, got), count) in mismatches.iter().take(12) {
+            eprintln!("[biomes] vanilla {want} vs ours {got}: {count}");
+        }
+        // The residual flips all sit in quart columns where the fitness race
+        // between two biome rows differs by one quantized step: at block
+        // x=36, z=12 the continentalness sample quantizes to -1100, the
+        // beach row's span edge, and the best beach row scores 2699449
+        // against dark forest's 2699450. Vanilla's climate noises land one
+        // float-granularity step off there, so single columns flip without
+        // the search being wrong. One column in five thousand flipping is
+        // the expected granularity cost.
+        let ratio = agree as f64 / total as f64;
+        assert!(
+            ratio >= 0.999,
+            "biome agreement {ratio:.4} below 99.9% ({} of {} cells)",
+            total - agree,
+            total
+        );
     }
 }

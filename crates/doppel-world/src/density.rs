@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::biome::{BiomeTable, AXIS_COUNT};
 use crate::noise::{world_positional, Perlin, Positional, Xoroshiro};
 use crate::registry::BlockRegistry;
 
@@ -1630,6 +1631,71 @@ impl AquiferState {
 // The terrain engine.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Climate sampling and biome selection.
+// ---------------------------------------------------------------------------
+
+/// The six climate router functions plus the parameter table that turns
+/// their samples into biome wire ids.
+pub struct ClimateSampler {
+    temperature: NodeRef,
+    humidity: NodeRef,
+    continentalness: NodeRef,
+    erosion: NodeRef,
+    depth: NodeRef,
+    weirdness: NodeRef,
+    table: BiomeTable,
+}
+
+impl ClimateSampler {
+    /// Binds the router's climate functions and loads the pinned
+    /// parameter table. Router key names map onto the parameter axes:
+    /// vegetation carries humidity, continents carry continentalness,
+    /// ridges carry weirdness.
+    fn from_router(loader: &mut Loader, router: &Value, pins: &Path) -> Result<ClimateSampler> {
+        let axis = |loader: &mut Loader, key: &str| -> Result<NodeRef> {
+            let id = router
+                .get(key)
+                .and_then(Value::as_str)
+                .with_context(|| format!("noise router {key}"))?;
+            loader.function_id(id)
+        };
+        Ok(ClimateSampler {
+            temperature: axis(loader, "temperature")?,
+            humidity: axis(loader, "vegetation")?,
+            continentalness: axis(loader, "continents")?,
+            erosion: axis(loader, "erosion")?,
+            depth: axis(loader, "depth")?,
+            weirdness: axis(loader, "ridges")?,
+            table: BiomeTable::load(pins)?,
+        })
+    }
+
+    /// Samples the climate functions at block coordinates and resolves
+    /// the biome. Each axis narrows through the quantized search.
+    fn biome(&self, graph: &Graph, ctx: &mut ChunkCtx, x: i32, y: i32, z: i32) -> u32 {
+        let axes = self.axes(graph, ctx, x, y, z);
+        self.table.find_axes(axes)
+    }
+
+    /// Raw climate samples at block coordinates.
+    fn axes(&self, graph: &Graph, ctx: &mut ChunkCtx, x: i32, y: i32, z: i32) -> [f32; AXIS_COUNT] {
+        let nodes = [
+            self.temperature,
+            self.humidity,
+            self.continentalness,
+            self.erosion,
+            self.depth,
+            self.weirdness,
+        ];
+        let mut axes = [0f32; AXIS_COUNT];
+        for (slot, &node) in nodes.iter().enumerate() {
+            axes[slot] = sample_node(graph, ctx, node, x, y, z);
+        }
+        axes
+    }
+}
+
 /// The density-driven terrain generator.
 pub struct NoiseTerrain {
     graph: Graph,
@@ -1643,6 +1709,7 @@ pub struct NoiseTerrain {
     aquifer_spread: NodeRef,
     aquifer_lava: NodeRef,
     aquifer_exclusion: NodeRef,
+    climate: ClimateSampler,
     rule: Rule,
     surface_stack: Arc<StackNoise>,
     secondary_stack: Arc<StackNoise>,
@@ -1698,6 +1765,7 @@ impl NoiseTerrain {
         let aquifer_lava = aq(&mut loader, "lava")?;
         let aquifer_exclusion = aq(&mut loader, "exclusion")?;
         let preliminary = aq(&mut loader, "surface_level")?;
+        let climate = ClimateSampler::from_router(&mut loader, router, pins)?;
         let rule = loader.rule_id(
             settings
                 .get("material_rule")
@@ -1741,6 +1809,7 @@ impl NoiseTerrain {
             aquifer_spread,
             aquifer_lava,
             aquifer_exclusion,
+            climate,
             rule,
             surface_stack,
             secondary_stack,
@@ -1809,6 +1878,60 @@ impl NoiseTerrain {
             }
         }
         -1
+    }
+
+    /// Biome wire ids for every section's 4x4x4 cell grid, storage order
+    /// (x fastest, then z, then y). Each cell resolves at its minimum
+    /// corner on the quart grid.
+    pub fn section_biomes(&self, cx: i32, cz: i32) -> Vec<[u32; 64]> {
+        let sections = (self.height / 16) as usize;
+        let mut ctx = ChunkCtx::new(cx * EDGE, cz * EDGE, self.min_y, self.height);
+        let mut out = Vec::with_capacity(sections);
+        let mut cells = [0u32; 64];
+        for section in 0..sections {
+            let base_quart_y = self.min_y.div_euclid(4) + section as i32 * 4;
+            for y4 in 0..4 {
+                for z4 in 0..4 {
+                    for x4 in 0..4 {
+                        let x = cx * EDGE + x4 * 4;
+                        let z = cz * EDGE + z4 * 4;
+                        let y = (base_quart_y + y4) * 4;
+                        let cell = (y4 * 16 + z4 * 4 + x4) as usize;
+                        cells[cell] = self.climate.biome(&self.graph, &mut ctx, x, y, z);
+                    }
+                }
+            }
+            out.push(cells);
+        }
+        out
+    }
+
+    /// The biome holding one block position, sampled at the quart cell
+    /// corner that owns it.
+    pub fn biome_at(&self, wx: i32, wy: i32, wz: i32) -> u32 {
+        let x = wx.div_euclid(4) * 4;
+        let z = wz.div_euclid(4) * 4;
+        let y = wy.div_euclid(4) * 4;
+        let mut ctx = ChunkCtx::new(
+            wx.div_euclid(EDGE) * EDGE,
+            wz.div_euclid(EDGE) * EDGE,
+            self.min_y,
+            self.height,
+        );
+        self.climate.biome(&self.graph, &mut ctx, x, y, z)
+    }
+
+    /// Raw climate axis samples at one block position: temperature,
+    /// humidity, continentalness, erosion, depth, weirdness.
+    #[cfg(test)]
+    pub(crate) fn climate_axes(&self, wx: i32, wy: i32, wz: i32) -> [f32; AXIS_COUNT] {
+        let mut ctx = ChunkCtx::new(
+            wx.div_euclid(EDGE) * EDGE,
+            wz.div_euclid(EDGE) * EDGE,
+            self.min_y,
+            self.height,
+        );
+        self.climate.axes(&self.graph, &mut ctx, wx, wy, wz)
     }
 
     fn global_fluid(&self, y: i32) -> FluidStatus {
