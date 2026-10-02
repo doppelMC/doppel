@@ -725,7 +725,7 @@ mod tests {
         let _ = rx;
     }
 
-        fn places_on_every_face() {
+    fn places_on_every_face() {
         let (mut g, rx) = harness();
         give(&mut g, "minecraft:stone", 64);
         // Top of the floor: target is the circuit plane y=100.
