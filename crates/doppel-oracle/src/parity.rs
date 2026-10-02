@@ -657,7 +657,7 @@ fn decode_update_writes(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), 
             let packed = i64::from_be_bytes(raw[0..8].try_into().unwrap());
             let x = (((packed >> 38) & 0x3ff_ffff) as i64) << 38 >> 38;
             let z = (((packed >> 12) & 0x3ff_ffff) as i64) << 38 >> 38;
-            let y = (packed & 0xfff) as i32;
+            let y = (((packed & 0xfff) as i32) << 20) >> 20;
             let mut st = 0u32;
             let mut sh = 0u32;
             let mut o = 8usize;
@@ -675,7 +675,7 @@ fn decode_update_writes(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), 
             let sec = i64::from_be_bytes(raw[0..8].try_into().unwrap());
             let sx = (sec >> 42) & 0x3f_ffff;
             let sz = (sec >> 20) & 0x3f_ffff;
-            let sy = (sec & 0xf_ffff) as i64;
+            let sy = (((sec & 0xf_ffff) as i64) << 12) >> 12;
             let sx = (sx << 10) >> 10;
             let sz = (sz << 10) >> 10;
             let mut o = 8usize;
@@ -1173,7 +1173,10 @@ pub fn parity_placement() -> Result<bool> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(1, -60, 1, 1))];
+    let raw: Vec<(i32, Vec<u8>)> = vec![
+        (0x2c, Vec::new()), // player_loaded
+        (0x42, bot::build_use_item_on_top(1, -60, 1, 1)),
+    ];
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
