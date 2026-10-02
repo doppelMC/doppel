@@ -1166,14 +1166,14 @@ pub fn parity_placement() -> Result<bool> {
 
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
-    let commands: Vec<String> = ["gamemode creative", "setblock 10 99 10 minecraft:stone"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let raw: Vec<(i32, Vec<u8>)> = vec![
-        (0x38, bot::build_set_creative_slot(36, 1)),
-        (0x42, bot::build_use_item_on_top(10, 99, 10, 1)),
-    ];
+    let commands: Vec<String> = [
+        "setblock 10 99 10 minecraft:stone",
+        "give @s minecraft:stone 64",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(10, 99, 10, 1))];
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
