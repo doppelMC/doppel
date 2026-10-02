@@ -585,6 +585,11 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         if from.is_dir() {
             copy_dir(&from, &to)?;
         } else {
+            // The running process holds the world's session lock; the
+            // snapshot never needed it.
+            if entry.file_name() == "session.lock" {
+                continue;
+            }
             std::fs::copy(&from, &to).with_context(|| format!("copying {}", from.display()))?;
         }
     }
