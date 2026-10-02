@@ -376,6 +376,32 @@ fn circuit_trace() {
     for _ in 0..10 {
         g.tick_once_for_test();
     }
+    // Full CI circuit tail: comparator + observer + stone swap + L-shape.
+    for c in [
+        "setblock 16 100 10 minecraft:repeater[facing=west,delay=1]",
+        "tick step 1",
+        "setblock 17 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 18 100 10 minecraft:comparator[facing=west,mode=compare,powered=false]",
+        "tick step 1",
+        "setblock 10 100 12 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 11 100 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 17 100 13 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 20 100 10 minecraft:observer[facing=east]",
+        "tick step 1",
+        "setblock 21 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:stone",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:oak_planks",
+        "tick step 10",
+    ] {
+        cmd(&mut g, c);
+        g.tick_once_for_test();
+    }
     std::env::remove_var("WIRE_TRACE");
     // Final lever state: 8439 = powered true, 8440 = false.
     let lever = g.get_block(10, 100, 10).expect("lever present");
