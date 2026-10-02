@@ -230,6 +230,15 @@ pub fn login_capture(
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
             Err(e) => {
+                // A scripted command whose reply never came names itself
+                // here: the volley stalls at it, and the stall reads as a
+                // timeout once the server goes quiet.
+                if next_cmd > 0 && next_cmd < commands.len() {
+                    eprintln!(
+                        "[bot] volley stalled after command {:?} (no reply)",
+                        commands[next_cmd - 1]
+                    );
+                }
                 // Record WHY the transcript ended: "idle timeout" (server
                 // waiting on us) reads very differently from a framing error.
                 packets.push(CapturedPacket {
