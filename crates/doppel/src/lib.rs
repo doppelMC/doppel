@@ -434,7 +434,7 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         }
         // set_creative_mode_slot: creative clients push their picked
         // stacks.
-        0x38 => {
+        0x39 => {
             let set = inventory::parse_set_creative_slot(body).ok()?;
             Some(game::Inbound::CreativeSlot { conn, set })
         }
