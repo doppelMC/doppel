@@ -8,6 +8,7 @@ mod parity_worldgen;
 mod registry;
 mod scenario;
 mod vanilla;
+mod worldgen_pins;
 
 use anyhow::{Context, Result};
 use doppel_protocol::{save_pin, Pin};
@@ -18,6 +19,8 @@ fn usage() -> ! {
     eprintln!(
         "usage:
   doppel-oracle pin                   write pins/version.json for the latest release
+  doppel-oracle pin-worldgen          unpack the vanilla jar and copy its worldgen
+                                       configs into pins/worldgen/
   doppel-oracle status <host> <port>  ping any server and print its status JSON
   doppel-oracle parity-status         differential test: vanilla oracle vs doppel
                                        (set DOPPEL_BIN=<path> to override the binary)
@@ -44,6 +47,7 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("pin") => cmd_pin()?,
+        Some("pin-worldgen") => worldgen_pins::run()?,
         Some("status") => {
             let host = args.get(1).unwrap_or_else(|| usage()).clone();
             let port: u16 = args

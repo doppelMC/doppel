@@ -28,19 +28,21 @@ const PORT: u16 = 25571;
 const SEED: i64 = 42;
 /// Capture floor: below this the join burst failed, not the generator.
 const MIN_CHUNKS: usize = 20;
-/// Heightmap convergence targets (world layers).
-const MAX_MEDIAN_DELTA: f64 = 32.0;
-const MAX_P95_DELTA: f64 = 96.0;
+/// Heightmap convergence targets (world layers). The residual median sits
+/// at canopy height: the density surface matches, vanilla adds trees.
+const MAX_MEDIAN_DELTA: f64 = 8.0;
+const MAX_P95_DELTA: f64 = 12.0;
 /// Shape alignment: Pearson correlation of the height fields.
-const MIN_CORRELATION: f64 = 0.3;
+const MIN_CORRELATION: f64 = 0.68;
 /// Material agreement: histogram overlap over block names.
-const MIN_OVERLAP: f64 = 0.35;
+const MIN_OVERLAP: f64 = 0.5;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
 /// breakage like wrong world height or offset sections).
-const MIN_CELL_AGREEMENT: f64 = 0.5;
-/// Coastline agreement: decorrelated climate fields sit near 0.6, matched
-/// fields well above 0.8.
-const MIN_LANDMASK: f64 = 0.75;
+const MIN_CELL_AGREEMENT: f64 = 0.7;
+/// Coastline agreement: the density surface matches vanilla block for
+/// block; the remaining disagreement columns carry vanilla ground cover
+/// (leaf litter, grass, tree canopies) the density engine does not place.
+const MIN_LANDMASK: f64 = 0.76;
 
 pub fn run() -> Result<bool> {
     let pin = load_pin()?;
