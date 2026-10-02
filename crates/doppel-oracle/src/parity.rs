@@ -1168,6 +1168,7 @@ pub fn parity_placement() -> Result<bool> {
     let protocol = pin.protocol.unwrap_or(0);
     let commands: Vec<String> = [
         "setblock 10 99 10 minecraft:stone",
+        "tp @s 10 101 12",
         "give @s minecraft:stone 64",
     ]
     .iter()
