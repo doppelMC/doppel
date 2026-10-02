@@ -689,11 +689,15 @@ impl Game {
                 .as_ref()
                 .and_then(|s| crate::placement::block_item_form(s.item()))
             else {
+                eprintln!(
+                    "[game] use_item_on at ({x},{y},{z}) face {face}: no block item in slot {slot}"
+                );
                 return;
             };
             (slot, block, form, p.yaw, p.pitch, p.inv.creative)
         };
         let Some(spec) = form.spec(block, face, yaw, pitch) else {
+            eprintln!("[game] use_item_on: no form for {block} face {face}");
             return;
         };
         let (dx, dy, dz) = crate::placement::face_step(face);
@@ -701,6 +705,10 @@ impl Game {
         // Only air accepts a placement; replaceable blocks (water, grass
         // paths) arrive with the block-data pin.
         if !matches!(self.get_block(tx, ty, tz), Some((n, _)) if n == "minecraft:air") {
+            eprintln!(
+                "[game] use_item_on: target ({tx},{ty},{tz}) is not air: {:?}",
+                self.get_block(tx, ty, tz)
+            );
             return;
         }
         let Some(state) = self.resolve_state(&spec) else {
