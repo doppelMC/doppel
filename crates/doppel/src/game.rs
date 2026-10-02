@@ -268,8 +268,13 @@ impl Game {
     /// tick; the real 20 TPS loop replaces this when simulation arrives.
     pub fn run(&mut self) {
         const TICK: Duration = Duration::from_millis(50);
+        // Ticks fire on wall-clock deadlines, not per event batch: a tick
+        // per command batch would flush each edit separately instead of
+        // batching everything that landed inside one 50ms window.
+        let mut next_tick = std::time::Instant::now() + TICK;
         loop {
-            match self.inbound.recv_timeout(TICK) {
+            let wait = next_tick.saturating_duration_since(std::time::Instant::now());
+            match self.inbound.recv_timeout(wait) {
                 Ok(event) => {
                     self.handle(event);
                     // Drain everything else already queued: events arriving
@@ -282,14 +287,18 @@ impl Game {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            // The flush now happens inside game_tick at vanilla's
-            // broadcast point; edits from the block-event/BE phases below
-            // it deliberately stay pending until the next tick's flush.
-            // A frozen clock only advances through explicit `tick step`s.
-            if !self.frozen {
-                self.game_tick();
+            if std::time::Instant::now() >= next_tick {
+                // The flush happens inside game_tick at vanilla's
+                // broadcast point; edits from the block-event/BE phases
+                // below it deliberately stay pending until the next
+                // tick's flush. A frozen clock only advances through
+                // explicit `tick step`s.
+                if !self.frozen {
+                    self.game_tick();
+                }
+                self.tick_keep_alives();
+                next_tick += TICK;
             }
-            self.tick_keep_alives();
         }
     }
 

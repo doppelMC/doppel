@@ -25,11 +25,11 @@ fn harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
             // reference pops it without one. Storage packing is YZX.
             let block_states = if sy == 10 {
                 let mut longs = vec![0u64; 256];
-                for l in 0..256 {
+                for (l, slot) in longs.iter_mut().enumerate() {
                     for j in 0..16 {
                         let i = l * 16 + j;
                         let v: u64 = if (i >> 8) == 3 { 1 } else { 0 };
-                        longs[l] |= v << (j * 4);
+                        *slot |= v << (j * 4);
                     }
                 }
                 doppel_world::chunk_codec::Container::Palette {
@@ -621,6 +621,9 @@ fn serve_loop_burst_sim() {
             .unwrap();
         }
     }
+    // Hold the channel open across tick boundaries so the deadline-based
+    // run loop flushes the burst before Disconnected ends it.
+    std::thread::sleep(std::time::Duration::from_millis(150));
     drop(tx); // reader gone -> Disconnected -> run() exits after draining
     runner.join().unwrap();
     // Decode everything the viewer received, oracle apply() style.
