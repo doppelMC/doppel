@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct BlockRegistry {
     /// "name|k=v,k=v" -> state id
     by_key: HashMap<String, u32>,

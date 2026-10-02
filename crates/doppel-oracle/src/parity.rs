@@ -572,6 +572,141 @@ pub fn parity_walk() -> Result<bool> {
     }
 }
 
+/// Recursively copies a directory (a tiny std-only `cp -r`).
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copying {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Boots vanilla WITHOUT running any commands, captures the clean join
+/// transcript as replay blobs, and snapshots the pristine flat world.
+/// Doppel later boots against these, so the scripted commands it receives
+/// are executed by its own engine against a world with no leftovers —
+/// otherwise its setblocks no-op against vanilla's saved circuit and the
+/// comparison degrades into vanilla-vs-replayed-vanilla.
+fn capture_clean_blobs(
+    pin: &Pin,
+    jar: &std::path::Path,
+    blobs_dir: &std::path::Path,
+    pristine_world: &std::path::Path,
+) -> Result<()> {
+    use crate::capture;
+
+    let server = vanilla::boot(pin, jar, VANILLA_PORT)?;
+    let login = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(300),
+            dump_dir: Some(blobs_dir),
+            commands: &[],
+            walk_chunks: None,
+        },
+    )
+    .context("capturing clean vanilla join")?;
+    drop(server);
+    let entries = capture::write_manifest(&v, blobs_dir)?;
+    anyhow::ensure!(entries > 0, "no blobs captured from vanilla");
+    // Snapshot the untouched world before any scripted run dirties it.
+    if pristine_world.exists() {
+        std::fs::remove_dir_all(pristine_world)?;
+    }
+    let world = crate::vanilla::vanilla_dir()?.join("run").join("world");
+    anyhow::ensure!(world.is_dir(), "vanilla world dir missing after boot");
+    copy_dir(&world, pristine_world)?;
+    // The JVM was killed; a stale lock file means nothing to a reader.
+    let _ = std::fs::remove_file(pristine_world.join("session.lock"));
+    println!(
+        "[oracle] clean join blobs ({} packets) + pristine world snapshot at {}",
+        v.iter().filter(|p| p.id >= 0).count(),
+        pristine_world.display()
+    );
+    Ok(())
+}
+
+/// Decodes a captured update stream (0x08 + 0x56 packets) into ordered
+/// (pos, state) writes — the oracle-side eyes for final-state comparison.
+fn decode_update_writes(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), u32)> {
+    let mut out = Vec::new();
+    for p in pkts {
+        let raw = hex::decode(&p.head_hex).unwrap_or_default();
+        if p.id == 0x08 && raw.len() >= 9 {
+            let packed = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+            let x = (((packed >> 38) & 0x3ff_ffff) as i64) << 38 >> 38;
+            let z = (((packed >> 12) & 0x3ff_ffff) as i64) << 38 >> 38;
+            let y = (packed & 0xfff) as i32;
+            let mut st = 0u32;
+            let mut sh = 0u32;
+            let mut o = 8usize;
+            while o < raw.len() {
+                let b = raw[o];
+                o += 1;
+                st |= u32::from(b & 0x7f) << sh;
+                sh += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            out.push(((x as i32, y, z as i32), st));
+        } else if p.id == 0x56 && raw.len() >= 8 {
+            let sec = i64::from_be_bytes(raw[0..8].try_into().unwrap());
+            let sx = (sec >> 42) & 0x3f_ffff;
+            let sz = (sec >> 20) & 0x3f_ffff;
+            let sy = (sec & 0xf_ffff) as i64;
+            let sx = (sx << 10) >> 10;
+            let sz = (sz << 10) >> 10;
+            let mut o = 8usize;
+            let rd = |raw: &[u8], o: &mut usize| -> u64 {
+                let mut v: u64 = 0;
+                let mut sh = 0u32;
+                while *o < raw.len() {
+                    let b = raw[*o];
+                    *o += 1;
+                    v |= u64::from(b & 0x7f) << sh;
+                    sh += 7;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+                v
+            };
+            let count = rd(&raw, &mut o);
+            for _ in 0..count {
+                let e = rd(&raw, &mut o);
+                let local = (e & 0xfff) as i32;
+                let st = (e >> 12) as u32;
+                let lx = (local >> 8) & 0xf;
+                let lz = (local >> 4) & 0xf;
+                let ly = local & 0xf;
+                out.push((
+                    (
+                        (sx * 16 + lx as i64) as i32,
+                        (sy * 16 + ly as i64) as i32,
+                        (sz * 16 + lz as i64) as i32,
+                    ),
+                    st,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The differential block test: identical setblock commands on both
 /// servers; compare every section_blocks_update (0x56) and block_update
 /// (0x08) broadcast — section coords, entry counts, and each
@@ -583,15 +718,9 @@ pub fn parity_blocks() -> Result<bool> {
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
     let blobs_dir = root.join("target").join("vanilla").join("blobs");
-    let world_dir = root
-        .join("target")
-        .join("vanilla")
-        .join("run")
-        .join("world");
-    for dir in [&blobs_dir] {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
-        }
+    let pristine_world = root.join("target").join("vanilla").join("pristine-world");
+    if blobs_dir.exists() {
+        std::fs::remove_dir_all(&blobs_dir)?;
     }
 
     let login = capture::login_start_c("Doppel");
@@ -606,7 +735,10 @@ pub fn parity_blocks() -> Result<bool> {
     .map(|s| s.to_string())
     .collect();
 
-    // 1. Vanilla: capture join + setblocks + the broadcasts.
+    // 1. Clean join blobs + pristine world (no commands run yet).
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+
+    // 2. Vanilla reference: same commands, fresh boot (fresh world).
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v = bot::login_capture(
         "127.0.0.1",
@@ -616,16 +748,15 @@ pub fn parity_blocks() -> Result<bool> {
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(5)),
             max_packets: Some(300),
-            dump_dir: Some(&blobs_dir),
+            dump_dir: None,
             commands: &commands,
             walk_chunks: None,
         },
     )
     .context("capturing vanilla setblocks")?;
     drop(server);
-    capture::write_manifest(&v, &blobs_dir)?;
 
-    // 2. Doppel, same script.
+    // 3. Doppel against the clean blobs + pristine world.
     let bin = default_doppel_bin()?;
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
@@ -633,7 +764,7 @@ pub fn parity_blocks() -> Result<bool> {
         .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
-        .env("DOPPEL_WORLD", &world_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -656,80 +787,37 @@ pub fn parity_blocks() -> Result<bool> {
     let _ = child.kill();
     let _ = child.wait();
 
-    // 3. Decode and compare every 0x56/0x08 packet.
-    fn decode_updates(pkts: &[&bot::CapturedPacket]) -> Vec<(i32, String)> {
-        let mut out = Vec::new();
-        for p in pkts {
-            if p.id != 0x56 && p.id != 0x08 {
-                continue;
-            }
-            let raw = hex::decode(&p.head_hex).unwrap_or_default();
-            if p.id == 0x08 && raw.len() >= 8 {
-                out.push((0x08, format!("pos {:?}", raw[..8].to_vec())));
-                continue;
-            }
-            if p.id == 0x56 && raw.len() >= 8 {
-                let b = &raw;
-                let sec = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
-                // Decode count + VarLongs.
-                let mut o = 8usize;
-                let mut val: u64 = 0;
-                let mut shift = 0u32;
-                while o < b.len() {
-                    let byte = b[o];
-                    o += 1;
-                    val |= u64::from(byte & 0x7f) << shift;
-                    shift += 7;
-                    if byte & 0x80 == 0 {
-                        break;
-                    }
-                }
-                let count = val;
-                let mut entries = Vec::new();
-                for _ in 0..count {
-                    let mut v: u64 = 0;
-                    let mut sh = 0u32;
-                    while o < b.len() {
-                        let byte = b[o];
-                        o += 1;
-                        v |= u64::from(byte & 0x7f) << sh;
-                        sh += 7;
-                        if byte & 0x80 == 0 {
-                            break;
-                        }
-                    }
-                    entries.push(format!("{:x}:{:x}", v & 0xfff, v >> 12));
-                }
-                out.push((0x56, format!("sec {:x?} n={} {:?}", sec, count, entries)));
-            }
-        }
-        out
-    }
-
+    // 4. Compare the engine-made broadcasts: same writes, same batching.
     let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
     let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
-    let vu = decode_updates(&vr);
-    let du = decode_updates(&dr);
+    let v_writes = decode_update_writes(&vr);
+    let d_writes = decode_update_writes(&dr);
     println!(
-        "[oracle] block broadcasts: vanilla {} doppel {}",
-        vu.len(),
-        du.len()
+        "[oracle] block writes: vanilla {} doppel {}",
+        v_writes.len(),
+        d_writes.len()
     );
     let mut failures = Vec::new();
-    for (i, (a, b)) in vu.iter().zip(du.iter()).enumerate() {
+    for (i, (a, b)) in v_writes.iter().zip(d_writes.iter()).enumerate() {
         if a != b {
-            failures.push(format!("broadcast {i}: vanilla {a:?} != doppel {b:?}"));
+            failures.push(format!("write {i}: vanilla {a:?} != doppel {b:?}"));
         }
     }
-    if vu.len() != du.len() {
+    if v_writes.len() != d_writes.len() {
         failures.push(format!(
             "count: vanilla {} vs doppel {}",
-            vu.len(),
-            du.len()
+            v_writes.len(),
+            d_writes.len()
         ));
+        println!(
+            "  vanilla writes: {:?}",
+            v_writes.iter().take(12).collect::<Vec<_>>()
+        );
+        println!(
+            "  doppel writes: {:?}",
+            d_writes.iter().take(12).collect::<Vec<_>>()
+        );
     }
-    // Vanilla's post-broadcast chunk state can also be compared via the
-    // system_chat setblock.success count (all four must have succeeded).
     let v_ok = vr.iter().filter(|p| p.id == 0x7c).count();
     let d_ok = dr.iter().filter(|p| p.id == 0x7c).count();
     println!("[oracle] system_chat: vanilla {v_ok} doppel {d_ok}");
@@ -757,11 +845,7 @@ pub fn parity_redstone() -> Result<bool> {
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
     let blobs_dir = root.join("target").join("vanilla").join("blobs");
-    let world_dir = root
-        .join("target")
-        .join("vanilla")
-        .join("run")
-        .join("world");
+    let pristine_world = root.join("target").join("vanilla").join("pristine-world");
     if blobs_dir.exists() {
         std::fs::remove_dir_all(&blobs_dir)?;
     }
@@ -772,10 +856,10 @@ pub fn parity_redstone() -> Result<bool> {
     // The L-shaped branch off wire 12 exercises the same-Y corner
     // (connection recompute + signal around the bend). The step places
     // the top wire BEFORE the stone under it so the climbing wire's
-    // UP-connection (diagonal rules, §1.4b/§2.2) is recomputed by
-    // vanilla's own updateShape when the stone lands; the stone above
-    // the branch wire cuts its UP connections; the terminator beside the
-    // top wire recomputes that wire's line shape.
+    // UP-connection (diagonal rules) is recomputed by vanilla's own
+    // updateShape when the stone lands; the stone above the branch wire
+    // cuts its UP connections; the terminator beside the top wire
+    // recomputes that wire's line shape.
     let commands: Vec<String> = [
         "tick freeze",
         "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
@@ -845,7 +929,10 @@ pub fn parity_redstone() -> Result<bool> {
     .map(|s| s.to_string())
     .collect();
 
-    // 1. Vanilla.
+    // 1. Clean join blobs + pristine world (no commands run yet).
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+
+    // 2. Vanilla reference: the scripted run on a fresh boot.
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v = bot::login_capture(
         "127.0.0.1",
@@ -855,16 +942,16 @@ pub fn parity_redstone() -> Result<bool> {
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(6)),
             max_packets: Some(600),
-            dump_dir: Some(&blobs_dir),
+            dump_dir: None,
             commands: &commands,
             walk_chunks: None,
         },
     )
     .context("capturing vanilla redstone")?;
     drop(server);
-    capture::write_manifest(&v, &blobs_dir)?;
 
-    // 2. Doppel.
+    // 3. Doppel against the clean blobs + pristine world: its own engine
+    // now executes every command for real.
     let bin = default_doppel_bin()?;
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
@@ -872,7 +959,7 @@ pub fn parity_redstone() -> Result<bool> {
         .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
-        .env("DOPPEL_WORLD", &world_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -884,8 +971,8 @@ pub fn parity_redstone() -> Result<bool> {
         protocol,
         &login,
         &bot::CaptureOpts {
-            idle_timeout: Some(Duration::from_secs(6)),
-            max_packets: Some(600),
+            idle_timeout: Some(Duration::from_secs(10)),
+            max_packets: Some(1200),
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
@@ -895,10 +982,9 @@ pub fn parity_redstone() -> Result<bool> {
     let _ = child.kill();
     let _ = child.wait();
 
-    // 3. Diff every 0x56/0x08 (ignoring the placement setblocks themselves
-    //    — the LAST placement (lever on) plus tick-stepped changes must
-    //    match; initial placements compare too but connection props may
-    //    differ on the first divergence, which is the data we want).
+    // 4. Final per-position states: apply each stream's updates in order,
+    //    last write wins. Under /tick freeze raw packet ordering is not
+    //    reliably observable; final states are the semantic claim.
     let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
     let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
     let v_updates: Vec<_> = vr
@@ -916,72 +1002,22 @@ pub fn parity_redstone() -> Result<bool> {
         v_updates.len(),
         d_updates.len()
     );
+    // Transcripts can end early (idle timeout, packet cap): a truncated
+    // doppel stream would silently pass half a circuit. Surface the ends.
+    for (who, all) in [("vanilla", &v), ("doppel", &d)] {
+        if let Some(p) = all.iter().rev().find(|p| p.id < 0) {
+            println!(
+                "[oracle] {who} transcript note: {}",
+                p.note.clone().unwrap_or_default()
+            );
+        }
+    }
 
-    // Compare FINAL per-position states (apply each stream's updates in
-    // order, last write wins) rather than raw packet sequences: under
-    // tick freeze vanilla's in-window packet count is thin and ordering
-    // is not reliably observable. Final states are the semantic claim.
     let apply =
         |pkts: &[&bot::CapturedPacket]| -> std::collections::BTreeMap<(i32, i32, i32), u32> {
             let mut map = std::collections::BTreeMap::new();
-            for p in pkts {
-                let raw = hex::decode(&p.head_hex).unwrap_or_default();
-                if p.id == 0x08 && raw.len() >= 9 {
-                    let pos = raw[0..8].try_into().unwrap();
-                    let packed = i64::from_be_bytes(pos);
-                    let x = ((packed >> 38) & 0x3ff_ffff) as i32;
-                    let z = ((packed >> 12) & 0x3ff_ffff) as i32;
-                    let y = (packed & 0xfff) as i32;
-                    // sign-extend 26-bit
-                    let x = ((x as i64) << 38 >> 38) as i32;
-                    let z = (z << 6) >> 6;
-                    let mut o = 8usize;
-                    let mut st = 0u32;
-                    let mut sh = 0u32;
-                    while o < raw.len() {
-                        let b = raw[o];
-                        o += 1;
-                        st |= u32::from(b & 0x7f) << sh;
-                        sh += 7;
-                        if b & 0x80 == 0 {
-                            break;
-                        }
-                    }
-                    map.insert((x, y, z), st);
-                } else if p.id == 0x56 && raw.len() >= 8 {
-                    // section updates: entries carry localPos:state
-                    let sec = i64::from_be_bytes(raw[0..8].try_into().unwrap());
-                    let sx = ((sec >> 42) & 0x3f_ffff) as i32;
-                    let sz = ((sec >> 20) & 0x3f_ffff) as i32;
-                    let sy = (sec & 0xf_ffff) as i32;
-                    let sx = (sx << 10) >> 10;
-                    let sz = (sz << 10) >> 10;
-                    let mut o = 8usize;
-                    let rd = |o: &mut usize| -> u64 {
-                        let mut v: u64 = 0;
-                        let mut sh = 0u32;
-                        while *o < raw.len() {
-                            let b = raw[*o];
-                            *o += 1;
-                            v |= u64::from(b & 0x7f) << sh;
-                            sh += 7;
-                            if b & 0x80 == 0 {
-                                break;
-                            }
-                        }
-                        v
-                    };
-                    let count = rd(&mut o);
-                    for _ in 0..count {
-                        let e = rd(&mut o);
-                        let local = (e & 0xfff) as i32;
-                        let st = (e >> 12) as u32;
-                        let lx = (local >> 8) & 0xf;
-                        let lz = (local >> 4) & 0xf;
-                        let ly = local & 0xf;
-                        map.insert((sx * 16 + lx, sy * 16 + ly, sz * 16 + lz), st);
-                    }
-                }
+            for (pos, st) in decode_update_writes(pkts) {
+                map.insert(pos, st);
             }
             map
         };
@@ -998,33 +1034,25 @@ pub fn parity_redstone() -> Result<bool> {
             Some(ds) if ds == st => {}
             Some(ds) => {
                 failures.push(format!("pos {:?}: vanilla {st} != doppel {ds}", pos));
-                // History: every vanilla/doppel update packet mentioning
-                // the lever's coordinate bytes, in order.
-                let _hist = |pkts: &[&bot::CapturedPacket]| -> Vec<String> {
-                    let mut out = Vec::new();
-                    for (i, p) in pkts.iter().enumerate() {
-                        let raw = hex::decode(&p.head_hex).unwrap_or_default();
-                        if raw.len() < 8 {
-                            continue;
-                        }
-                        if raw
-                            .windows(2)
-                            .any(|w| w == [(st >> 8) as u8, (st & 0xff) as u8])
-                        {
-                            out.push(format!(
-                                "#{i} id=0x{:02x} len={} {}",
-                                p.id,
-                                p.body_len,
-                                &p.head_hex[..p.head_hex.len().min(48)]
-                            ));
-                        }
-                    }
-                    out
+                // History: every update write touching this position, in
+                // stream order, for both servers.
+                let hist = |writes: &[((i32, i32, i32), u32)]| -> String {
+                    writes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (p, _))| p == pos)
+                        .map(|(i, (_, s))| format!("#{i}:{s}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 };
+                let v_writes = decode_update_writes(&v_updates);
+                let d_writes = decode_update_writes(&d_updates);
+                println!("  vanilla history: {}", hist(&v_writes));
+                println!("  doppel history: {}", hist(&d_writes));
                 let listing = |pkts: &[&bot::CapturedPacket]| -> String {
                     pkts.iter()
                         .enumerate()
-                        .map(|(i, p)| format!("#{i}:0x{:02x}/{}", p.id, p.body_len))
+                        .map(|(i, p)| format!("#{i}:0x{:02x}/{}@{}ms", p.id, p.body_len, p.t_ms))
                         .collect::<Vec<_>>()
                         .join(" ")
                 };

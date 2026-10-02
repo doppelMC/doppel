@@ -13,7 +13,7 @@ use std::time::Duration;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 
-fn vanilla_dir() -> Result<PathBuf> {
+pub fn vanilla_dir() -> Result<PathBuf> {
     Ok(find_repo_root()?.join("target").join("vanilla"))
 }
 

@@ -1756,6 +1756,11 @@ impl Game {
     pub(crate) fn registry_for_test(&self) -> bool {
         self.registry.is_some()
     }
+
+    #[cfg(test)]
+    pub(crate) fn registry_snapshot_for_test(&self) -> doppel_world::registry::BlockRegistry {
+        self.registry.clone().expect("registry loaded")
+    }
 }
 
 /// Reads the facing= direction from a props string (default north).

@@ -411,3 +411,426 @@ fn circuit_trace() {
         "lever should end ON (vanilla parity), got {lever:?}"
     );
 }
+
+#[test]
+fn lever_state_ids() {
+    let (_tx, _rx) = std::sync::mpsc::channel::<Inbound>();
+    let g = Game::new(_rx, None, None);
+    assert!(g.registry_for_test(), "pins/blocks.json not found");
+    let reg = g.registry_snapshot_for_test();
+    assert_eq!(
+        reg.state_of(8439).map(|(n, _)| n.to_string()),
+        Some("minecraft:lever".to_string())
+    );
+    let (n, p) = doppel_world::registry::BlockRegistry::split_state(
+        "minecraft:lever[face=floor,facing=north,powered=true]",
+    );
+    assert_eq!(reg.state_id(n, p), Some(8439));
+    let (n, p) = doppel_world::registry::BlockRegistry::split_state(
+        "minecraft:lever[face=floor,facing=north,powered=false]",
+    );
+    assert_eq!(reg.state_id(n, p), Some(8440));
+}
+
+/// Simulates the SERVE path exactly: the real `run()` loop on its own
+/// thread, Inbound events fed through the real mpsc channel in a tight
+/// burst (like the connection reader forwarding 47 rapid command
+/// packets), viewer wired for broadcasts. Decodes the captured stream
+/// with the oracle's apply() logic. Reproduces the CI-side conditions
+/// that produced "7 update packets, lever ends 8440".
+#[test]
+fn serve_loop_burst_sim() {
+    let script: Vec<&str> = vec![
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+        "tick step 1",
+        "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 12 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 13 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 14 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 15 100 10 minecraft:redstone_torch",
+        "tick step 1",
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 16 100 10 minecraft:repeater[facing=west,delay=1]",
+        "tick step 1",
+        "setblock 17 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 18 100 10 minecraft:comparator[facing=west,mode=compare,powered=false]",
+        "tick step 1",
+        "setblock 10 100 12 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 11 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 12 100 12 minecraft:comparator[facing=west,mode=compare,powered=false]",
+        "tick step 1",
+        "setblock 13 100 12 minecraft:comparator[facing=west,mode=subtract,powered=false]",
+        "tick step 1",
+        "setblock 13 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 14 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 16 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 17 100 13 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 20 100 10 minecraft:observer[facing=east]",
+        "tick step 1",
+        "setblock 21 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:stone",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:oak_planks",
+        "tick step 1",
+        "setblock 12 100 11 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 12 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 13 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 14 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 101 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 100 12 minecraft:stone",
+        "tick step 1",
+        "setblock 13 101 12 minecraft:stone",
+        "tick step 1",
+        "setblock 16 101 12 minecraft:stone",
+        "tick step 10",
+    ];
+    let (tx, rx) = std::sync::mpsc::channel::<Inbound>();
+    let mut g = Game::new(rx, None, None);
+    assert!(g.registry_for_test(), "pins/blocks.json not found");
+    let wire = |x: i32| {
+        let mut w = WireChunk {
+            x,
+            z: 0,
+            heightmaps: Vec::new(),
+            sections: Vec::new(),
+            block_entities: Vec::new(),
+            light: Default::default(),
+        };
+        for _ in 0..24 {
+            w.sections.push(doppel_world::chunk_codec::WireSection {
+                non_empty: 0,
+                fluid: 0,
+                block_states: doppel_world::chunk_codec::Container::Single(0),
+                biomes: doppel_world::chunk_codec::Container::Single(0),
+            });
+        }
+        w
+    };
+    for cx in [-1, 0, 1, 2] {
+        g.seed_chunk_for_test(cx, 0, wire(cx));
+    }
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Outbound>();
+    g.join_viewer_for_test(0, &[(-1, 0), (0, 0), (1, 0), (2, 0)], tx_out);
+    // The real serve loop on a real thread.
+    let runner = std::thread::spawn(move || g.run());
+    // The burst: all events queued back-to-back, like the reader thread
+    // forwarding a rapid command volley.
+    for c in &script {
+        let parts: Vec<&str> = c.split_whitespace().collect();
+        if parts[0] == "tick" {
+            tx.send(Inbound::TickStep {
+                conn: 0,
+                steps: parts[2].parse().unwrap(),
+            })
+            .unwrap();
+        } else {
+            tx.send(Inbound::Setblock {
+                conn: 0,
+                x: parts[1].parse().unwrap(),
+                y: parts[2].parse().unwrap(),
+                z: parts[3].parse().unwrap(),
+                name: parts[4].to_string(),
+            })
+            .unwrap();
+        }
+    }
+    drop(tx); // reader gone -> Disconnected -> run() exits after draining
+    runner.join().unwrap();
+    // Decode everything the viewer received, oracle apply() style.
+    let mut writes: Vec<((i32, i32, i32), u32)> = Vec::new();
+    let mut update_pkts = 0usize;
+    for frame in rx_out.try_iter() {
+        let Outbound::Frame { id, body } = frame else {
+            continue;
+        };
+        if id == 0x08 && body.len() >= 9 {
+            update_pkts += 1;
+            let packed = i64::from_be_bytes(body[0..8].try_into().unwrap());
+            let x = ((packed >> 38) & 0x3ff_ffff) << 38 >> 38;
+            let z = ((packed >> 12) & 0x3ff_ffff) << 38 >> 38;
+            let y = (packed & 0xfff) as i32;
+            let mut st = 0u32;
+            let mut sh = 0u32;
+            let mut o = 8usize;
+            while o < body.len() {
+                let b = body[o];
+                o += 1;
+                st |= u32::from(b & 0x7f) << sh;
+                sh += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            writes.push(((x as i32, y, z as i32), st));
+        } else if id == 0x56 && body.len() >= 8 {
+            update_pkts += 1;
+            let sec = i64::from_be_bytes(body[0..8].try_into().unwrap());
+            let sx = (sec >> 42) & 0x3f_ffff;
+            let sz = (sec >> 20) & 0x3f_ffff;
+            let sy = sec & 0xf_ffff;
+            let sx = (sx << 10) >> 10;
+            let sz = (sz << 10) >> 10;
+            let mut o = 8usize;
+            let rd = |body: &[u8], o: &mut usize| -> u64 {
+                let mut v: u64 = 0;
+                let mut sh = 0u32;
+                while *o < body.len() {
+                    let b = body[*o];
+                    *o += 1;
+                    v |= u64::from(b & 0x7f) << sh;
+                    sh += 7;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+                v
+            };
+            let count = rd(&body, &mut o);
+            for _ in 0..count {
+                let e = rd(&body, &mut o);
+                let local = (e & 0xfff) as i32;
+                let st = (e >> 12) as u32;
+                let lx = (local >> 8) & 0xf;
+                let lz = (local >> 4) & 0xf;
+                let ly = local & 0xf;
+                writes.push((
+                    (
+                        (sx * 16 + lx as i64) as i32,
+                        (sy * 16 + ly as i64) as i32,
+                        (sz * 16 + lz as i64) as i32,
+                    ),
+                    st,
+                ));
+            }
+        }
+    }
+    let mut map = std::collections::BTreeMap::new();
+    for (pos, st) in &writes {
+        map.insert(*pos, *st);
+    }
+    eprintln!(
+        "[sim] update packets: {}, writes: {}",
+        update_pkts,
+        writes.len()
+    );
+    for (i, (pos, st)) in writes.iter().enumerate() {
+        if *pos == (10, 100, 10) {
+            eprintln!("[sim] lever write #{}: {}", i, st);
+        }
+    }
+    eprintln!("[sim] final lever map state: {:?}", map.get(&(10, 100, 10)));
+    assert_eq!(
+        map.get(&(10, 100, 10)),
+        Some(&8439u32),
+        "serve-loop burst must end with the lever ON (8439)"
+    );
+}
+
+/// Replays the EXACT parity-redstone CI script through a real Game with a
+/// registered viewer, captures the outbound packet stream, and decodes
+/// every 0x08/0x56 exactly like the oracle's apply() (final map, last
+/// write wins). Prints every write touching the lever at (10,100,10) so
+/// the phantom-OFF broadcast (if any) is visible locally.
+#[test]
+fn broadcast_stream_trace() {
+    let (mut g, rx) = harness();
+    let script: Vec<&str> = vec![
+        "tick freeze",
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+        "tick step 1",
+        "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 12 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 13 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 14 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 15 100 10 minecraft:redstone_torch",
+        "tick step 1",
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 16 100 10 minecraft:repeater[facing=west,delay=1]",
+        "tick step 1",
+        "setblock 17 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 18 100 10 minecraft:comparator[facing=west,mode=compare,powered=false]",
+        "tick step 1",
+        "setblock 10 100 12 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 11 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 12 100 12 minecraft:comparator[facing=west,mode=compare,powered=false]",
+        "tick step 1",
+        "setblock 13 100 12 minecraft:comparator[facing=west,mode=subtract,powered=false]",
+        "tick step 1",
+        "setblock 13 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 14 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 16 100 13 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 17 100 13 minecraft:lever[face=floor,facing=north,powered=true]",
+        "tick step 1",
+        "setblock 20 100 10 minecraft:observer[facing=east]",
+        "tick step 1",
+        "setblock 21 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:stone",
+        "tick step 1",
+        "setblock 19 100 10 minecraft:oak_planks",
+        "tick step 1",
+        "setblock 12 100 11 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 12 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 13 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 14 100 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 101 12 minecraft:redstone_wire",
+        "tick step 1",
+        "setblock 15 100 12 minecraft:stone",
+        "tick step 1",
+        "setblock 13 101 12 minecraft:stone",
+        "tick step 1",
+        "setblock 16 101 12 minecraft:stone",
+        "tick step 10",
+    ];
+    // (pos, state) writes in stream order, mirroring the oracle decode.
+    let mut writes: Vec<((i32, i32, i32), u32)> = Vec::new();
+    let mut pkts = 0usize;
+    let drain = |rx: &std::sync::mpsc::Receiver<Outbound>,
+                 writes: &mut Vec<((i32, i32, i32), u32)>,
+                 pkts: &mut usize| {
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, body } = frame else {
+                continue;
+            };
+            *pkts += 1;
+            if id == 0x08 && body.len() >= 9 {
+                let packed = i64::from_be_bytes(body[0..8].try_into().unwrap());
+                let x = ((packed >> 38) & 0x3ff_ffff) << 38 >> 38;
+                let z = ((packed >> 12) & 0x3ff_ffff) << 38 >> 38;
+                let y = (packed & 0xfff) as i32;
+                let mut st = 0u32;
+                let mut sh = 0u32;
+                let mut o = 8usize;
+                while o < body.len() {
+                    let b = body[o];
+                    o += 1;
+                    st |= u32::from(b & 0x7f) << sh;
+                    sh += 7;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+                writes.push(((x as i32, y, z as i32), st));
+            } else if id == 0x56 && body.len() >= 8 {
+                let sec = i64::from_be_bytes(body[0..8].try_into().unwrap());
+                let sx = (sec >> 42) & 0x3f_ffff;
+                let sz = (sec >> 20) & 0x3f_ffff;
+                let sy = sec & 0xf_ffff;
+                let sx = (sx << 10) >> 10;
+                let sz = (sz << 10) >> 10;
+                let mut o = 8usize;
+                let rd = |body: &[u8], o: &mut usize| -> u64 {
+                    let mut v: u64 = 0;
+                    let mut sh = 0u32;
+                    while *o < body.len() {
+                        let b = body[*o];
+                        *o += 1;
+                        v |= u64::from(b & 0x7f) << sh;
+                        sh += 7;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                    }
+                    v
+                };
+                let count = rd(&body, &mut o);
+                for _ in 0..count {
+                    let e = rd(&body, &mut o);
+                    let local = (e & 0xfff) as i32;
+                    let st = (e >> 12) as u32;
+                    let lx = (local >> 8) & 0xf;
+                    let lz = (local >> 4) & 0xf;
+                    let ly = local & 0xf;
+                    writes.push((
+                        (
+                            (sx * 16 + lx as i64) as i32,
+                            (sy * 16 + ly as i64) as i32,
+                            (sz * 16 + lz as i64) as i32,
+                        ),
+                        st,
+                    ));
+                }
+            }
+        }
+    };
+    for (i, c) in script.iter().enumerate() {
+        if *c == "tick freeze" {
+            continue; // the serve path ignores it too (unhandled command)
+        }
+        let before = writes.len();
+        cmd(&mut g, c);
+        // tick step N runs its ticks inside handle(); a setblock's updates
+        // are flushed by the NEXT tick — run one to mirror the serve loop.
+        if !c.starts_with("tick") {
+            g.tick_once_for_test();
+        }
+        drain(&rx, &mut writes, &mut pkts);
+        for (pos, st) in &writes[before..] {
+            if *pos == (10, 100, 10) {
+                eprintln!("[stream] after cmd #{} `{}`: lever -> {}", i, c, st);
+            }
+        }
+    }
+    // Flush anything left by the final tick step 10.
+    g.tick_once_for_test();
+    drain(&rx, &mut writes, &mut pkts);
+    let mut map = std::collections::BTreeMap::new();
+    for (pos, st) in &writes {
+        map.insert(*pos, *st);
+    }
+    eprintln!(
+        "[stream] total update packets: {}, writes: {}",
+        pkts,
+        writes.len()
+    );
+    eprintln!(
+        "[stream] final lever map state: {:?}",
+        map.get(&(10, 100, 10))
+    );
+    eprintln!(
+        "[stream] engine get_state_id: {:?}",
+        g.block_label_for_test(10, 100, 10)
+    );
+    assert_eq!(
+        map.get(&(10, 100, 10)),
+        Some(&8439u32),
+        "broadcast stream must end with the lever ON (8439)"
+    );
+}
