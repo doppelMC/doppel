@@ -1261,6 +1261,8 @@ pub fn parity_placement() -> Result<bool> {
         vw.len(),
         dw.len()
     );
+    println!("  vanilla writes: {vw:?}");
+    println!("  doppel writes: {dw:?}");
     let mut failures = Vec::new();
     for (i, (a, b)) in vw.iter().zip(dw.iter()).enumerate() {
         if a != b {
@@ -1273,8 +1275,6 @@ pub fn parity_placement() -> Result<bool> {
             vw.len(),
             dw.len()
         ));
-        println!("  vanilla writes: {vw:?}");
-        println!("  doppel writes: {dw:?}");
     }
     if !vw.iter().any(|(p, _)| *p == (10, 100, 10)) {
         failures.push("the placed block at (10,100,10) is missing".to_string());

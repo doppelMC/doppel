@@ -710,7 +710,22 @@ mod tests {
     // -- placement -----------------------------------------------------
 
     #[test]
-    fn places_on_every_face() {
+    #[test]
+    fn tp_then_place_repro() {
+        let (mut g, rx) = harness();
+        g.handle(crate::game::Inbound::Tp {
+            conn: 0,
+            x: 10.0,
+            y: 101.0,
+            z: 12.0,
+        });
+        give(&mut g, "minecraft:stone", 64);
+        use_on(&mut g, 10, 99, 10, DIR_UP, 0);
+        assert_eq!(at(&g, 10, 100, 10), "minecraft:stone[]");
+        let _ = rx;
+    }
+
+        fn places_on_every_face() {
         let (mut g, rx) = harness();
         give(&mut g, "minecraft:stone", 64);
         // Top of the floor: target is the circuit plane y=100.
