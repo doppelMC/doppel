@@ -116,6 +116,8 @@ pub struct Game {
     dirty: std::collections::BTreeMap<(i32, i32, i32), Vec<(u64, u32)>>,
     /// Block-state registry (name+props -> id), loaded from pins/blocks.json.
     registry: Option<doppel_world::registry::BlockRegistry>,
+    /// Dedup guard for dropped-world-write warnings: (cx, cz, reason).
+    warned_writes: std::collections::BTreeSet<(i32, i32, String)>,
     /// Flat-world generator: the fallback for chunks the Anvil store does
     /// not have, built from the same registry pins.
     flat: Option<doppel_world::worldgen::FlatGenerator>,
@@ -223,6 +225,7 @@ impl Game {
             world,
             blobs,
             dirty: std::collections::BTreeMap::new(),
+            warned_writes: std::collections::BTreeSet::new(),
             registry: doppel_protocol::find_repo_root().ok().and_then(|r| {
                 let p = r.join("pins").join("blocks.json");
                 p.exists()
@@ -536,15 +539,24 @@ impl Game {
     }
 
     /// Raw state id at world coords (no registry lookup).
+    ///
+    /// Section storage follows vanilla's YZX layout (`y<<8 | z<<4 | x`);
+    /// the section-update wire localPos is XZY (`x<<8 | z<<4 | y`) — two
+    /// different conventions, both pinned against vanilla bytes.
     fn get_state_id(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
         let sec_index = (y.div_euclid(16) + 4) as usize;
-        let idx = (((x.rem_euclid(16) as u64) << 8)
-            | ((z.rem_euclid(16) as u64) << 4)
-            | y.rem_euclid(16) as u64) as usize;
+        let idx = local_yzx(x, y, z);
         let chunk = self.chunks.get(&(cx, cz))?;
         get_section_cell(&chunk.wire, sec_index, idx)
+    }
+
+    /// Logs a dropped world write, once per (chunk, reason).
+    fn warn_dropped_write(&mut self, cx: i32, cz: i32, reason: &str) {
+        if self.warned_writes.insert((cx, cz, reason.to_string())) {
+            eprintln!("[game] setblock dropped at chunk ({cx},{cz}): {reason}");
+        }
     }
 
     /// Writes a block state, marking dirty + scheduling neighbor updates.
@@ -554,29 +566,34 @@ impl Game {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
         let sec_index = (y.div_euclid(16) + 4) as usize;
-        let idx = (((x.rem_euclid(16) as u64) << 8)
-            | ((z.rem_euclid(16) as u64) << 4)
-            | y.rem_euclid(16) as u64) as usize;
+        let idx = local_yzx(x, y, z);
         if self.get_state_id(x, y, z) == Some(state) {
             return;
         }
         if !self.chunks.contains_key(&(cx, cz)) {
             let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+                self.warn_dropped_write(cx, cz, "no world or blobs configured");
                 return;
             };
-            if self.load_chunk(&world, &blobs, cx, cz).is_err() {
+            if let Err(e) = self.load_chunk(&world, &blobs, cx, cz) {
+                self.warn_dropped_write(cx, cz, &format!("chunk load failed: {e:#}"));
                 return;
             }
         }
         let chunk = self.chunks.get_mut(&(cx, cz)).expect("loaded");
         if !set_section_cell(&mut chunk.wire, sec_index, idx, state) {
+            self.warn_dropped_write(
+                cx,
+                cz,
+                &format!("section write rejected (section {sec_index} missing or palette >8 bits)"),
+            );
             return;
         }
         chunk.version += 1;
         self.dirty
             .entry((cx, cz, y.div_euclid(16)))
             .or_default()
-            .push((idx as u64, state));
+            .push((local_xzy(x, y, z), state));
         if notify {
             for (dx, dy, dz) in NEIGHBORS {
                 self.scheduled.push((
@@ -1761,6 +1778,20 @@ impl Game {
     pub(crate) fn registry_snapshot_for_test(&self) -> doppel_world::registry::BlockRegistry {
         self.registry.clone().expect("registry loaded")
     }
+}
+
+/// Section-storage cell index, vanilla's YZX layout (`y<<8 | z<<4 | x`):
+/// the order chunk sections pack their paletted longs on the wire and in
+/// Anvil.
+fn local_yzx(x: i32, y: i32, z: i32) -> usize {
+    (((y.rem_euclid(16) as u64) << 8) | ((z.rem_euclid(16) as u64) << 4) | x.rem_euclid(16) as u64)
+        as usize
+}
+
+/// Section-update wire localPos, XZY layout (`x<<8 | z<<4 | y`): the
+/// packed position inside section_blocks_update (0x56) entries.
+fn local_xzy(x: i32, y: i32, z: i32) -> u64 {
+    ((x.rem_euclid(16) as u64) << 8) | ((z.rem_euclid(16) as u64) << 4) | y.rem_euclid(16) as u64
 }
 
 /// Reads the facing= direction from a props string (default north).

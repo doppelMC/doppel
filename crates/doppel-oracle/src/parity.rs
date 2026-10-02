@@ -603,6 +603,19 @@ fn capture_clean_blobs(
     use crate::capture;
 
     let server = vanilla::boot(pin, jar, VANILLA_PORT)?;
+    // Snapshot the untouched world right after boot: the boot-time
+    // spawn-area save settles well within a second, and this phase runs
+    // no commands, so the world stays pristine regardless of how the JVM
+    // is later torn down.
+    std::thread::sleep(Duration::from_secs(2));
+    if pristine_world.exists() {
+        std::fs::remove_dir_all(pristine_world)?;
+    }
+    let world = crate::vanilla::vanilla_dir()?.join("run").join("world");
+    anyhow::ensure!(world.is_dir(), "vanilla world dir missing after boot");
+    copy_dir(&world, pristine_world)?;
+    // A stale lock file means nothing to a reader.
+    let _ = std::fs::remove_file(pristine_world.join("session.lock"));
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
@@ -622,15 +635,6 @@ fn capture_clean_blobs(
     drop(server);
     let entries = capture::write_manifest(&v, blobs_dir)?;
     anyhow::ensure!(entries > 0, "no blobs captured from vanilla");
-    // Snapshot the untouched world before any scripted run dirties it.
-    if pristine_world.exists() {
-        std::fs::remove_dir_all(pristine_world)?;
-    }
-    let world = crate::vanilla::vanilla_dir()?.join("run").join("world");
-    anyhow::ensure!(world.is_dir(), "vanilla world dir missing after boot");
-    copy_dir(&world, pristine_world)?;
-    // The JVM was killed; a stale lock file means nothing to a reader.
-    let _ = std::fs::remove_file(pristine_world.join("session.lock"));
     println!(
         "[oracle] clean join blobs ({} packets) + pristine world snapshot at {}",
         v.iter().filter(|p| p.id >= 0).count(),
@@ -787,35 +791,55 @@ pub fn parity_blocks() -> Result<bool> {
     let _ = child.kill();
     let _ = child.wait();
 
-    // 4. Compare the engine-made broadcasts: same writes, same batching.
+    // 4. Compare the engine-made broadcasts: one entry-set per update
+    //    packet, in packet order. Within a batch packet the reference
+    //    emits entries in hash-iteration order (not a contract), but the
+    //    packet boundaries themselves carry the batching semantics.
+    type EntrySet = Vec<((i32, i32, i32), u32)>;
     let vr: Vec<_> = v.iter().filter(|p| p.id >= 0).collect();
     let dr: Vec<_> = d.iter().filter(|p| p.id >= 0).collect();
-    let v_writes = decode_update_writes(&vr);
-    let d_writes = decode_update_writes(&dr);
+    let packets_of = |pkts: &[&bot::CapturedPacket]| -> Vec<EntrySet> {
+        pkts.iter()
+            .filter(|p| p.id == 0x56 || p.id == 0x08)
+            .map(|p| {
+                let mut entries = decode_update_writes(&[*p]);
+                entries.sort();
+                entries
+            })
+            .collect()
+    };
+    let vp = packets_of(&vr);
+    let dp = packets_of(&dr);
     println!(
-        "[oracle] block writes: vanilla {} doppel {}",
-        v_writes.len(),
-        d_writes.len()
+        "[oracle] block update packets: vanilla {} doppel {}",
+        vp.len(),
+        dp.len()
     );
     let mut failures = Vec::new();
-    for (i, (a, b)) in v_writes.iter().zip(d_writes.iter()).enumerate() {
+    for (i, (a, b)) in vp.iter().zip(dp.iter()).enumerate() {
         if a != b {
-            failures.push(format!("write {i}: vanilla {a:?} != doppel {b:?}"));
+            failures.push(format!(
+                "packet {i}: vanilla {} entries vs doppel {} entries",
+                a.len(),
+                b.len()
+            ));
+            println!("  vanilla packet {i}: {a:?}");
+            println!("  doppel  packet {i}: {b:?}");
         }
     }
-    if v_writes.len() != d_writes.len() {
+    if vp.len() != dp.len() {
         failures.push(format!(
-            "count: vanilla {} vs doppel {}",
-            v_writes.len(),
-            d_writes.len()
+            "packet count: vanilla {} vs doppel {}",
+            vp.len(),
+            dp.len()
         ));
         println!(
-            "  vanilla writes: {:?}",
-            v_writes.iter().take(12).collect::<Vec<_>>()
+            "  vanilla packets: {:?}",
+            vp.iter().map(Vec::as_slice).collect::<Vec<_>>()
         );
         println!(
-            "  doppel writes: {:?}",
-            d_writes.iter().take(12).collect::<Vec<_>>()
+            "  doppel packets: {:?}",
+            dp.iter().map(Vec::as_slice).collect::<Vec<_>>()
         );
     }
     let v_ok = vr.iter().filter(|p| p.id == 0x7c).count();
