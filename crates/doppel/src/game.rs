@@ -93,6 +93,16 @@ pub enum Inbound {
         conn: ConnId,
         click: crate::inventory::ContainerClick,
     },
+    /// `gamemode <mode>`: flips the commanding player's creative flag.
+    GameMode {
+        conn: ConnId,
+        creative: bool,
+    },
+    /// set_creative_mode_slot: a creative client pushing its picked stack.
+    CreativeSlot {
+        conn: ConnId,
+        set: crate::inventory::CreativeSlotSet,
+    },
     /// `give @s <item> [count]` — the harness driver for inventory tests.
     Give {
         conn: ConnId,
@@ -522,6 +532,15 @@ impl Game {
             // --- inventory hooks (inventory.rs) ---
             Inbound::SetCarriedItem { conn, slot } => self.select_hotbar_slot(conn, slot),
             Inbound::ContainerClick { conn, click } => self.container_clicked(conn, &click),
+            Inbound::GameMode { conn, creative } => {
+                if let Some(p) = self.players.get_mut(&conn) {
+                    p.inv.creative = creative;
+                }
+                self.send_command_feedback(conn);
+            }
+            Inbound::CreativeSlot { conn, set } => {
+                self.creative_slot(conn, set);
+            }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
                 self.send_command_feedback(conn);
@@ -770,6 +789,29 @@ impl Game {
     fn send_command_feedback(&mut self, conn: ConnId) {
         let body = [0x00u8, 0x00];
         self.send(conn, 0x7c, &body);
+    }
+
+    /// Applies a creative slot push. Vanilla only records these in
+    /// creative mode and never echoes a set_slot back: the client's own
+    /// prediction stands.
+    fn creative_slot(&mut self, conn: ConnId, set: crate::inventory::CreativeSlotSet) {
+        let Some(p) = self.players.get(&conn) else {
+            return;
+        };
+        if !p.inv.creative {
+            return;
+        }
+        if set.slot < 0 {
+            return;
+        }
+        let slot = set.slot as usize;
+        if slot >= 46 {
+            return;
+        }
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        crate::inventory::menu_slot_set(&mut p.inv.inventory, slot, set.stack);
     }
 
     /// Logs a dropped world write, once per (chunk, reason).

@@ -377,6 +377,25 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     _ => {}
                 }
             }
+            // `gamemode <mode>` for the commanding player flips the
+            // creative flag the inventory and placement paths read.
+            if parts.len() == 2 && parts[0] == "gamemode" {
+                match parts[1] {
+                    "creative" => {
+                        return Some(game::Inbound::GameMode {
+                            conn,
+                            creative: true,
+                        });
+                    }
+                    "survival" | "adventure" | "spectator" => {
+                        return Some(game::Inbound::GameMode {
+                            conn,
+                            creative: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
             // `give @s <item> [count]`: the inventory test driver. The
             // item name resolves (or fails) game-side against the learned
             // id table, like setblock.
@@ -401,6 +420,13 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         0x36 => {
             let slot = inventory::parse_set_carried_item(body).ok()?;
             Some(game::Inbound::SetCarriedItem { conn, slot })
+        }
+        // set_creative_mode_slot: creative clients push their picked
+        // stacks. 26.3 id derived from the 26.2 registration order
+        // shift; wire-verify against a capture.
+        0x39 => {
+            let set = inventory::parse_set_creative_slot(body).ok()?;
+            Some(game::Inbound::CreativeSlot { conn, set })
         }
         // container_click: clicks against an open menu (HashedStack
         // predictions decoded but not applied — see inventory.rs).

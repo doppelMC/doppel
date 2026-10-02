@@ -613,7 +613,7 @@ fn menu_slot_get(inv: &PlayerInventory, menu_slot: usize) -> Option<ItemStack> {
 }
 
 /// Writes a menu slot (no-op for the crafting view).
-fn menu_slot_set(inv: &mut PlayerInventory, menu_slot: usize, stack: Option<ItemStack>) {
+pub(crate) fn menu_slot_set(inv: &mut PlayerInventory, menu_slot: usize, stack: Option<ItemStack>) {
     if let Some(c) = menu_to_container(menu_slot) {
         inv.set(c, stack);
     }
@@ -695,6 +695,23 @@ pub fn parse_container_click(body: &[u8]) -> Result<ContainerClick> {
 }
 
 /// Parses a serverbound set_carried_item body: one i16 hotbar slot.
+/// One set_creative_mode_slot push: the menu slot and the stack (None
+/// slot means the client dropped the picked stack outside).
+pub struct CreativeSlotSet {
+    pub slot: i16,
+    pub stack: Option<ItemStack>,
+}
+
+pub fn parse_set_creative_slot(body: &[u8]) -> Result<CreativeSlotSet> {
+    let mut r = Reader::new(body);
+    let slot = read_i16(&mut r)?;
+    let stack = decode_item_stack(&mut r)?;
+    if r.remaining() != 0 {
+        bail!("trailing bytes in set_creative_mode_slot");
+    }
+    Ok(CreativeSlotSet { slot, stack })
+}
+
 pub fn parse_set_carried_item(body: &[u8]) -> Result<i16> {
     let mut r = Reader::new(body);
     let slot = read_i16(&mut r)?;
@@ -1411,6 +1428,14 @@ impl Game {
     }
 
     /// Flips the infinite-materials flag (`hasInfiniteMaterials`).
+    #[cfg(test)]
+    pub(crate) fn player_inv_state_for_test(
+        &self,
+        conn: ConnId,
+    ) -> Option<&crate::inventory::PlayerInvState> {
+        self.players.get(&conn).map(|p| &p.inv)
+    }
+
     pub(crate) fn set_creative_for_test(&mut self, conn: ConnId, creative: bool) {
         if let Some(p) = self.players.get_mut(&conn) {
             p.inv.creative = creative;
@@ -1699,6 +1724,48 @@ mod tests {
             }
         }
         last.expect("no set_content frame queued")
+    }
+
+    #[test]
+    fn gamemode_gates_creative_slot() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            creative: false,
+        });
+        while rx.try_recv().is_ok() {}
+        g.handle(Inbound::CreativeSlot {
+            conn: 0,
+            set: CreativeSlotSet {
+                slot: 36,
+                stack: decode_item_stack(&mut Reader::new(&[1, 1, 0, 0])).unwrap(),
+            },
+        });
+        let got = g
+            .player_inv_state_for_test(0)
+            .expect("player")
+            .inventory
+            .get(0);
+        assert!(got.is_none(), "survival ignores creative pushes");
+
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            creative: true,
+        });
+        g.handle(Inbound::CreativeSlot {
+            conn: 0,
+            set: CreativeSlotSet {
+                slot: 36,
+                stack: decode_item_stack(&mut Reader::new(&[1, 1, 0, 0])).unwrap(),
+            },
+        });
+        let got = g
+            .player_inv_state_for_test(0)
+            .expect("player")
+            .inventory
+            .get(0)
+            .expect("creative push lands");
+        assert_eq!((got.count(), got.item()), (1, 1));
     }
 
     #[test]
