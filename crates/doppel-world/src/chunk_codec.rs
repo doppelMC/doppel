@@ -396,17 +396,15 @@ fn write_light_arrays(out: &mut Vec<u8>, arrays: &[Vec<u8>]) {
     }
 }
 
-/// Reads a nullable network NBT compound, returning its raw bytes
-/// (including the presence bool, excluding nothing) for byte-faithful relay.
+/// Reads a nullable network NBT compound, returning its raw bytes for
+/// byte-faithful relay. Absence is a lone end tag (0x00); presence is the
+/// compound's type byte followed directly by named entries (the wire root
+/// carries no name field).
 fn read_nullable_nbt(r: &mut Reader) -> Result<Option<Vec<u8>>> {
-    let present = r.read_u8().context("nbt presence")?;
-    if present == 0 {
-        return Ok(None);
-    }
-    let start = r.pos - 1; // include the presence byte in the passthrough
+    let start = r.pos;
     let root_tag = r.read_u8().context("nbt root tag")?;
     if root_tag == 0 {
-        return Ok(Some(r.buf[start..r.pos].to_vec()));
+        return Ok(None);
     }
     skip_nbt_payload(r, root_tag).context("walking nbt")?;
     Ok(Some(r.buf[start..r.pos].to_vec()))
@@ -508,12 +506,24 @@ mod tests {
                     },
                 },
             ],
-            block_entities: vec![WireBlockEntity {
-                packed_xz: 0x12,
-                y: -60,
-                ty: 8,
-                tag: None,
-            }],
+            block_entities: vec![
+                WireBlockEntity {
+                    packed_xz: 0x12,
+                    y: -60,
+                    ty: 8,
+                    tag: None,
+                },
+                WireBlockEntity {
+                    packed_xz: 0x34,
+                    y: 72,
+                    ty: 8,
+                    // Compound with one entry, "id" -> string "m": type byte,
+                    // entry tag 8, name length 2, name, payload, end byte.
+                    tag: Some(vec![
+                        0x0A, 0x08, 0x00, 0x02, b'i', b'd', 0x00, 0x01, b'm', 0x00,
+                    ]),
+                },
+            ],
             light: WireLight {
                 sky_mask: vec![0x06],
                 block_mask: vec![],

@@ -130,6 +130,12 @@ impl FlatGenerator {
         FlatGenerator::new(&stack, PLAINS_BIOME_ID, air, registry)
     }
 
+    /// Flat worlds ignore the seed; this exists so callers can swap the
+    /// generator behind one constructor shape.
+    pub fn with_seed(_seed: i64, registry: &BlockRegistry) -> Result<FlatGenerator> {
+        FlatGenerator::classic(registry)
+    }
+
     /// Where a player spawns: one layer above the stack top (vanilla's
     /// spawn-height rule for flat worlds).
     pub fn spawn_y(&self) -> i32 {
@@ -282,7 +288,7 @@ impl FlatGenerator {
 
 /// Java `BitSet.toByteArray`: bit k lives in byte k/8, LSB-first, trailing
 /// zero bytes trimmed (an empty set serializes to no bytes at all).
-fn mask_bytes(bits: &[usize]) -> Vec<u8> {
+pub(crate) fn mask_bytes(bits: &[usize]) -> Vec<u8> {
     let Some(&top) = bits.last() else {
         return Vec::new();
     };

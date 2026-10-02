@@ -112,6 +112,52 @@ impl Drop for VanillaServer {
 /// Boots vanilla headless on `port` inside a fresh run directory and waits
 /// for the "Done" log line.
 pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer> {
+    // Minimal deterministic configuration: flat world, offline, small radius.
+    // The MOTD is deliberately left at the vanilla default ("A Minecraft
+    // Server") — matching the default is exactly what parity means.
+    let properties = format!(
+        "online-mode=false\n\
+         white-list=false\n\
+         server-port={port}\n\
+         level-type=minecraft\\:flat\n\
+         generate-structures=false\n\
+         view-distance=4\n\
+         simulation-distance=4\n\
+         spawn-protection=0\n\
+         sync-chunk-writes=false\n"
+    );
+    boot_with_properties(pin, jar, port, &properties)
+}
+
+/// Boots vanilla with a pinned seed and normal terrain generation, for
+/// worldgen parity comparisons.
+pub fn boot_seeded(
+    pin: &Pin,
+    jar: &std::path::Path,
+    port: u16,
+    seed: i64,
+) -> Result<VanillaServer> {
+    let properties = format!(
+        "online-mode=false\n\
+         white-list=false\n\
+         server-port={port}\n\
+         level-seed={seed}\n\
+         level-type=minecraft\\:normal\n\
+         generate-structures=false\n\
+         view-distance=4\n\
+         simulation-distance=4\n\
+         spawn-protection=0\n\
+         sync-chunk-writes=false\n"
+    );
+    boot_with_properties(pin, jar, port, &properties)
+}
+
+fn boot_with_properties(
+    pin: &Pin,
+    jar: &std::path::Path,
+    port: u16,
+    properties: &str,
+) -> Result<VanillaServer> {
     let have = java_major_version()?;
     if have < pin.java_major {
         bail!(
@@ -132,20 +178,6 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
 
     std::fs::write(run_dir.join("eula.txt"), "eula=true\n").context("writing eula.txt")?;
 
-    // Minimal deterministic configuration: flat world, offline, small radius.
-    // The MOTD is deliberately left at the vanilla default ("A Minecraft
-    // Server") — matching the default is exactly what parity means.
-    let properties = format!(
-        "online-mode=false\n\
-         white-list=false\n\
-         server-port={port}\n\
-         level-type=minecraft\\:flat\n\
-         generate-structures=false\n\
-         view-distance=4\n\
-         simulation-distance=4\n\
-         spawn-protection=0\n\
-         sync-chunk-writes=false\n"
-    );
     std::fs::write(run_dir.join("server.properties"), properties)
         .context("writing server.properties")?;
 
