@@ -711,7 +711,13 @@ pub struct CreativeSlotSet {
 pub fn parse_set_creative_slot(body: &[u8]) -> Result<CreativeSlotSet> {
     let mut r = Reader::new(body);
     let slot = read_i16(&mut r)?;
-    let stack = decode_item_stack(&mut r)?;
+    // The nullable stack codec: a presence boolean, then the stack.
+    let present = r.read_u8().context("stack presence")?;
+    let stack = if present != 0 {
+        decode_item_stack(&mut r)?
+    } else {
+        None
+    };
     if r.remaining() != 0 {
         bail!("trailing bytes in set_creative_mode_slot");
     }
@@ -1844,12 +1850,10 @@ mod tests {
             creative: false,
         });
         while rx.try_recv().is_ok() {}
+        let survival_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot {
             conn: 0,
-            set: CreativeSlotSet {
-                slot: 36,
-                stack: decode_item_stack(&mut Reader::new(&[1, 1, 0, 0])).unwrap(),
-            },
+            set: survival_set,
         });
         let got = g
             .player_inv_state_for_test(0)
@@ -1862,12 +1866,10 @@ mod tests {
             conn: 0,
             creative: true,
         });
+        let creative_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot {
             conn: 0,
-            set: CreativeSlotSet {
-                slot: 36,
-                stack: decode_item_stack(&mut Reader::new(&[1, 1, 0, 0])).unwrap(),
-            },
+            set: creative_set,
         });
         let got = g
             .player_inv_state_for_test(0)
