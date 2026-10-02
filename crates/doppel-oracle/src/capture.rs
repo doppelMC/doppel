@@ -77,6 +77,7 @@ pub fn run(out_path: &Path, blobs_dir: Option<&Path>) -> Result<()> {
             dump_dir: blobs_dir,
             commands: &[],
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing full login transcript")?;

@@ -128,6 +128,37 @@ fn send_commanded(
     Ok(())
 }
 
+/// Packs a block position the wire way (x 26<<38 | z 26<<12 | y 12).
+pub fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
+    (((x as i64) & 0x3ff_ffff) << 38) | (((z as i64) & 0x3ff_ffff) << 12) | ((y as i64) & 0xfff)
+}
+
+/// set_creative_mode_slot body: menu slot plus one item stack
+/// (count 1, id, empty component patch).
+pub fn build_set_creative_slot(slot: i16, item: i32) -> Vec<u8> {
+    let mut b = slot.to_be_bytes().to_vec();
+    doppel_protocol::write_varint(&mut b, 1);
+    doppel_protocol::write_varint(&mut b, item);
+    doppel_protocol::write_varint(&mut b, 0);
+    doppel_protocol::write_varint(&mut b, 0);
+    b
+}
+
+/// use_item_on body against the top face of the clicked block.
+pub fn build_use_item_on_top(x: i32, y: i32, z: i32, sequence: i32) -> Vec<u8> {
+    let mut b = Vec::new();
+    doppel_protocol::write_varint(&mut b, 0); // hand: main
+    b.extend_from_slice(&pack_block_pos(x, y, z).to_be_bytes());
+    doppel_protocol::write_varint(&mut b, 1); // face: up
+    b.extend_from_slice(&0.5f32.to_be_bytes());
+    b.extend_from_slice(&1.0f32.to_be_bytes());
+    b.extend_from_slice(&0.5f32.to_be_bytes());
+    b.push(0); // inside
+    b.push(0); // world border
+    doppel_protocol::write_varint(&mut b, sequence);
+    b
+}
+
 /// Options for a login capture session.
 #[derive(Default)]
 pub struct CaptureOpts<'a> {
@@ -135,6 +166,9 @@ pub struct CaptureOpts<'a> {
     pub max_packets: Option<usize>,
     pub dump_dir: Option<&'a std::path::Path>,
     pub commands: &'a [String],
+    /// Prebuilt serverbound frames sent once the command volley
+    /// completes (interactions with no command response to pace on).
+    pub raw_packets: &'a [(i32, Vec<u8>)],
     /// After the join burst, walk this many chunks in +x (one
     /// move_player_pos per 400ms) to exercise chunk streaming.
     pub walk_chunks: Option<usize>,
@@ -196,6 +230,8 @@ pub fn login_capture(
     let mut play_started = false;
     let mut commands_pending = !commands.is_empty();
     let mut next_cmd = 0usize;
+    let raw_packets = opts.raw_packets;
+    let mut raw_sent = false;
     let walk = opts.walk_chunks;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
@@ -316,6 +352,13 @@ pub fn login_capture(
             } else {
                 // Volley complete: back to the session's idle threshold.
                 conn.get_ref().set_read_timeout(Some(idle_timeout))?;
+                if !raw_sent && !raw_packets.is_empty() {
+                    raw_sent = true;
+                    for (id, body) in raw_packets {
+                        conn.write_packet(*id, body)?;
+                    }
+                    note = Some("sent raw interaction packets".to_string());
+                }
             }
         }
         // Walk pacing: cross one chunk per step via /tp — vanilla's

@@ -256,6 +256,7 @@ pub fn parity_login() -> Result<bool> {
             dump_dir: Some(&blobs_dir),
             commands: &[],
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing vanilla transcript")?;
@@ -469,6 +470,7 @@ pub fn parity_walk() -> Result<bool> {
             dump_dir: Some(&blobs_dir),
             commands: &[],
             walk_chunks: Some(4),
+            raw_packets: &[],
         },
     )
     .context("walking through vanilla")?;
@@ -503,6 +505,7 @@ pub fn parity_walk() -> Result<bool> {
             dump_dir: Some(&d_dump),
             commands: &[],
             walk_chunks: Some(4),
+            raw_packets: &[],
         },
     )
     .context("walking through doppel")?;
@@ -629,6 +632,7 @@ fn capture_clean_blobs(
             dump_dir: Some(blobs_dir),
             commands: &[],
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing clean vanilla join")?;
@@ -755,6 +759,7 @@ pub fn parity_blocks() -> Result<bool> {
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing vanilla setblocks")?;
@@ -785,6 +790,7 @@ pub fn parity_blocks() -> Result<bool> {
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing doppel setblocks")?;
@@ -1036,6 +1042,7 @@ pub fn parity_redstone() -> Result<bool> {
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing vanilla redstone")?;
@@ -1067,6 +1074,7 @@ pub fn parity_redstone() -> Result<bool> {
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
+            raw_packets: &[],
         },
     )
     .context("capturing doppel redstone")?;
@@ -1167,6 +1175,124 @@ pub fn parity_redstone() -> Result<bool> {
     } else {
         println!("FAIL: {} redstone difference(s):", failures.len());
         for f in failures.iter().take(40) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}
+
+/// The differential placement test: both servers get one anchor block,
+/// the bot flips itself creative, picks a stack, and right-clicks the
+/// anchor's top face. The resulting block writes must match.
+pub fn parity_placement() -> Result<bool> {
+    use crate::capture;
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs");
+    let pristine_world = root.join("target").join("vanilla").join("pristine-world");
+    if blobs_dir.exists() {
+        std::fs::remove_dir_all(&blobs_dir)?;
+    }
+
+    let login = capture::login_start_c("Doppel");
+    let protocol = pin.protocol.unwrap_or(0);
+    let commands: Vec<String> = ["gamemode creative", "setblock 10 99 10 minecraft:stone"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let raw: Vec<(i32, Vec<u8>)> = vec![
+        (0x39, bot::build_set_creative_slot(36, 1)),
+        (0x43, bot::build_use_item_on_top(10, 99, 10, 1)),
+    ];
+
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let v = bot::login_capture(
+        "127.0.0.1",
+        VANILLA_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(1200),
+            dump_dir: None,
+            commands: &commands,
+            walk_chunks: None,
+            raw_packets: &raw,
+        },
+    )
+    .context("capturing vanilla placement")?;
+    drop(server);
+
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let d = bot::login_capture(
+        "127.0.0.1",
+        DOPPEL_PORT,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(5)),
+            max_packets: Some(1200),
+            dump_dir: None,
+            commands: &commands,
+            walk_chunks: None,
+            raw_packets: &raw,
+        },
+    )
+    .context("capturing doppel placement")?;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let updates = |pkts: &[bot::CapturedPacket]| -> Vec<((i32, i32, i32), u32)> {
+        let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
+        decode_update_writes(&refs)
+    };
+    let vw = updates(&v);
+    let dw = updates(&d);
+    println!(
+        "[oracle] placement writes: vanilla {} doppel {}",
+        vw.len(),
+        dw.len()
+    );
+    let mut failures = Vec::new();
+    for (i, (a, b)) in vw.iter().zip(dw.iter()).enumerate() {
+        if a != b {
+            failures.push(format!("write {i}: vanilla {a:?} != doppel {b:?}"));
+        }
+    }
+    if vw.len() != dw.len() {
+        failures.push(format!(
+            "write count: vanilla {} vs doppel {}",
+            vw.len(),
+            dw.len()
+        ));
+        println!("  vanilla writes: {vw:?}");
+        println!("  doppel writes: {dw:?}");
+    }
+    if !vw.iter().any(|(p, _)| *p == (10, 100, 10)) {
+        failures.push("the placed block at (10,100,10) is missing".to_string());
+    }
+
+    if failures.is_empty() {
+        println!("PASS: placement writes match");
+        Ok(true)
+    } else {
+        println!("FAIL: {} placement difference(s):", failures.len());
+        for f in failures.iter().take(10) {
             println!("  {f}");
         }
         Ok(false)

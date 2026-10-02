@@ -52,6 +52,11 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Some("parity-placement") => {
+            if !parity::parity_placement()? {
+                std::process::exit(1);
+            }
+        }
         Some("parity-redstone") => {
             if !parity::parity_redstone()? {
                 std::process::exit(1);
