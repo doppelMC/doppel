@@ -758,7 +758,6 @@ impl Game {
             "minecraft:redstone_torch" | "minecraft:redstone_wall_torch" => {
                 self.update_torch(x, y, z, &name, &props)
             }
-            "minecraft:observer" => self.update_observer(x, y, z, &props),
             "minecraft:repeater" => self.update_repeater(x, y, z, &props),
             "minecraft:comparator" => self.update_comparator(x, y, z, &props),
             "minecraft:piston" | "minecraft:sticky_piston" => self.update_piston(x, y, z),
@@ -789,6 +788,20 @@ impl Game {
         };
         if name == "minecraft:redstone_wire" {
             wire::update_wire_side(self, (x, y, z), &props, dx, dy, dz);
+            if let Some((n, p2)) = self.get_block(x, y, z) {
+                if n == "minecraft:redstone_wire" {
+                    wire::update_wire_power_only(self, x, y, z, &p2);
+                }
+            }
+            return;
+        }
+        // Observers react only to changes at their watched face; their
+        // own state writes must not re-trigger the pulse.
+        if name == "minecraft:observer" {
+            let facing = prop_dir(&props);
+            if (dx, dy, dz) == dir_step(dir_id(facing)) {
+                self.update_observer(x, y, z, &props);
+            }
             return;
         }
         self.update_block(x, y, z);
@@ -849,6 +862,9 @@ impl Game {
             return;
         }
         let powered = props.contains("powered=true");
+        if std::env::var_os("OBS_TRACE").is_some() {
+            eprintln!("[obs] tick {} toggle at ({x},{y},{z}): {}", self.tick, if powered { "off" } else { "on" });
+        }
         let new_props = doppel_world::registry::BlockRegistry::with_prop(
             &props,
             "powered",

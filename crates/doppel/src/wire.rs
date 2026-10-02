@@ -863,9 +863,58 @@ fn refresh_wire_shape(host: &mut impl WireHost, p: Pos, props: &str) -> String {
 /// path — the whole propagation is synchronous.
 pub fn update_wire_cascade(host: &mut impl WireHost, x: i32, y: i32, z: i32, props: &str) {
     let mut queue = NeighborQueue::new();
-    let props = refresh_wire_shape(host, (x, y, z), props);
+    let props = placement_shape(host, (x, y, z), props);
     update_wire_strength(host, (x, y, z), &props, &mut queue);
     queue.drain(host);
+}
+
+/// Power recompute after a directional shape update, without touching
+/// stored sides.
+pub fn update_wire_power_only(host: &mut impl WireHost, x: i32, y: i32, z: i32, props: &str) {
+    let mut queue = NeighborQueue::new();
+    update_wire_strength(host, (x, y, z), props, &mut queue);
+    queue.drain(host);
+}
+
+/// The shape derivation a freshly placed (or undirectedly notified) wire
+/// performs: same-level sides only. Diagonal sides never form at
+/// placement; they arrive through later directional updates.
+fn placement_shape(host: &mut impl WireHost, p: Pos, props: &str) -> String {
+    let stored = Connections::from_props(props);
+    let mut c = Connections::all_none();
+    for d in Dir::HORIZONTAL {
+        if should_connect_to(host, at(p, d), Some(d)) {
+            c.set(d, Side::Side);
+        }
+    }
+    let was_dot = stored.is_dot();
+    if was_dot && c.is_dot() {
+        return props.to_string();
+    }
+    let north_south_empty = !c.north.is_connected() && !c.south.is_connected();
+    let east_west_empty = !c.east.is_connected() && !c.west.is_connected();
+    if !c.west.is_connected() && north_south_empty {
+        c.west = Side::Side;
+    }
+    if !c.east.is_connected() && north_south_empty {
+        c.east = Side::Side;
+    }
+    if !c.north.is_connected() && east_west_empty {
+        c.north = Side::Side;
+    }
+    if !c.south.is_connected() && east_west_empty {
+        c.south = Side::Side;
+    }
+    if c == stored {
+        return props.to_string();
+    }
+    let power = wire_power_of(props);
+    if let Some(state) = host.resolve_wire_state(&c, power) {
+        if get(host, p).is_some_and(|(name, _)| is_wire(&name)) {
+            host.set_wire_state(p.0, p.1, p.2, state);
+        }
+    }
+    get(host, p).map(|(_, p2)| p2).unwrap_or_else(|| props.to_string())
 }
 
 /// The directional shape update: recompute only the side facing the
