@@ -65,8 +65,14 @@ fn sha1_file(path: &std::path::Path) -> Result<String> {
 }
 
 /// Reports the major version of `java` on PATH (8 for "1.8.0_x", 25 for "25.0.1").
+/// The java binary the oracle boots vanilla with: JAVA_BIN when set
+/// (a specific JDK install), else whatever `java` resolves on PATH.
+fn java_bin() -> String {
+    std::env::var("JAVA_BIN").unwrap_or_else(|_| "java".to_string())
+}
+
 pub fn java_major_version() -> Result<u32> {
-    let out = Command::new("java")
+    let out = Command::new(java_bin())
         .arg("-version")
         .output()
         .context("running `java -version` — is a JDK/JRE installed and on PATH?")?;
@@ -151,7 +157,7 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
     std::fs::write(run_dir.join("ops.json"), ops).context("writing ops.json")?;
 
     eprintln!("[oracle] booting vanilla {} on port {port}...", pin.id);
-    let mut child = Command::new("java")
+    let mut child = Command::new(java_bin())
         .args(["-Xms512M", "-Xmx2G", "-jar"])
         .arg(jar)
         .arg("nogui")
