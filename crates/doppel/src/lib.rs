@@ -366,6 +366,17 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     count,
                 });
             }
+            // --- containers hooks (containers.rs) ---
+            // `opencontainer x y z`: the container test driver.
+            if parts.len() == 5 && parts[0] == "opencontainer" {
+                if let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[1].parse::<i32>(),
+                    parts[2].parse::<i32>(),
+                    parts[3].parse::<i32>(),
+                ) {
+                    return Some(game::Inbound::OpenContainer { conn, x, y, z });
+                }
+            }
             None
         }
         // --- inventory hooks (inventory.rs) ---
@@ -381,6 +392,15 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         0x12 => {
             let click = inventory::parse_container_click(body).ok()?;
             Some(game::Inbound::ContainerClick { conn, click })
+        }
+        // --- containers hooks (containers.rs) ---
+        // container_close: the client closed a menu (one VarInt id).
+        0x13 => {
+            let id = game::containers::parse_container_close(body).ok()?;
+            Some(game::Inbound::ContainerClose {
+                conn,
+                container_id: id,
+            })
         }
         _ => None,
     }
