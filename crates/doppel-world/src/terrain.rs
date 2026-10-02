@@ -68,17 +68,19 @@ const OFFSET: OctaveSpec = OctaveSpec {
 };
 
 /// Continental position to base height: deep ocean floor rising through
-/// shelf and coast to inland hills and mountains.
+/// shelf and coast to inland hills and mountains. The land branch sits six
+/// layers over the naive knee so inland columns land where the parity gate
+/// measures vanilla putting them; the ocean branch already matches.
 const HEIGHT_SPLINE: [(f64, f64); 9] = [
     (-1.05, 34.0),
     (-0.455, 42.0),
     (-0.19, 51.0),
     (-0.06, 60.0),
-    (0.03, 64.0),
-    (0.06, 66.0),
-    (0.32, 74.0),
-    (0.55, 90.0),
-    (1.05, 128.0),
+    (0.03, 70.0),
+    (0.06, 72.0),
+    (0.32, 80.0),
+    (0.55, 96.0),
+    (1.05, 134.0),
 ];
 
 /// Relief weight: flat over the ocean, full over inland continental mass.

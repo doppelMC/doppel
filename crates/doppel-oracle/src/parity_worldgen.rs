@@ -189,6 +189,25 @@ fn compare(
     };
     let disagree = masks.total - masks.agree;
     println!("[worldgen] land mask agreement: {landmask:.3} ({disagree} columns disagree)");
+    let gap = |d: &[f64], label: &str| {
+        if d.is_empty() {
+            return;
+        }
+        let mut sorted = d.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        println!(
+            "[worldgen] {label}: n={n} median gap {:+.1} p25 {:+.1} p75 {:+.1}",
+            sorted[n / 2],
+            sorted[n / 4],
+            sorted[(n * 3) / 4]
+        );
+    };
+    gap(
+        &masks.vanilla_land_gap,
+        "vanilla-land columns we call water",
+    );
+    gap(&masks.ours_land_gap, "our-land columns vanilla calls water");
     let split = |d: &[f64], label: &str| {
         if d.is_empty() {
             println!("[worldgen] {label}: no shared columns");
@@ -354,6 +373,14 @@ impl HeightCompare {
                         } else {
                             self.masks.ocean_deltas.push(delta);
                         }
+                    } else if land_b {
+                        // How far the column sits from flipping to land on
+                        // our side (positive = still water-side of the line).
+                        self.masks.vanilla_land_only += 1;
+                        self.masks.vanilla_land_gap.push(delta);
+                    } else {
+                        self.masks.ours_land_only += 1;
+                        self.masks.ours_land_gap.push(-delta);
                     }
                 }
             }
@@ -371,6 +398,10 @@ struct MaskStats {
     total: u64,
     ocean_deltas: Vec<f64>,
     land_deltas: Vec<f64>,
+    vanilla_land_only: u64,
+    ours_land_only: u64,
+    vanilla_land_gap: Vec<f64>,
+    ours_land_gap: Vec<f64>,
 }
 
 /// Per-chunk aggregates for the comparison: block histogram by name, biome
