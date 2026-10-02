@@ -77,8 +77,8 @@ impl Xoroshiro {
         if lo | hi == 0 {
             // The all-zero state is the single fixed point; nudge it.
             return Xoroshiro {
-                lo: 0x9E37_79B9_7F4A_7C15,
-                hi: 0x6A09_E667_F3BC_C909,
+                lo: (-7046029254386353131i64) as u64,
+                hi: 7640891576956012809u64,
             };
         }
         Xoroshiro { lo, hi }

@@ -38,6 +38,9 @@ const MIN_OVERLAP: f64 = 0.35;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
 /// breakage like wrong world height or offset sections).
 const MIN_CELL_AGREEMENT: f64 = 0.5;
+/// Coastline agreement: decorrelated climate fields sit near 0.6, matched
+/// fields well above 0.8.
+const MIN_LANDMASK: f64 = 0.75;
 
 pub fn run() -> Result<bool> {
     let pin = load_pin()?;
@@ -122,11 +125,7 @@ fn compare(
     registry: &BlockRegistry,
     dump_dir: &Path,
 ) -> Result<bool> {
-    let mut deltas: Vec<Vec<f64>> = vec![Vec::new(); 3];
-    let mut map_types: Vec<Option<u32>> = vec![None; 3];
-    let mut corr_type: Option<u32> = None;
-    let mut pairs_a: Vec<f64> = Vec::new();
-    let mut pairs_b: Vec<f64> = Vec::new();
+    let mut heights = HeightCompare::default();
     let mut ours_hist: HashMap<String, u64> = HashMap::new();
     let mut vanilla_hist: HashMap<String, u64> = HashMap::new();
     let mut biomes: HashMap<u32, u64> = HashMap::new();
@@ -135,15 +134,7 @@ fn compare(
 
     for v in captured {
         let mine = generate_chunk(terrain, well, SEED, v.x, v.z);
-        compare_heightmaps(
-            v,
-            &mine,
-            &mut deltas,
-            &mut map_types,
-            &mut corr_type,
-            &mut pairs_a,
-            &mut pairs_b,
-        );
+        heights.add_chunk(v, &mine);
         let ours_cells = chunk_cells(&mine, registry);
         let vanilla_cells = chunk_cells(v, registry);
         for (name, count) in ours_cells.hist {
@@ -166,7 +157,7 @@ fn compare(
     // Heightmap deltas per wire map type.
     let mut worst_median = 0f64;
     let mut worst_p95 = 0f64;
-    for (ty, d) in map_types.iter().zip(deltas.iter()) {
+    for (ty, d) in heights.map_types.iter().zip(heights.deltas.iter()) {
         let Some(ty) = *ty else {
             continue;
         };
@@ -184,10 +175,34 @@ fn compare(
         worst_p95 = worst_p95.max(p95);
     }
     let mut worst_corr = 1f64;
-    if corr_type.is_some() {
-        worst_corr = pearson(&pairs_a, &pairs_b);
+    if heights.corr_type.is_some() {
+        worst_corr = pearson(&heights.pairs_a, &heights.pairs_b);
         println!("[worldgen] height correlation: {worst_corr:.3}");
     }
+
+    // Land-mask split: coastline agreement and per-class height bias.
+    let masks = heights.masks;
+    let landmask = if masks.total == 0 {
+        0.0
+    } else {
+        masks.agree as f64 / masks.total as f64
+    };
+    let disagree = masks.total - masks.agree;
+    println!("[worldgen] land mask agreement: {landmask:.3} ({disagree} columns disagree)");
+    let split = |d: &[f64], label: &str| {
+        if d.is_empty() {
+            println!("[worldgen] {label}: no shared columns");
+            return;
+        }
+        let mut sorted = d.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let n = sorted.len();
+        let median = sorted[n / 2];
+        let p95 = sorted[(n * 95) / 100].abs();
+        println!("[worldgen] {label}: median signed {median:+.1} p95|d|={p95:.1} (n={n})");
+    };
+    split(&masks.ocean_deltas, "shared-ocean delta");
+    split(&masks.land_deltas, "shared-land delta");
 
     // Block histogram overlap.
     let mut overlap_lo = 0u64;
@@ -245,14 +260,14 @@ fn compare(
     std::fs::write(
         &report,
         format!(
-            "chunks={}\noverlap={overlap:.4}\nagreement={agreement:.4}\ncorr={worst_corr:.4}\nmedian={worst_median:.2}\np95={worst_p95:.2}\n",
+            "chunks={}\noverlap={overlap:.4}\nagreement={agreement:.4}\ncorr={worst_corr:.4}\nmedian={worst_median:.2}\np95={worst_p95:.2}\nlandmask={landmask:.4}\n",
             captured.len()
         ),
     )
     .ok();
 
     let mut ok = true;
-    if map_types.iter().all(|t| t.is_none()) {
+    if heights.map_types.iter().all(|t| t.is_none()) {
         // Without a shared heightmap type the delta and correlation metrics
         // above never ran; their zero-initialized worsts would pass vacuously.
         println!("[worldgen] FAIL no shared heightmap type between vanilla and generated chunks");
@@ -278,46 +293,84 @@ fn compare(
         println!("[worldgen] FAIL cell agreement {agreement:.3} < {MIN_CELL_AGREEMENT}");
         ok = false;
     }
+    if landmask < MIN_LANDMASK {
+        println!("[worldgen] FAIL land mask agreement {landmask:.3} < {MIN_LANDMASK}");
+        ok = false;
+    }
     if ok {
         println!("[worldgen] gate green: all convergence targets met");
     }
     Ok(ok)
 }
 
-/// Per-chunk heightmap deltas for every map type both sides carry, plus a
-/// record of which wire type ids those were. The first common type also
-/// feeds the raw correlation pairs.
-fn compare_heightmaps(
-    vanilla: &WireChunk,
-    mine: &WireChunk,
-    deltas: &mut [Vec<f64>],
-    map_types: &mut [Option<u32>],
-    corr_type: &mut Option<u32>,
-    pairs_a: &mut Vec<f64>,
-    pairs_b: &mut Vec<f64>,
-) {
-    for (slot, ours) in mine.heightmaps.iter().enumerate() {
-        let Some((_, vlongs)) = vanilla.heightmaps.iter().find(|(ty, _)| *ty == ours.0) else {
-            continue;
-        };
-        map_types[slot] = Some(ours.0);
-        let a = unpack(&ours.1, 9, 256);
-        let b = unpack(vlongs, 9, 256);
-        let take_pairs = match *corr_type {
-            None => {
-                *corr_type = Some(ours.0);
-                true
-            }
-            Some(t) => t == ours.0,
-        };
-        for i in 0..256 {
-            deltas[slot].push(b[i] as f64 - a[i] as f64);
-            if take_pairs {
-                pairs_a.push(b[i] as f64);
-                pairs_b.push(a[i] as f64);
+/// Height comparison accumulators: per-map-type deltas for every type both
+/// sides carry, plus the raw correlation pairs and the land-mask split fed
+/// by the first common type.
+#[derive(Default)]
+struct HeightCompare {
+    deltas: Vec<Vec<f64>>,
+    map_types: Vec<Option<u32>>,
+    corr_type: Option<u32>,
+    pairs_a: Vec<f64>,
+    pairs_b: Vec<f64>,
+    masks: MaskStats,
+}
+
+impl HeightCompare {
+    fn add_chunk(&mut self, vanilla: &WireChunk, mine: &WireChunk) {
+        if self.deltas.is_empty() {
+            self.deltas = vec![Vec::new(); mine.heightmaps.len()];
+            self.map_types = vec![None; mine.heightmaps.len()];
+        }
+        for (slot, ours) in mine.heightmaps.iter().enumerate() {
+            let Some((_, vlongs)) = vanilla.heightmaps.iter().find(|(ty, _)| *ty == ours.0) else {
+                continue;
+            };
+            self.map_types[slot] = Some(ours.0);
+            let a = unpack(&ours.1, 9, 256);
+            let b = unpack(vlongs, 9, 256);
+            let take_pairs = match self.corr_type {
+                None => {
+                    self.corr_type = Some(ours.0);
+                    true
+                }
+                Some(t) => t == ours.0,
+            };
+            for i in 0..256 {
+                let delta = b[i] as f64 - a[i] as f64;
+                self.deltas[slot].push(delta);
+                if take_pairs {
+                    self.pairs_a.push(b[i] as f64);
+                    self.pairs_b.push(a[i] as f64);
+                    // Stored values are (first free y) - MIN_Y; the ocean
+                    // rests at exactly sea level, so land is > 128.
+                    let land_a = a[i] > 128;
+                    let land_b = b[i] > 128;
+                    self.masks.total += 1;
+                    if land_a == land_b {
+                        self.masks.agree += 1;
+                        if land_a {
+                            self.masks.land_deltas.push(delta);
+                        } else {
+                            self.masks.ocean_deltas.push(delta);
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Coastline agreement plus height deltas split by shared surface class.
+/// The mask isolates the noise field from the height formula: a matching
+/// field with a mis-calibrated spline keeps the mask high while the split
+/// deltas expose the per-class bias.
+#[derive(Default)]
+struct MaskStats {
+    agree: u64,
+    total: u64,
+    ocean_deltas: Vec<f64>,
+    land_deltas: Vec<f64>,
 }
 
 /// Per-chunk aggregates for the comparison: block histogram by name, biome
