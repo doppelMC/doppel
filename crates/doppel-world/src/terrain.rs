@@ -1,19 +1,16 @@
-//! Layered-noise terrain: a composable height field over the same wire
-//! emission surface the flat generator uses.
+//! Layered terrain over the shared wire emission surface.
 //!
-//! Four octave stacks drive a height spline (continental position) plus a
-//! gain-scaled relief term (erosion, folded peaks) and a small surface
-//! detail term. Columns fill with a bedrock/stone/deepslate/cap stack,
-//! water rises to sea level where terrain dips below, and the chunk
-//! emission (palette sections, heightmaps, light layers) follows the
-//! shared wire shape.
-//! The full 3D density graph is out of scope; parity converges by way of
-//! the same seed derivation and spline calibration.
+//! Two engines feed one emitter. The density engine interprets the pinned
+//! worldgen configs: a 3D density field with aquifers and a per-column
+//! surface pass decide every block. The fitted engine keeps the older
+//! behavior-calibrated height field for its tests. Both share the chunk
+//! emission (palette sections, heightmaps, light layers).
 
 use anyhow::{Context, Result};
 
 use crate::anvil_to_wire::pack;
 use crate::chunk_codec::{Container, WireChunk, WireLight, WireSection};
+use crate::density::{locate_pins, NoiseTerrain};
 use crate::noise::{world_positional, OctaveNoise, OctaveSpec};
 use crate::registry::BlockRegistry;
 use crate::worldgen::{mask_bytes, MIN_Y, PLAINS_BIOME_ID};
@@ -31,6 +28,8 @@ const CLIENT_HEIGHTMAPS: [u32; 3] = [1, 5, 4];
 
 /// Where the ocean surface sits (world y).
 pub const SEA_LEVEL: i32 = 63;
+
+// --- fitted engine ---------------------------------------------------------
 
 /// Continental stack: the slow field that picks ocean shelf vs highlands.
 const CONTINENTAL: OctaveSpec = OctaveSpec {
@@ -146,36 +145,37 @@ struct SurfaceStates {
     air: u32,
 }
 
-/// The layered terrain generator.
-pub struct HeightmapGenerator {
+fn resolve_states(registry: &BlockRegistry) -> Result<SurfaceStates> {
+    let resolve = |name: &str, props: &str| {
+        registry
+            .state_id(name, props)
+            .with_context(|| format!("pinning {name}[{props}]"))
+    };
+    Ok(SurfaceStates {
+        grass: resolve("minecraft:grass_block", "snowy=false")?,
+        dirt: resolve("minecraft:dirt", "")?,
+        stone: resolve("minecraft:stone", "")?,
+        deepslate: resolve("minecraft:deepslate", "")?,
+        sand: resolve("minecraft:sand", "")?,
+        water: resolve("minecraft:water", "level=0")?,
+        bedrock: resolve("minecraft:bedrock", "")?,
+        air: resolve("minecraft:air", "")?,
+    })
+}
+
+/// The behavior-fitted height field.
+struct FittedTerrain {
     continental: OctaveNoise,
     erosion: OctaveNoise,
     peaks: OctaveNoise,
     surface: OctaveNoise,
     offset: OctaveNoise,
     states: SurfaceStates,
-    biome: u32,
 }
 
-impl HeightmapGenerator {
-    /// Builds the noise chain from the world seed: one positional factory,
-    /// one octave stack per layer name.
-    pub fn with_seed(seed: i64, registry: &BlockRegistry) -> Result<HeightmapGenerator> {
-        let resolve = |name: &str, props: &str| {
-            registry
-                .state_id(name, props)
-                .with_context(|| format!("pinning {name}[{props}]"))
-        };
-        let states = SurfaceStates {
-            grass: resolve("minecraft:grass_block", "snowy=false")?,
-            dirt: resolve("minecraft:dirt", "")?,
-            stone: resolve("minecraft:stone", "")?,
-            deepslate: resolve("minecraft:deepslate", "")?,
-            sand: resolve("minecraft:sand", "")?,
-            water: resolve("minecraft:water", "level=0")?,
-            bedrock: resolve("minecraft:bedrock", "")?,
-            air: resolve("minecraft:air", "")?,
-        };
+impl FittedTerrain {
+    fn with_seed(seed: i64, registry: &BlockRegistry) -> Result<FittedTerrain> {
+        let states = resolve_states(registry)?;
         let world = world_positional(seed);
         // Layer seeds hash the full registry identifier of each noise, so
         // the strings carry the namespace.
@@ -189,19 +189,18 @@ impl HeightmapGenerator {
         let surface = OctaveNoise::new(&SURFACE, &mut surface_rng);
         let mut offset_rng = world.from_name("minecraft:offset");
         let offset = OctaveNoise::new(&OFFSET, &mut offset_rng);
-        Ok(HeightmapGenerator {
+        Ok(FittedTerrain {
             continental,
             erosion,
             peaks,
             surface,
             offset,
             states,
-            biome: PLAINS_BIOME_ID,
         })
     }
 
     /// World y of the topmost solid block in the column.
-    pub fn column_top(&self, wx: i32, wz: i32) -> i32 {
+    fn column_top(&self, wx: i32, wz: i32) -> i32 {
         let continental = climate(&self.continental, &self.offset, wx, wz);
         let erosion = climate(&self.erosion, &self.offset, wx, wz);
         let peaks = peaks_and_valleys(climate(&self.peaks, &self.offset, wx, wz));
@@ -216,9 +215,7 @@ impl HeightmapGenerator {
         (height.floor() as i32).clamp(MIN_Y + 2, MIN_Y + WORLD_LAYERS as i32 - 2)
     }
 
-    /// Fills the chunk block buffer (storage order, y-major) and returns the
-    /// per-column ground tops for placement decisions.
-    pub(crate) fn build_blocks(&self, cx: i32, cz: i32) -> (Vec<u32>, [i32; HEIGHTMAP_CELLS]) {
+    fn build_blocks(&self, cx: i32, cz: i32) -> (Vec<u32>, [i32; HEIGHTMAP_CELLS]) {
         let mut blocks = vec![self.states.air; WORLD_LAYERS * HEIGHTMAP_CELLS];
         let mut tops = [0i32; HEIGHTMAP_CELLS];
         for z in 0..SECTION_EDGE {
@@ -231,22 +228,36 @@ impl HeightmapGenerator {
         }
         (blocks, tops)
     }
+}
 
-    /// Generates the terrain-only chunk.
-    pub fn generate(&self, cx: i32, cz: i32) -> WireChunk {
-        let (blocks, _) = self.build_blocks(cx, cz);
-        self.emit(cx, cz, &blocks)
+// --- emission --------------------------------------------------------------
+
+/// Wire emission state: air and water ids plus the single biome id.
+struct ChunkEmitter {
+    air: u32,
+    water: u32,
+    biome: u32,
+}
+
+impl ChunkEmitter {
+    fn new(registry: &BlockRegistry) -> Result<ChunkEmitter> {
+        let states = resolve_states(registry)?;
+        Ok(ChunkEmitter {
+            air: states.air,
+            water: states.water,
+            biome: PLAINS_BIOME_ID,
+        })
     }
 
     /// Emits a wire chunk from a filled block buffer; heightmaps and light
     /// recompute from the buffer so structure overlays stay consistent.
-    pub(crate) fn emit(&self, cx: i32, cz: i32, blocks: &[u32]) -> WireChunk {
+    fn emit(&self, cx: i32, cz: i32, blocks: &[u32]) -> WireChunk {
         debug_assert_eq!(blocks.len(), WORLD_LAYERS * HEIGHTMAP_CELLS);
         let mut sections = Vec::with_capacity(SECTION_SPAN);
         let mut ground: Option<(usize, usize)> = None;
         for index in 0..SECTION_SPAN {
             let cells = &blocks[index * SECTION_CELLS..(index + 1) * SECTION_CELLS];
-            let solid = cells.iter().filter(|&&s| s != self.states.air).count();
+            let solid = cells.iter().filter(|&&s| s != self.air).count();
             if solid > 0 {
                 let span = ground.get_or_insert((index, index));
                 span.0 = span.0.min(index);
@@ -260,7 +271,7 @@ impl HeightmapGenerator {
         for column in 0..HEIGHTMAP_CELLS {
             let top = (MIN_Y..MIN_Y + WORLD_LAYERS as i32)
                 .rev()
-                .find(|&y| blocks[layer_index(y) * HEIGHTMAP_CELLS + column] != self.states.air);
+                .find(|&y| blocks[layer_index(y) * HEIGHTMAP_CELLS + column] != self.air);
             first_free[column] = top.map(|y| (y + 1 - MIN_Y) as usize).unwrap_or(0);
         }
         let heightmaps: Vec<(u32, Vec<u64>)> = CLIENT_HEIGHTMAPS
@@ -284,11 +295,11 @@ impl HeightmapGenerator {
             return WireSection {
                 non_empty: 0,
                 fluid: 0,
-                block_states: Container::Single(self.states.air),
+                block_states: Container::Single(self.air),
                 biomes: Container::Single(self.biome),
             };
         }
-        let mut entries = vec![self.states.air];
+        let mut entries = vec![self.air];
         let storage: Vec<u16> = cells
             .iter()
             .map(|&state| match entries.iter().position(|&s| s == state) {
@@ -303,7 +314,7 @@ impl HeightmapGenerator {
         // same strategy the disk converter applies.
         if entries.len() == 1 {
             let state = cells[0];
-            let fluid = if state == self.states.water { 4096 } else { 0 };
+            let fluid = if state == self.water { 4096 } else { 0 };
             return WireSection {
                 non_empty: solid as i16,
                 fluid,
@@ -316,7 +327,7 @@ impl HeightmapGenerator {
             bits += 1;
         }
         debug_assert!(bits <= 8, "terrain palette exceeded 8 bits");
-        let fluid = cells.iter().filter(|&&s| s == self.states.water).count();
+        let fluid = cells.iter().filter(|&&s| s == self.water).count();
         WireSection {
             non_empty: solid as i16,
             fluid: fluid as i16,
@@ -373,6 +384,80 @@ impl HeightmapGenerator {
     }
 }
 
+// --- generator -------------------------------------------------------------
+
+enum Engine {
+    Fitted(FittedTerrain),
+    Density(NoiseTerrain),
+}
+
+/// The terrain generator: a density engine over the pinned worldgen
+/// configs, or the fitted height field, both behind one chunk emitter.
+pub struct HeightmapGenerator {
+    engine: Engine,
+    emitter: ChunkEmitter,
+}
+
+impl HeightmapGenerator {
+    /// Builds the density engine from the pinned worldgen configs.
+    pub fn with_seed(seed: i64, registry: &BlockRegistry) -> Result<HeightmapGenerator> {
+        let pins = locate_pins()?;
+        let engine = NoiseTerrain::with_seed(seed, registry, &pins)?;
+        Ok(HeightmapGenerator {
+            engine: Engine::Density(engine),
+            emitter: ChunkEmitter::new(registry)?,
+        })
+    }
+
+    /// Builds the fitted height field.
+    pub fn fitted_with_seed(seed: i64, registry: &BlockRegistry) -> Result<HeightmapGenerator> {
+        Ok(HeightmapGenerator {
+            engine: Engine::Fitted(FittedTerrain::with_seed(seed, registry)?),
+            emitter: ChunkEmitter::new(registry)?,
+        })
+    }
+
+    /// World y of the topmost solid block in the column.
+    pub fn column_top(&self, wx: i32, wz: i32) -> i32 {
+        match &self.engine {
+            Engine::Fitted(fitted) => fitted.column_top(wx, wz),
+            Engine::Density(density) => density.column_top(wx, wz),
+        }
+    }
+
+    /// Fills the chunk block buffer (storage order, y-major) and returns the
+    /// per-column ground tops for placement decisions.
+    pub(crate) fn build_blocks(&self, cx: i32, cz: i32) -> (Vec<u32>, [i32; HEIGHTMAP_CELLS]) {
+        match &self.engine {
+            Engine::Fitted(fitted) => fitted.build_blocks(cx, cz),
+            Engine::Density(density) => {
+                let blocks = density.fill_chunk(cx, cz);
+                let mut tops = [0i32; HEIGHTMAP_CELLS];
+                for column in 0..HEIGHTMAP_CELLS {
+                    let top = (MIN_Y..MIN_Y + WORLD_LAYERS as i32).rev().find(|&y| {
+                        let state = blocks[layer_index(y) * HEIGHTMAP_CELLS + column];
+                        state != self.emitter.air && state != self.emitter.water
+                    });
+                    tops[column] = top.unwrap_or(MIN_Y - 1);
+                }
+                (blocks, tops)
+            }
+        }
+    }
+
+    /// Generates the terrain-only chunk.
+    pub fn generate(&self, cx: i32, cz: i32) -> WireChunk {
+        let (blocks, _) = self.build_blocks(cx, cz);
+        self.emit(cx, cz, &blocks)
+    }
+
+    /// Emits a wire chunk from a filled block buffer; heightmaps and light
+    /// recompute from the buffer so structure overlays stay consistent.
+    pub(crate) fn emit(&self, cx: i32, cz: i32, blocks: &[u32]) -> WireChunk {
+        self.emitter.emit(cx, cz, blocks)
+    }
+}
+
 /// World layer index (0 = MIN_Y) of a world y.
 fn layer_index(y: i32) -> usize {
     (y - MIN_Y) as usize
@@ -424,7 +509,7 @@ mod tests {
     }
 
     fn generator() -> HeightmapGenerator {
-        HeightmapGenerator::with_seed(42, &registry()).expect("terrain generator")
+        HeightmapGenerator::fitted_with_seed(42, &registry()).expect("terrain generator")
     }
 
     fn unpack_section(chunk: &WireChunk, section: usize) -> Vec<u32> {
@@ -447,6 +532,7 @@ mod tests {
     #[test]
     fn terrain_shape_and_water() {
         let gen = generator();
+        let states = resolve_states(&registry()).unwrap();
         let (blocks, tops) = gen.build_blocks(0, 0);
         for column in 0..HEIGHTMAP_CELLS {
             let top = tops[column];
@@ -457,30 +543,30 @@ mod tests {
             assert_eq!(
                 blocks[layer_index(top) * HEIGHTMAP_CELLS + column],
                 if top <= SEA_LEVEL + 1 {
-                    gen.states.sand
+                    states.sand
                 } else {
-                    gen.states.grass
+                    states.grass
                 }
             );
             assert_eq!(
                 blocks[layer_index(MIN_Y) * HEIGHTMAP_CELLS + column],
-                gen.states.bedrock
+                states.bedrock
             );
             if top < SEA_LEVEL {
                 assert_eq!(
                     blocks[layer_index(SEA_LEVEL) * HEIGHTMAP_CELLS + column],
-                    gen.states.water,
+                    states.water,
                     "sea level cell"
                 );
                 assert_eq!(
                     blocks[layer_index(SEA_LEVEL + 1) * HEIGHTMAP_CELLS + column],
-                    gen.states.air,
+                    states.air,
                     "water above sea level"
                 );
             } else {
                 assert_ne!(
                     blocks[layer_index(SEA_LEVEL) * HEIGHTMAP_CELLS + column],
-                    gen.states.water,
+                    states.water,
                     "water on land column"
                 );
             }
@@ -535,13 +621,14 @@ mod tests {
         let chunk = gen.generate(3, 6);
         assert_eq!(chunk.sections.len(), SECTION_SPAN);
         assert!(chunk.block_entities.is_empty());
-        let air = gen.states.air;
+        let states = resolve_states(&registry()).unwrap();
+        let air = states.air;
         for (index, section) in chunk.sections.iter().enumerate() {
             assert_eq!(section.biomes, Container::Single(PLAINS_BIOME_ID));
             let cells = unpack_section(&chunk, index);
             let solid = cells.iter().filter(|&&s| s != air).count();
             assert_eq!(section.non_empty as usize, solid, "section {index}");
-            let fluid = cells.iter().filter(|&&s| s == gen.states.water).count();
+            let fluid = cells.iter().filter(|&&s| s == states.water).count();
             assert_eq!(section.fluid as usize, fluid, "section {index}");
             match &section.block_states {
                 Container::Single(v) => {
@@ -586,7 +673,7 @@ mod tests {
         let a = gen.generate(2, 2);
         let b = gen.generate(2, 2);
         assert_eq!(a, b, "same seed regenerates identically");
-        let other = HeightmapGenerator::with_seed(43, &registry()).unwrap();
+        let other = HeightmapGenerator::fitted_with_seed(43, &registry()).unwrap();
         let c = other.generate(2, 2);
         assert_ne!(a, c, "different seed changes terrain");
         // Chunk-order independence: generating neighbors must not shift
@@ -605,5 +692,40 @@ mod tests {
             assert_eq!(decoded, chunk, "chunk ({cx},{cz})");
             assert_eq!(decoded.encode(), bytes);
         }
+    }
+
+    /// The density engine produces the same wire shape: full section list,
+    /// heightmaps agreeing with the emitted blocks, and byte-stable
+    /// regeneration.
+    #[test]
+    fn density_engine_chunk() {
+        let gen = HeightmapGenerator::with_seed(42, &registry()).expect("density generator");
+        let chunk = gen.generate(0, 0);
+        assert_eq!(chunk.sections.len(), SECTION_SPAN);
+        let values = unpack(&chunk.heightmaps[0].1, HEIGHTMAP_BITS, HEIGHTMAP_CELLS);
+        let section_cells: Vec<Vec<u32>> = (0..SECTION_SPAN)
+            .map(|s| unpack_section(&chunk, s))
+            .collect();
+        let air = resolve_states(&registry()).unwrap().air;
+        for column in 0..HEIGHTMAP_CELLS {
+            let mut expected = 0u16;
+            for layer in (0..WORLD_LAYERS).rev() {
+                let section = layer / SECTION_EDGE;
+                let ly = layer % SECTION_EDGE;
+                if section_cells[section][ly * 256 + column] != air {
+                    expected = layer as u16 + 1;
+                    break;
+                }
+            }
+            assert_eq!(values[column], expected, "column {column}");
+        }
+        let again = gen.generate(0, 0);
+        assert_eq!(again.encode(), chunk.encode(), "same seed refills");
+        // Chunk-order independence: emitting a neighbor leaves this chunk
+        // stable.
+        let _ = HeightmapGenerator::with_seed(42, &registry())
+            .unwrap()
+            .generate(1, 0);
+        assert_eq!(gen.generate(0, 0).encode(), chunk.encode());
     }
 }

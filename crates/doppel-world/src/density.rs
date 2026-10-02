@@ -1979,11 +1979,13 @@ impl NoiseTerrain {
         {
             return 2.0;
         }
-        let fluid_diff = (first.level - second.level).abs();
+        // Level arithmetic wraps like the reference int math when a level
+        // sits below the world floor.
+        let fluid_diff = first.level.wrapping_sub(second.level).wrapping_abs();
         if fluid_diff == 0 {
             return 0.0;
         }
-        let average = 0.5 * (first.level + second.level) as f64;
+        let average = 0.5 * f64::from(first.level.wrapping_add(second.level));
         let above_average = f64::from(y) + 0.5 - average;
         let base = fluid_diff as f64 / 2.0;
         let towards_middle = base - above_average.abs();
@@ -2251,7 +2253,7 @@ impl NoiseTerrain {
                             look -= 1;
                         }
                     }
-                    walk.stone_below = y - next_ceiling + 1;
+                    walk.stone_below = y.wrapping_sub(next_ceiling).wrapping_add(1);
                     walk.stone_above += 1;
                     let replaced = try_apply(&self.rule, &mut job, ctx, &walk, bx, y, bz);
                     if let Some(state) = replaced {
