@@ -311,7 +311,7 @@ fn build_heightmaps(anvil: &Chunk) -> Vec<(u32, Vec<u64>)> {
 /// the mask and carries its 2048 nibble-packed bytes; absent layers are
 /// not represented. Bit index = light section index (section y + 5).
 fn build_light(anvil: &Chunk) -> WireLight {
-    const LIGHT_SECTIONS: usize = 30; // light sections -5..=24 inclusive
+    const LIGHT_SECTIONS: usize = 26; // light sections -5..=20 inclusive
     let mut sky_mask = vec![false; LIGHT_SECTIONS];
     let mut block_mask = vec![false; LIGHT_SECTIONS];
     let mut empty_sky = vec![false; LIGHT_SECTIONS];
