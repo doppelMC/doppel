@@ -125,6 +125,7 @@ dependencies = [
  "anyhow",
  "doppel-protocol",
  "doppel-world",
+ "flate2",
  "hex",
  "md-5",
  "serde",
