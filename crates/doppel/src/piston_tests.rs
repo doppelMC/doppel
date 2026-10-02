@@ -40,6 +40,13 @@ fn harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
 /// Runs one scripted command (`setblock ...` or `tick step N`).
 pub fn cmd(g: &mut Game, s: &str) {
     let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() == 2 && parts[0] == "tick" && parts[1] == "freeze" {
+        g.handle(Inbound::TickFreeze {
+            conn: 0,
+            frozen: true,
+        });
+        return;
+    }
     if parts[0] == "tick" {
         g.handle(Inbound::TickStep {
             conn: 0,
@@ -441,6 +448,7 @@ fn lever_state_ids() {
 #[test]
 fn serve_loop_burst_sim() {
     let script: Vec<&str> = vec![
+        "tick freeze",
         "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
         "tick step 1",
         "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
@@ -537,7 +545,13 @@ fn serve_loop_burst_sim() {
     // forwarding a rapid command volley.
     for c in &script {
         let parts: Vec<&str> = c.split_whitespace().collect();
-        if parts[0] == "tick" {
+        if parts.len() == 2 && parts[0] == "tick" && parts[1] == "freeze" {
+            tx.send(Inbound::TickFreeze {
+                conn: 0,
+                frozen: true,
+            })
+            .unwrap();
+        } else if parts[0] == "tick" {
             tx.send(Inbound::TickStep {
                 conn: 0,
                 steps: parts[2].parse().unwrap(),
@@ -791,9 +805,6 @@ fn broadcast_stream_trace() {
         }
     };
     for (i, c) in script.iter().enumerate() {
-        if *c == "tick freeze" {
-            continue; // the serve path ignores it too (unhandled command)
-        }
         let before = writes.len();
         cmd(&mut g, c);
         // tick step N runs its ticks inside handle(); a setblock's updates

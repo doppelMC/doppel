@@ -70,6 +70,13 @@ pub enum Inbound {
         conn: ConnId,
         steps: u32,
     },
+    /// `tick freeze` / `tick unfreeze`: while frozen the wall-clock tick
+    /// loop suspends; `tick step N` still runs its ticks, exactly the
+    /// reference's frozen stepping semantics.
+    TickFreeze {
+        conn: ConnId,
+        frozen: bool,
+    },
     Left {
         conn: ConnId,
     },
@@ -118,6 +125,8 @@ pub struct Game {
     registry: Option<doppel_world::registry::BlockRegistry>,
     /// Dedup guard for dropped-world-write warnings: (cx, cz, reason).
     warned_writes: std::collections::BTreeSet<(i32, i32, String)>,
+    /// `/tick freeze`: wall-clock ticks suspend; steps still run.
+    frozen: bool,
     /// Flat-world generator: the fallback for chunks the Anvil store does
     /// not have, built from the same registry pins.
     flat: Option<doppel_world::worldgen::FlatGenerator>,
@@ -226,6 +235,7 @@ impl Game {
             blobs,
             dirty: std::collections::BTreeMap::new(),
             warned_writes: std::collections::BTreeSet::new(),
+            frozen: false,
             registry: doppel_protocol::find_repo_root().ok().and_then(|r| {
                 let p = r.join("pins").join("blocks.json");
                 p.exists()
@@ -275,7 +285,10 @@ impl Game {
             // The flush now happens inside game_tick at vanilla's
             // broadcast point; edits from the block-event/BE phases below
             // it deliberately stay pending until the next tick's flush.
-            self.game_tick();
+            // A frozen clock only advances through explicit `tick step`s.
+            if !self.frozen {
+                self.game_tick();
+            }
             self.tick_keep_alives();
         }
     }
@@ -439,6 +452,9 @@ impl Game {
                 for _ in 0..steps {
                     self.game_tick();
                 }
+            }
+            Inbound::TickFreeze { conn: _, frozen } => {
+                self.frozen = frozen;
             }
         }
     }

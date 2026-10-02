@@ -751,7 +751,7 @@ pub fn parity_blocks() -> Result<bool> {
         &login,
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(5)),
-            max_packets: Some(300),
+            max_packets: Some(600),
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,
@@ -781,7 +781,7 @@ pub fn parity_blocks() -> Result<bool> {
         &login,
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(5)),
-            max_packets: Some(300),
+            max_packets: Some(1200),
             dump_dir: None,
             commands: &commands,
             walk_chunks: None,

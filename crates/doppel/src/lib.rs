@@ -334,6 +334,22 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     return Some(game::Inbound::TickStep { conn, steps });
                 }
             }
+            // `tick freeze` / `tick unfreeze` gate the wall-clock loop;
+            // stepped ticks still advance a frozen clock.
+            if parts.len() == 2 && parts[0] == "tick" {
+                match parts[1] {
+                    "freeze" => {
+                        return Some(game::Inbound::TickFreeze { conn, frozen: true });
+                    }
+                    "unfreeze" => {
+                        return Some(game::Inbound::TickFreeze {
+                            conn,
+                            frozen: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
             None
         }
         _ => None,
