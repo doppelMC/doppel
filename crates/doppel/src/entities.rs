@@ -80,8 +80,9 @@ const PICKUP_UP: f64 = 1.8 + 0.5;
 const TRACK_RANGE: f64 = 96.0;
 /// The default stack cap merges honor.
 const MAX_MERGE: i32 = 64;
-/// Random ticks per randomly-ticking section per tick (randomTickSpeed).
-const TICK_SPEED: usize = 3;
+/// Random ticks per randomly-ticking section per tick (the
+/// randomTickSpeed gamerule's default).
+const DEFAULT_TICK_SPEED: usize = 3;
 /// Spread attempts a healthy grass block gets per random tick.
 const SPREAD_ATTEMPTS: usize = 4;
 
@@ -268,9 +269,8 @@ impl ItemEntity {
         }
     }
 
-    /// The spawn pairing: add_entity (a fresh pairing carries the
-    /// zero-initialized last-sent movement) followed by the stack's
-    /// entity data.
+    /// The spawn pairing: add_entity (carrying the spawn velocity as the
+    /// movement vector) followed by the stack's entity data.
     fn pairing_frames(&self) -> Vec<(i32, Vec<u8>)> {
         vec![
             (
@@ -282,7 +282,7 @@ impl ItemEntity {
                     self.x,
                     self.y,
                     self.z,
-                    (0.0, 0.0, 0.0),
+                    (self.vx, self.vy, self.vz),
                     0.0,
                     0.0,
                     0.0,
@@ -299,19 +299,34 @@ impl ItemEntity {
 
 /// Survival state the game thread owns: live drops plus the random-tick
 /// bookkeeping.
-#[derive(Default)]
 pub(crate) struct SurvivalState {
     items: Vec<ItemEntity>,
     /// Seed for the drop uuid splitmix stream.
     uuid_seed: u64,
     /// Seed for the spread-target picks.
     spread_seed: u64,
+    /// Picks per randomly ticking section per tick (randomTickSpeed).
+    tick_speed: usize,
     /// The per-level random tick LCG (`randValue`).
     rand_value: i32,
     /// Sections holding a randomly ticking block; `unknown` holds the
     /// ones already scanned.
     ticking: BTreeSet<(i32, i32, i32)>,
     unknown: BTreeSet<(i32, i32, i32)>,
+}
+
+impl Default for SurvivalState {
+    fn default() -> Self {
+        SurvivalState {
+            items: Vec::new(),
+            uuid_seed: 0,
+            spread_seed: 0,
+            tick_speed: DEFAULT_TICK_SPEED,
+            rand_value: 0,
+            ticking: BTreeSet::new(),
+            unknown: BTreeSet::new(),
+        }
+    }
 }
 
 impl SurvivalState {
@@ -973,7 +988,7 @@ impl Game {
                     continue;
                 }
                 let base_y = (sy - 4) * 16;
-                for _ in 0..TICK_SPEED {
+                for _ in 0..self.survival.tick_speed {
                     // The per-level LCG; chunk iteration order is this
                     // build's own (the reference shares the stream across
                     // its tick-chunk order).
@@ -1032,7 +1047,9 @@ impl Game {
             }
         }
         for (x, y, z) in spread {
-            if let Some(state) = self.resolve_state("minecraft:grass_block") {
+            // The default grass state: the registry lists snowy=true first,
+            // but a spread plant is snowy=false.
+            if let Some(state) = self.resolve_state("minecraft:grass_block[snowy=false]") {
                 self.set_block(x, y, z, state, true);
             }
         }
@@ -1084,6 +1101,11 @@ impl Game {
     pub(crate) fn invalidate_section_ticks(&mut self, cx: i32, cz: i32, sy: i32) {
         self.survival.ticking.remove(&(cx, cz, sy));
         self.survival.unknown.remove(&(cx, cz, sy));
+    }
+
+    /// `gamerule random_tick_speed N`: picks per randomly ticking section.
+    pub(crate) fn set_tick_speed(&mut self, speed: usize) {
+        self.survival.tick_speed = speed;
     }
 
     /// Sky exposure standing in for the brightness check: no
@@ -1610,6 +1632,37 @@ mod tests {
             g.block_label_for_test(5, 99, 5)
                 .starts_with("minecraft:grass_block"),
             "a torch passes light"
+        );
+    }
+
+    #[test]
+    fn gamerule_randomtickspeed_accelerates_decay() {
+        let (mut g, _rx) = harness();
+        for x in 4..8 {
+            for z in 4..8 {
+                g.handle(Inbound::Setblock {
+                    conn: 0,
+                    x,
+                    y: 100,
+                    z,
+                    name: "minecraft:stone".to_string(),
+                });
+            }
+        }
+        g.set_tick_speed(400);
+        for _ in 0..50 {
+            g.random_ticks();
+        }
+        let dirt = (4..8)
+            .flat_map(|x| (4..8).map(move |z| (x, z)))
+            .filter(|&(x, z)| {
+                g.block_label_for_test(x, 99, z)
+                    .starts_with("minecraft:dirt")
+            })
+            .count();
+        assert!(
+            dirt >= 12,
+            "{dirt}/16 capped cells decayed in 50 fast ticks"
         );
     }
 }

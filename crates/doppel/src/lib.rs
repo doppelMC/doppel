@@ -433,6 +433,27 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     count,
                 });
             }
+            // --- survival hooks (entities.rs) ---
+            // `gamerule random_tick_speed N`: the random tick rate the
+            // survival gate amplifies its decay window with (the rule is
+            // snake_case on the wire).
+            if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "random_tick_speed" {
+                if let Ok(speed) = parts[2].parse::<usize>() {
+                    return Some(game::Inbound::GameRule {
+                        conn,
+                        tick_speed: speed,
+                    });
+                }
+            }
+            // Spawner gamerules silence the reference's mobs; nothing to
+            // spawn here, but the reply must come.
+            if parts.len() == 3
+                && parts[0] == "gamerule"
+                && parts[1].starts_with("spawn_")
+                && parts[2].parse::<bool>().is_ok()
+            {
+                return Some(game::Inbound::GameRuleNoop { conn });
+            }
             // --- containers hooks (containers.rs) ---
             // `opencontainer x y z`: the container test driver.
             if parts.len() == 5 && parts[0] == "opencontainer" {

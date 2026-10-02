@@ -109,6 +109,17 @@ pub enum Inbound {
         item: String,
         count: i32,
     },
+    // --- survival hooks (entities.rs) ---
+    /// `gamerule random_tick_speed N`: the random tick rate.
+    GameRule {
+        conn: ConnId,
+        tick_speed: usize,
+    },
+    /// A spawner gamerule (`spawn_mobs` and kin): a no-op here, this
+    /// build has no mob spawning.
+    GameRuleNoop {
+        conn: ConnId,
+    },
     // --- placement hooks (placement.rs) ---
     /// `move_player_rot`: view rotation without movement.
     Rotated {
@@ -658,6 +669,14 @@ impl Game {
             }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
+                self.send_command_feedback(conn);
+            }
+            // --- survival hooks (entities.rs) ---
+            Inbound::GameRule { conn, tick_speed } => {
+                self.set_tick_speed(tick_speed);
+                self.send_command_feedback(conn);
+            }
+            Inbound::GameRuleNoop { conn } => {
                 self.send_command_feedback(conn);
             }
             // --- placement hooks (placement.rs) ---

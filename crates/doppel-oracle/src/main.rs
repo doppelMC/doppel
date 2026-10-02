@@ -4,6 +4,7 @@ mod bot;
 mod capture;
 mod parity;
 mod parity_break;
+mod parity_survival;
 mod parity_worldgen;
 mod registry;
 mod scenario;
@@ -25,6 +26,8 @@ fn usage() -> ! {
                                        terrain, capture the spawn chunks, and
                                        structurally diff them against the
                                        seeded terrain generator
+  doppel-oracle parity-survival     differential test: drops, pickup, grass
+                                       decay/spread (break + random ticks)
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
                                       record vanilla's login transcript; with a
                                       blobs dir, dump byte-exact packet bodies
@@ -65,6 +68,11 @@ fn run() -> Result<()> {
         }
         Some("parity-break") => {
             if !parity_break::parity_break()? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-survival") => {
+            if !parity_survival::parity_survival()? {
                 std::process::exit(1);
             }
         }

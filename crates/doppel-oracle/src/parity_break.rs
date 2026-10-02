@@ -46,7 +46,7 @@ fn build_player_action(action: i32, x: i32, y: i32, z: i32, sequence: i32) -> Ve
 }
 
 /// Recursively copies a directory (a tiny std-only `cp -r`).
-fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+pub(crate) fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -61,7 +61,7 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn default_doppel_bin() -> Result<PathBuf> {
+pub(crate) fn default_doppel_bin() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("DOPPEL_BIN") {
         let path = PathBuf::from(path);
         if path.exists() {
@@ -85,7 +85,7 @@ fn default_doppel_bin() -> Result<PathBuf> {
     )
 }
 
-fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
+pub(crate) fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -101,7 +101,7 @@ fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
 /// Boots vanilla WITHOUT running any commands, captures the clean join
 /// transcript as replay blobs, and snapshots the pristine flat world
 /// (doppel boots against both).
-fn capture_clean_blobs(
+pub(crate) fn capture_clean_blobs(
     pin: &doppel_protocol::Pin,
     jar: &std::path::Path,
     blobs_dir: &std::path::Path,
@@ -160,7 +160,9 @@ fn capture_clean_blobs(
 
 /// Decodes a captured update stream (0x08 + 0x56 packets) into ordered
 /// (pos, state, t_ms) writes.
-fn decode_update_writes(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), u32, u64)> {
+pub(crate) fn decode_update_writes(
+    pkts: &[&bot::CapturedPacket],
+) -> Vec<((i32, i32, i32), u32, u64)> {
     let mut out = Vec::new();
     for p in pkts {
         let raw = hex::decode(&p.head_hex).unwrap_or_default();
