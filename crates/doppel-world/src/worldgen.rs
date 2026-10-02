@@ -282,7 +282,7 @@ impl FlatGenerator {
 
 /// Java `BitSet.toByteArray`: bit k lives in byte k/8, LSB-first, trailing
 /// zero bytes trimmed (an empty set serializes to no bytes at all).
-fn mask_bytes(bits: &[usize]) -> Vec<u8> {
+pub(crate) fn mask_bytes(bits: &[usize]) -> Vec<u8> {
     let Some(&top) = bits.last() else {
         return Vec::new();
     };

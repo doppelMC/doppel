@@ -558,7 +558,7 @@ pub struct OctaveSpec {
     pub base_octave: i32,
     pub octave_count: usize,
     pub base_amplitude: f64,
-    pub amplitude_modifiers: Vec<f64>,
+    pub amplitude_modifiers: &'static [f64],
 }
 
 struct OctaveLayer {
@@ -761,7 +761,7 @@ mod tests {
             base_octave: -9,
             octave_count: 9,
             base_amplitude: 0.8880832896205223,
-            amplitude_modifiers: vec![1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0],
+            amplitude_modifiers: &[1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0],
         }
     }
 
