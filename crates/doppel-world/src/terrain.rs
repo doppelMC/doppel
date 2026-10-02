@@ -59,6 +59,13 @@ const SURFACE: OctaveSpec = OctaveSpec {
     base_amplitude: 0.9381732587751008,
     amplitude_modifiers: &[],
 };
+/// Offset stack: the per-world phase shift applied to climate sampling.
+const OFFSET: OctaveSpec = OctaveSpec {
+    base_octave: -3,
+    octave_count: 4,
+    base_amplitude: 0.9381732587751005,
+    amplitude_modifiers: &[1.0, 1.0, 1.0, 0.0],
+};
 
 /// Continental position to base height: deep ocean floor rising through
 /// shelf and coast to inland hills and mountains.
@@ -77,6 +84,17 @@ const HEIGHT_SPLINE: [(f64, f64); 9] = [
 /// Relief weight: flat over the ocean, full over inland continental mass.
 fn gain(continental: f64) -> f64 {
     0.4 + 0.85 * (continental + 0.2).clamp(0.0, 1.0)
+}
+
+/// Climate stacks sample the 4-block cell grid: quarter-block coordinates,
+/// phase-shifted per world by the shared offset stack. The z shift samples
+/// that stack with its horizontal inputs swapped.
+fn climate(stack: &OctaveNoise, offset: &OctaveNoise, wx: i32, wz: i32) -> f64 {
+    let qx = wx as f64 * 0.25;
+    let qz = wz as f64 * 0.25;
+    let shift_x = f64::from(offset.sample_3d(qx, 0.0, qz)) * 4.0;
+    let shift_z = f64::from(offset.sample_3d(qz, qx, 0.0)) * 4.0;
+    f64::from(stack.sample_3d(qx + shift_x, 0.0, qz + shift_z))
 }
 
 fn spline_height(continental: f64) -> f64 {
@@ -112,6 +130,7 @@ pub struct HeightmapGenerator {
     erosion: OctaveNoise,
     peaks: OctaveNoise,
     surface: OctaveNoise,
+    offset: OctaveNoise,
     states: SurfaceStates,
     biome: u32,
 }
@@ -135,19 +154,24 @@ impl HeightmapGenerator {
             air: resolve("minecraft:air", "")?,
         };
         let world = world_positional(seed);
-        let mut continental_rng = world.from_name("continental");
+        // Layer seeds hash the full registry identifier of each noise, so
+        // the strings carry the namespace.
+        let mut continental_rng = world.from_name("minecraft:continentalness");
         let continental = OctaveNoise::new(&CONTINENTAL, &mut continental_rng);
-        let mut erosion_rng = world.from_name("erosion");
+        let mut erosion_rng = world.from_name("minecraft:erosion");
         let erosion = OctaveNoise::new(&EROSION, &mut erosion_rng);
-        let mut peaks_rng = world.from_name("peaks");
+        let mut peaks_rng = world.from_name("minecraft:ridge");
         let peaks = OctaveNoise::new(&PEAKS, &mut peaks_rng);
-        let mut surface_rng = world.from_name("surface");
+        let mut surface_rng = world.from_name("minecraft:surface");
         let surface = OctaveNoise::new(&SURFACE, &mut surface_rng);
+        let mut offset_rng = world.from_name("minecraft:offset");
+        let offset = OctaveNoise::new(&OFFSET, &mut offset_rng);
         Ok(HeightmapGenerator {
             continental,
             erosion,
             peaks,
             surface,
+            offset,
             states,
             biome: PLAINS_BIOME_ID,
         })
@@ -155,9 +179,9 @@ impl HeightmapGenerator {
 
     /// World y of the topmost solid block in the column.
     pub fn column_top(&self, wx: i32, wz: i32) -> i32 {
-        let continental = f64::from(self.continental.sample_2d(wx as f64, wz as f64));
-        let erosion = f64::from(self.erosion.sample_2d(wx as f64, wz as f64));
-        let peaks = f64::from(self.peaks.sample_2d(wx as f64, wz as f64));
+        let continental = climate(&self.continental, &self.offset, wx, wz);
+        let erosion = climate(&self.erosion, &self.offset, wx, wz);
+        let peaks = climate(&self.peaks, &self.offset, wx, wz);
         let surface = f64::from(self.surface.sample_2d(wx as f64, wz as f64));
         let height = spline_height(continental)
             + gain(continental) * (14.0 * erosion + 7.0 * peaks)

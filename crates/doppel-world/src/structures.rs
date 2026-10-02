@@ -360,34 +360,44 @@ mod tests {
         cells[ly * 256 + lz * 16 + lx]
     }
 
-    /// Feature chunk (51, 15) at seed 42 lands its well on ground with the
-    /// center column at x=830, so the rim crosses into chunk (52, 15).
+    /// Feature chunk (-347, 388) at seed 42 lands its well on high ground
+    /// with the center column at x=-5537 (local 15), so the rim crosses
+    /// into chunk (-346, 388).
     #[test]
     fn well_places_and_clips_across_the_chunk_border() {
         let reg = registry();
         let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
         let well = WellBlocks::from_registry(&reg).unwrap();
-        let a = generate_chunk(&terrain, &well, 42, 51, 15);
-        let b = generate_chunk(&terrain, &well, 42, 52, 15);
+        let a = generate_chunk(&terrain, &well, 42, -347, 388);
+        let b = generate_chunk(&terrain, &well, 42, -346, 388);
 
         let sandstone = well.sandstone;
         let water = well.water;
-        // The basin center at (830, 240), base = column top there; the rim
-        // spans two layers and crosses x=832 into chunk 52.
-        let base = terrain.column_top(830, 240);
+        // The basin center at (-5537, 6213), base = column top there; this
+        // piece draws one rim layer and the floor crosses x=-5536 into
+        // chunk -346.
+        let base = terrain.column_top(-5537, 6213);
         assert!(base > SEA_LEVEL, "test target is on land");
-        assert_eq!(block_at(&a, 830, base, 240), water, "basin center");
-        assert_eq!(block_at(&a, 829, base, 240), water, "basin interior");
-        assert_eq!(block_at(&a, 828, base, 240), sandstone, "floor ring");
-        assert_eq!(block_at(&a, 828, base + 1, 240), sandstone, "rim layer 1");
-        assert_eq!(block_at(&a, 828, base + 2, 240), sandstone, "rim layer 2");
-        assert_eq!(block_at(&b, 832, base, 240), sandstone, "floor spills over");
-        assert_eq!(block_at(&b, 832, base + 1, 240), sandstone, "east rim");
-        // The far side of chunk 52 is untouched terrain: the clipped volume
-        // wrote nothing beyond x=832.
-        assert_ne!(block_at(&b, 833, base + 1, 240), sandstone);
+        assert_eq!(block_at(&a, -5537, base, 6213), water, "basin center");
+        assert_eq!(block_at(&a, -5538, base, 6213), water, "basin interior");
+        assert_eq!(block_at(&a, -5539, base, 6213), sandstone, "floor ring");
+        assert_eq!(block_at(&a, -5539, base + 1, 6213), sandstone, "rim layer");
+        assert_ne!(
+            block_at(&a, -5539, base + 2, 6213),
+            sandstone,
+            "single rim layer"
+        );
+        assert_eq!(
+            block_at(&b, -5535, base, 6213),
+            sandstone,
+            "floor spills over"
+        );
+        assert_eq!(block_at(&b, -5535, base + 1, 6213), sandstone, "east rim");
+        // The far side of the neighbor is untouched terrain: the clipped
+        // volume wrote nothing beyond the well edge.
+        assert_ne!(block_at(&b, -5534, base + 1, 6213), sandstone);
         // The basin interior opens to the sky above the water.
-        assert_eq!(block_at(&a, 830, base + 1, 240), 0);
+        assert_eq!(block_at(&a, -5537, base + 1, 6213), 0);
     }
 
     #[test]
