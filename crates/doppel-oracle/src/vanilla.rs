@@ -129,6 +129,28 @@ pub fn boot(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer
     boot_with_properties(pin, jar, port, &properties)
 }
 
+/// Boots vanilla for the survival gate: the flat configuration plus
+/// peaceful difficulty. Spawner gamerules only stop future spawns, so a
+/// normal boot keeps whatever mob swarm built up before the scripted
+/// volley lands - and a swarm can shove or kill the scenario's player.
+/// Peaceful difficulty holds monsters out entirely; drops, pickup, and
+/// random ticks are difficulty-independent.
+pub fn boot_peaceful(pin: &Pin, jar: &std::path::Path, port: u16) -> Result<VanillaServer> {
+    let properties = format!(
+        "online-mode=false\n\
+         white-list=false\n\
+         server-port={port}\n\
+         level-type=minecraft\\:flat\n\
+         generate-structures=false\n\
+         view-distance=4\n\
+         simulation-distance=4\n\
+         spawn-protection=0\n\
+         sync-chunk-writes=false\n\
+         difficulty=peaceful\n"
+    );
+    boot_with_properties(pin, jar, port, &properties)
+}
+
 /// Boots vanilla with a pinned seed and normal terrain generation, for
 /// worldgen parity comparisons.
 pub fn boot_seeded(
@@ -181,10 +203,12 @@ fn boot_with_properties(
     std::fs::write(run_dir.join("server.properties"), properties)
         .context("writing server.properties")?;
 
-    // Op the capture bot so scenarios can run commands (/tick, /setblock,
-    // /data). The offline-mode profile UUID for "Doppel" is deterministic
-    // (UUIDv3 of "OfflinePlayer:Doppel"), so the same entry works every run.
-    let ops = r#"[{"uuid": "97e9cb14-470c-3c15-a976-2b16dcd2e827", "name": "Doppel", "level": 4, "bypassesPlayerLimit": true}]
+    // Op the capture bots so scenarios can run commands (/tick, /setblock,
+    // /data). The offline-mode profile UUIDs are deterministic (UUIDv3 of
+    // "OfflinePlayer:<name>"), so the same entries work every run. The
+    // witness bot needs it to teleport away from the (variable) world
+    // spawn before the scenario runs.
+    let ops = r#"[{"uuid": "97e9cb14-470c-3c15-a976-2b16dcd2e827", "name": "Doppel", "level": 4, "bypassesPlayerLimit": true}, {"uuid": "c82d9a9e-f1aa-33eb-9328-3cc5d6797842", "name": "Doppelist", "level": 4, "bypassesPlayerLimit": true}]
 "#;
     std::fs::write(run_dir.join("ops.json"), ops).context("writing ops.json")?;
 

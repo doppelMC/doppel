@@ -109,6 +109,17 @@ pub enum Inbound {
         item: String,
         count: i32,
     },
+    // --- survival hooks (entities.rs) ---
+    /// `gamerule random_tick_speed N`: the random tick rate.
+    GameRule {
+        conn: ConnId,
+        tick_speed: usize,
+    },
+    /// A spawner gamerule (`spawn_mobs` and kin): a no-op here, this
+    /// build has no mob spawning.
+    GameRuleNoop {
+        conn: ConnId,
+    },
     // --- placement hooks (placement.rs) ---
     /// `move_player_rot`: view rotation without movement.
     Rotated {
@@ -278,6 +289,9 @@ pub struct Game {
     containers: containers::ContainersState,
     /// Per-join entity ids for destruction overlays (see Player).
     next_entity_id: i32,
+    // --- survival hooks (entities.rs) ---
+    /// Live item entities and the random-tick bookkeeping.
+    survival: entities::SurvivalState,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -354,6 +368,10 @@ mod comparator;
 #[path = "containers.rs"]
 pub(crate) mod containers;
 
+// --- survival hooks (entities.rs) ---
+#[path = "entities.rs"]
+pub(crate) mod entities;
+
 const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -394,6 +412,7 @@ impl Game {
             comparator_outputs: std::collections::HashMap::new(),
             containers: Default::default(),
             next_entity_id: 1,
+            survival: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -445,6 +464,10 @@ impl Game {
     /// One game tick (50ms): fire scheduled actions, then housekeeping.
     fn game_tick(&mut self) {
         self.tick += 1;
+        // --- survival hooks (entities.rs) ---
+        // The entity pass runs first: a drop spawned last tick moves
+        // before this tick's breaks land.
+        self.tick_entities();
         // Dig progress advances with the tick counter (the reference's
         // per-player game mode tick); breaks land in this tick's flush.
         self.advance_digs();
@@ -500,6 +523,10 @@ impl Game {
                 TickAction::ComparatorToggle => self.comparator_toggle(x, y, z),
             }
         }
+        // --- survival hooks (entities.rs) ---
+        // Random ticks (the chunk tick's grass pass) land their writes in
+        // this tick's flush.
+        self.random_ticks();
         // Vanilla's broadcast point (`ServerChunkCache.tick` inside
         // `ServerLevel.tick`) sits AFTER the scheduled-tick phase but
         // BEFORE block events: world edits made by pistons below
@@ -642,6 +669,14 @@ impl Game {
             }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
+                self.send_command_feedback(conn);
+            }
+            // --- survival hooks (entities.rs) ---
+            Inbound::GameRule { conn, tick_speed } => {
+                self.set_tick_speed(tick_speed);
+                self.send_command_feedback(conn);
+            }
+            Inbound::GameRuleNoop { conn } => {
                 self.send_command_feedback(conn);
             }
             // --- placement hooks (placement.rs) ---
@@ -1009,37 +1044,56 @@ impl Game {
         self.broadcast_destruction(conn, pos, -1);
     }
 
-    /// Removes the block (air + neighbor notifications + broadcast);
-    /// the surrounding removal choreography (pairing, drops) is the
-    /// set_block path's own.
+    /// Removes the block (air + neighbor notifications + broadcast) and
+    /// spawns its drop; the surrounding removal choreography (pairing) is
+    /// the set_block path's own.
     fn break_block(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
-        let _ = conn;
-        // NOTE(breaking): drops are discarded (no item entities yet);
-        // the survival loop's pickup half waits on them.
+        // --- survival hooks (entities.rs) ---
+        // Creative breaks keep no drops; tool-gated blocks drop nothing
+        // bare-handed (that gate lives in spawn_break_drop).
+        let creative = self.players.get(&conn).is_some_and(|p| p.inv.creative);
+        let name = self
+            .get_block(pos.0, pos.1, pos.2)
+            .map(|(n, _)| n)
+            .filter(|n| n != "minecraft:air");
         self.set_block(pos.0, pos.1, pos.2, AIR_STATE, true);
+        if !creative {
+            if let Some(name) = name {
+                self.spawn_break_drop(pos, &name);
+            }
+        }
     }
 
     /// Spends the held stack: whole stack for drop-all, one item for the
-    /// single drop. The discarded half is the same gap as break drops.
-    /// The slot change queues for the per-tick menu broadcast like any
-    /// other non-click change.
+    /// single drop. The discarded half spawns a thrown item entity; the
+    /// slot change queues for the per-tick menu broadcast like any other
+    /// non-click change.
     fn drop_held(&mut self, conn: ConnId, all: bool) {
-        let Some(p) = self.players.get_mut(&conn) else {
-            return;
+        let dropped = {
+            let Some(p) = self.players.get_mut(&conn) else {
+                return;
+            };
+            let slot = p.inv.inventory.selected() as usize;
+            let held = p.inv.inventory.get(slot);
+            if held.is_none() {
+                return;
+            }
+            let (dropped, remaining) = if all {
+                (held, None)
+            } else {
+                let mut stack = held.expect("held");
+                let one = stack.split(1);
+                let remaining = (!stack.is_empty()).then_some(stack);
+                (Some(one), remaining)
+            };
+            p.inv.inventory.set(slot, remaining);
+            p.inv.pending_sync.insert(slot);
+            dropped
         };
-        let slot = p.inv.inventory.selected() as usize;
-        let held = p.inv.inventory.get(slot);
-        if held.is_none() {
-            return;
+        // --- survival hooks (entities.rs) ---
+        if let Some(stack) = dropped {
+            self.spawn_thrown_drop(conn, stack);
         }
-        let remaining = if all {
-            None
-        } else {
-            held.map(|s| s.with_count(s.count() - 1))
-                .filter(|s| !s.is_empty())
-        };
-        p.inv.inventory.set(slot, remaining);
-        p.inv.pending_sync.insert(slot);
     }
 
     /// Per-tick dig advance: delayed destroys finish, active digs deepen
@@ -1327,6 +1381,9 @@ impl Game {
             return;
         }
         chunk.version += 1;
+        // --- survival hooks (entities.rs) ---
+        // A write re-arms the section's random-tick scan.
+        self.invalidate_section_ticks(cx, cz, y.div_euclid(16) + 4);
         self.dirty
             .entry((cx, cz, y.div_euclid(16)))
             .or_default()
