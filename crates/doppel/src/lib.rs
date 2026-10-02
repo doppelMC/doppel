@@ -282,6 +282,7 @@ fn handle_login(
 /// shifts. Unknown packets are ignored, matching vanilla's tolerance for
 /// forward-compat channels.
 fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound> {
+    eprintln!("[doppel] play 0x{id:02x} len {}", body.len());
     let mut r = Reader::new(body);
     match id {
         0x1c => {

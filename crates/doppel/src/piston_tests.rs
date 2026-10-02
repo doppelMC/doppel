@@ -496,6 +496,37 @@ fn ci_placement_path_repro() {
 }
 
 #[test]
+fn play_event_accepts_bot_use_item_on() {
+    let mut body = Vec::new();
+    body.push(0); // hand
+    let packed: i64 = (1i64 << 38) | (1i64 << 12) | (-60i64 & 0xfff);
+    body.extend_from_slice(&packed.to_be_bytes());
+    body.push(1); // face up
+    body.extend_from_slice(&0.5f32.to_be_bytes());
+    body.extend_from_slice(&1.0f32.to_be_bytes());
+    body.extend_from_slice(&0.5f32.to_be_bytes());
+    body.push(0);
+    body.push(0);
+    body.push(1); // sequence
+    let event =
+        crate::play_event(7, 0x42, &body).expect("the bot's use_item_on frame must translate");
+    match event {
+        Inbound::UseItemOn {
+            conn,
+            x,
+            y,
+            z,
+            face,
+            ..
+        } => {
+            assert_eq!(conn, 7);
+            assert_eq!((x, y, z, face), (1, -60, 1, 1));
+        }
+        _ => panic!("wrong event variant"),
+    }
+}
+
+#[test]
 fn lever_state_ids() {
     let (_tx, _rx) = std::sync::mpsc::channel::<Inbound>();
     let g = Game::new(_rx, None, None);
