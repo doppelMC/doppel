@@ -3,6 +3,7 @@
 mod bot;
 mod capture;
 mod parity;
+mod parity_worldgen;
 mod registry;
 mod scenario;
 mod vanilla;
@@ -19,6 +20,10 @@ fn usage() -> ! {
   doppel-oracle status <host> <port>  ping any server and print its status JSON
   doppel-oracle parity-status         differential test: vanilla oracle vs doppel
                                        (set DOPPEL_BIN=<path> to override the binary)
+  doppel-oracle parity-worldgen       boot vanilla at a pinned seed with normal
+                                       terrain, capture the spawn chunks, and
+                                       structurally diff them against the
+                                       seeded terrain generator
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
                                       record vanilla's login transcript; with a
                                       blobs dir, dump byte-exact packet bodies
@@ -49,6 +54,11 @@ fn run() -> Result<()> {
         }
         Some("parity-status") => {
             if !parity::parity_status(None)? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-worldgen") => {
+            if !parity_worldgen::run()? {
                 std::process::exit(1);
             }
         }
