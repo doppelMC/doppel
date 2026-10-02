@@ -4,6 +4,7 @@
 
 pub mod blobs;
 pub mod game;
+pub mod inventory;
 pub mod wire;
 
 #[cfg(test)]
@@ -334,7 +335,36 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     return Some(game::Inbound::TickStep { conn, steps });
                 }
             }
+            // `give @s <item> [count]`: the inventory test driver. The
+            // item name resolves (or fails) game-side against the learned
+            // id table, like setblock.
+            if (parts.len() == 3 || parts.len() == 4) && parts[0] == "give" && parts[1] == "@s" {
+                let count = if parts.len() == 4 {
+                    parts[3].parse::<i32>().ok()?
+                } else {
+                    1
+                };
+                return Some(game::Inbound::Give {
+                    conn,
+                    item: parts[2].to_string(),
+                    count,
+                });
+            }
             None
+        }
+        // --- inventory hooks (inventory.rs) ---
+        // set_carried_item: hotbar select, one i16 slot. The id is the
+        // 26.3 registration order (26.2's 0x35 + the inserted-punch shift)
+        // — wire-verify TODO noted in inventory.rs.
+        0x36 => {
+            let slot = inventory::parse_set_carried_item(body).ok()?;
+            Some(game::Inbound::SetCarriedItem { conn, slot })
+        }
+        // container_click: clicks against an open menu (HashedStack
+        // predictions decoded but not applied — see inventory.rs).
+        0x12 => {
+            let click = inventory::parse_container_click(body).ok()?;
+            Some(game::Inbound::ContainerClick { conn, click })
         }
         _ => None,
     }
