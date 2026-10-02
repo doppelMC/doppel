@@ -2725,6 +2725,430 @@ mod tests {
         }
     }
 
+    /// Local-vanilla coast diagnostic: reads the spawn regions saved by the
+    /// parity capture and reports where the engines split on land vs water.
+    #[test]
+    #[ignore = "needs the saved vanilla spawn world; run explicitly"]
+    fn coast_diagnostic() {
+        use crate::anvil_to_wire::unpack;
+        use crate::Region;
+        let world_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/vanilla/run/world/dimensions/minecraft/overworld/region");
+        let regions = [
+            world_dir.join("r.-1.-1.mca"),
+            world_dir.join("r.-1.0.mca"),
+            world_dir.join("r.0.-1.mca"),
+            world_dir.join("r.0.0.mca"),
+        ];
+        // Chunk coords -> per-column top non-air, ground (top non-fluid),
+        // surface biome, and per-section palette cells for block lookups.
+        struct VanillaChunk {
+            top: [i32; 256],
+            ground: [i32; 256],
+            biomes: Vec<String>,
+            sections: Vec<(i32, Vec<u16>, Vec<String>)>,
+        }
+        let mut vanilla: HashMap<(i32, i32), VanillaChunk> = HashMap::new();
+        let name_at = |c: &VanillaChunk, y: i32, column: usize| -> String {
+            let sy = y.div_euclid(16);
+            let cell = (y.rem_euclid(16) as usize) * 256 + column;
+            for (section_y, cells, palette) in &c.sections {
+                if *section_y == sy && cell < cells.len() {
+                    return palette
+                        .get(cells[cell] as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                }
+            }
+            String::new()
+        };
+        // 26.3 palette entries come in two shapes: the older bare-name
+        // string and the newer compound with an empty or "id" key.
+        let entry_name = |entry: &crate::PaletteEntry| -> String {
+            match entry {
+                crate::PaletteEntry::Other(fastnbt::Value::Compound(map)) => map
+                    .get("id")
+                    .or_else(|| map.get(""))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                other => other.name().to_string(),
+            }
+        };
+        for path in &regions {
+            let Ok(region) = Region::open(path) else {
+                continue;
+            };
+            for rx in 0..32usize {
+                for rz in 0..32usize {
+                    let Ok(Some(chunk)) = region.chunk(rx, rz) else {
+                        continue;
+                    };
+                    let mut top = [-i32::MAX; 256];
+                    let mut ground = [-i32::MAX; 256];
+                    // (section y, palette indices, palette names)
+                    let mut sections: Vec<(i32, Vec<u16>, Vec<String>)> = Vec::new();
+                    for section in &chunk.sections {
+                        let Some(states) = &section.block_states else {
+                            continue;
+                        };
+                        let palette_bits =
+                            (((states.palette.len().max(2) - 1).ilog2() + 1).max(4)) as usize;
+                        let cells: Vec<u16> = match &states.data {
+                            None => vec![0u16; 4096],
+                            Some(data) => {
+                                let longs: Vec<u64> = data.iter().map(|&v| v as u64).collect();
+                                unpack(&longs, palette_bits, 4096).into_iter().collect()
+                            }
+                        };
+                        let palette: Vec<String> = states.palette.iter().map(entry_name).collect();
+                        sections.push((i32::from(section.y), cells, palette));
+                    }
+                    let is_air = |name: &str| {
+                        matches!(
+                            name,
+                            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                        )
+                    };
+                    let is_water = |name: &str| name == "minecraft:water";
+                    for (sy, cells, palette) in &sections {
+                        let masks: Vec<(bool, bool)> =
+                            palette.iter().map(|n| (is_air(n), is_water(n))).collect();
+                        for ly in (0..16usize).rev() {
+                            let y = sy * 16 + ly as i32;
+                            if !(-64..=319).contains(&y) {
+                                continue;
+                            }
+                            for column in 0..256usize {
+                                let cell = ly * 256 + column;
+                                let (a, w) = masks[cells[cell] as usize];
+                                if !a {
+                                    top[column] = top[column].max(y);
+                                    if !w {
+                                        ground[column] = ground[column].max(y);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Surface biome name from the top biome layer of the
+                    // highest section.
+                    let mut names = vec![String::new(); 256];
+                    let mut biome_layers: Vec<(i32, Vec<String>)> = chunk
+                        .sections
+                        .iter()
+                        .filter_map(|s| {
+                            let b = s.biomes.as_ref()?;
+                            if b.data.is_none() {
+                                return Some((
+                                    i32::from(s.y),
+                                    vec![b.palette.first().cloned().unwrap_or_default(); 64],
+                                ));
+                            }
+                            let longs: Vec<u64> =
+                                b.data.as_ref().unwrap().iter().map(|&v| v as u64).collect();
+                            let bits = (((b.palette.len().max(2) - 1).ilog2() + 1).max(4)) as usize;
+                            Some((
+                                i32::from(s.y),
+                                unpack(&longs, bits, 64)
+                                    .into_iter()
+                                    .map(|i| b.palette.get(i as usize).cloned().unwrap_or_default())
+                                    .collect(),
+                            ))
+                        })
+                        .collect();
+                    biome_layers.sort_by_key(|l| -l.0);
+                    if let Some((_, biomes)) = biome_layers.first() {
+                        if biomes.len() == 64 {
+                            for (column, name) in names.iter_mut().enumerate() {
+                                let bx = (column % 16) / 4;
+                                let bz = (column / 16) / 4;
+                                *name = biomes[3 * 16 + bz * 4 + bx].clone();
+                            }
+                        }
+                    }
+                    vanilla.insert(
+                        (chunk.x, chunk.z),
+                        VanillaChunk {
+                            top,
+                            ground,
+                            biomes: names,
+                            sections,
+                        },
+                    );
+                }
+            }
+        }
+        assert!(!vanilla.is_empty(), "no saved vanilla chunks");
+
+        let reg = registry();
+        let pin_root = pins();
+        let terrain = NoiseTerrain::with_seed(42, &reg, &pin_root).expect("engine build");
+        let mut loader = Loader::new(&pin_root, 42, &reg, -64, 384);
+        let continents = loader
+            .function_id("minecraft:overworld/continents")
+            .unwrap();
+        let erosion = loader.function_id("minecraft:overworld/erosion").unwrap();
+        let ridges = loader.function_id("minecraft:overworld/ridges").unwrap();
+        let folded = loader
+            .function_id("minecraft:overworld/ridges_folded")
+            .unwrap();
+        let offset = loader.function_id("minecraft:overworld/offset").unwrap();
+        let cheese = loader
+            .function_id("minecraft:overworld/sloped_cheese")
+            .unwrap();
+        let base3d = loader
+            .function_id("minecraft:overworld/base_3d_noise")
+            .unwrap();
+        let entrances = loader
+            .function_id("minecraft:overworld/caves/entrances")
+            .unwrap();
+        let depth_fn = loader.function_id("minecraft:overworld/depth").unwrap();
+        let noodle_fn = loader
+            .function_id("minecraft:overworld/caves/noodle")
+            .unwrap();
+        let final_fn = loader
+            .function_id("minecraft:overworld/final_density")
+            .unwrap();
+        loader.graph.finish();
+        let mut climate_ctx = ChunkCtx::new(0, 0, -64, 384);
+
+        let mut failing_chunks: Vec<(i32, i32)> = Vec::new();
+        let mut failing_columns = 0usize;
+        let mut fail_vanilla_top = std::collections::BTreeMap::new();
+        let mut fail_vanilla_ground = std::collections::BTreeMap::new();
+        let mut fail_our_ground = std::collections::BTreeMap::new();
+        let count_at = |map: &mut std::collections::BTreeMap<i32, usize>, y: i32| {
+            *map.entry(y).or_default() += 1;
+        };
+        let mut ground_deltas: Vec<i32> = Vec::new();
+        let mut ocean_floor_deltas: std::collections::BTreeMap<i32, usize> =
+            std::collections::BTreeMap::new();
+        let mut density_says_land = 0usize;
+        // (x, z, vanilla top, vanilla ground, our ground, density top,
+        // continents, erosion, ridges, ridges folded, offset)
+        #[allow(clippy::type_complexity)]
+        let mut samples: Vec<(i32, i32, i32, i32, i32, i32, f32, f32, f32, f32, f32)> = Vec::new();
+        let mut biomes_of_fail: HashMap<String, usize> = HashMap::new();
+        let mut cheese_floor_hist: std::collections::BTreeMap<i32, usize> =
+            std::collections::BTreeMap::new();
+        let mut block_at_y: std::collections::BTreeMap<(i32, String), usize> =
+            std::collections::BTreeMap::new();
+        let mut ladder_above_floor = 0usize;
+        let mut noodle_negative_above_floor = 0usize;
+        let mut total = 0usize;
+        let mut land_vanilla = 0usize;
+        let mut land_ours = 0usize;
+        let mut agree = 0usize;
+        let mut keys: Vec<(i32, i32)> = vanilla.keys().copied().collect();
+        keys.sort_unstable();
+        for &(cx, cz) in &keys {
+            let vc = &vanilla[&(cx, cz)];
+            let vtop = &vc.top;
+            let vground = &vc.ground;
+            let vbiome = &vc.biomes;
+            let blocks = terrain.fill_chunk(cx, cz);
+            let mut our_top = [-i32::MAX; 256];
+            let mut our_ground = [-i32::MAX; 256];
+            for y in 0..terrain.height {
+                for column in 0..256 {
+                    let state = blocks[y as usize * 256 + column];
+                    if state != terrain.air {
+                        our_top[column] = our_top[column].max(terrain.min_y + y);
+                        if state != terrain.water {
+                            our_ground[column] = our_ground[column].max(terrain.min_y + y);
+                        }
+                    }
+                }
+            }
+            let mut chunk_fails = 0usize;
+            for column in 0..256 {
+                let land_v = vtop[column] >= 64;
+                let land_o = our_top[column] >= 64;
+                total += 1;
+                land_vanilla += usize::from(land_v);
+                land_ours += usize::from(land_o);
+                agree += usize::from(land_v == land_o);
+                if vground[column] > 40 && our_ground[column] > 40 {
+                    let shared_ocean = vtop[column] <= 63 && our_top[column] <= 63;
+                    if shared_ocean {
+                        count_at(
+                            &mut ocean_floor_deltas,
+                            vground[column] - our_ground[column],
+                        );
+                    } else {
+                        ground_deltas.push(vground[column] - our_ground[column]);
+                    }
+                }
+                if !(land_v && !land_o) {
+                    continue;
+                }
+                chunk_fails += 1;
+                failing_columns += 1;
+                count_at(&mut fail_vanilla_top, vtop[column]);
+                count_at(&mut fail_vanilla_ground, vground[column]);
+                count_at(&mut fail_our_ground, our_ground[column]);
+                *biomes_of_fail.entry(vbiome[column].clone()).or_default() += 1;
+                for y in [62, 63, 64] {
+                    *block_at_y.entry((y, name_at(vc, y, column))).or_default() += 1;
+                }
+                {
+                    let wx = cx * 16 + (column % 16) as i32;
+                    let wz = cz * 16 + (column / 16) as i32;
+                    let g = our_ground[column];
+                    let mut ladder_floor = g;
+                    for y in (g - 4..=g + 8).rev() {
+                        let cheese_v =
+                            sample_node(&loader.graph, &mut climate_ctx, cheese, wx, y, wz);
+                        let ent5_v = 5.0
+                            * sample_node(&loader.graph, &mut climate_ctx, entrances, wx, y, wz);
+                        if cheese_v.min(ent5_v) > 0.0 {
+                            ladder_floor = y;
+                            break;
+                        }
+                    }
+                    count_at(&mut cheese_floor_hist, ladder_floor);
+                    if ladder_floor > g {
+                        ladder_above_floor += 1;
+                    }
+                    if sample_node(&loader.graph, &mut climate_ctx, noodle_fn, wx, g + 1, wz) < 0.0
+                    {
+                        noodle_negative_above_floor += 1;
+                    }
+                }
+                if chunk_fails == 130 {
+                    let wx = cx * 16 + (column % 16) as i32;
+                    let wz = cz * 16 + (column / 16) as i32;
+                    let start_x = cx * 16;
+                    let start_z = cz * 16;
+                    let mut ctx = ChunkCtx::new(start_x, start_z, -64, 384);
+                    let mut dtop = -64;
+                    for y in (0..384).rev() {
+                        let d = f64::from(sample_node(
+                            &terrain.graph,
+                            &mut ctx,
+                            terrain.final_density,
+                            wx,
+                            y - 64,
+                            wz,
+                        ));
+                        if d > 0.0 {
+                            dtop = y - 64;
+                            break;
+                        }
+                    }
+                    if dtop >= 64 {
+                        density_says_land += 1;
+                    }
+                    samples.push((
+                        wx,
+                        wz,
+                        vtop[column],
+                        vground[column],
+                        our_ground[column],
+                        dtop,
+                        sample_node(&loader.graph, &mut climate_ctx, continents, wx, 0, wz),
+                        sample_node(&loader.graph, &mut climate_ctx, erosion, wx, 0, wz),
+                        sample_node(&loader.graph, &mut climate_ctx, ridges, wx, 0, wz),
+                        sample_node(&loader.graph, &mut climate_ctx, folded, wx, 0, wz),
+                        sample_node(&loader.graph, &mut climate_ctx, offset, wx, 0, wz),
+                    ));
+                }
+            }
+            if chunk_fails > 0 {
+                failing_chunks.push((cx, cz));
+            }
+        }
+        println!("[diag] chunks={} columns={total}", keys.len());
+        println!(
+            "[diag] vanilla land {land_vanilla} our land {land_ours} agree {agree} ({:.1}%)",
+            100.0 * agree as f64 / total as f64
+        );
+        println!(
+            "[diag] failing columns: {failing_columns} across {} chunks",
+            failing_chunks.len()
+        );
+        let show = |label: &str, map: &std::collections::BTreeMap<i32, usize>| {
+            print!("[diag] {label}:");
+            for (y, n) in map {
+                print!(" {y}:{n}");
+            }
+            println!();
+        };
+        show("vanilla top hist", &fail_vanilla_top);
+        show("our ground hist", &fail_our_ground);
+        show("vanilla ground hist", &fail_vanilla_ground);
+        show("cheese-ladder floor hist", &cheese_floor_hist);
+        println!(
+            "[diag] ladder floor above ours: {ladder_above_floor}/{failing_columns}; noodle negative at our floor+1: {noodle_negative_above_floor}/{failing_columns}"
+        );
+        if !ground_deltas.is_empty() {
+            let mut sorted = ground_deltas.clone();
+            sorted.sort_unstable();
+            let n = sorted.len();
+            println!(
+                "[diag] ground delta (vanilla - ours, near-surface columns): median {:+} p10 {:+} p90 {:+} (n={n})",
+                sorted[n / 2],
+                sorted[n / 10],
+                sorted[(n * 9) / 10]
+            );
+        }
+        show("shared-ocean floor delta hist", &ocean_floor_deltas);
+        for y in [62, 63, 64] {
+            let mut names: Vec<(usize, &String)> = block_at_y
+                .iter()
+                .filter(|((yy, _), _)| *yy == y)
+                .map(|((_, n), c)| (*c, n))
+                .collect();
+            names.sort_unstable_by_key(|(c, _)| std::cmp::Reverse(*c));
+            let summary: Vec<String> = names
+                .iter()
+                .take(5)
+                .map(|(c, n)| format!("{n} x{c}"))
+                .collect();
+            println!(
+                "[diag] failing-column blocks at y={y}: {}",
+                summary.join(", ")
+            );
+        }
+        println!(
+            "[diag] sampled failing columns where density alone makes land: {density_says_land}/{}",
+            samples.len()
+        );
+        let mut biomes: Vec<(usize, String)> =
+            biomes_of_fail.into_iter().map(|(k, v)| (v, k)).collect();
+        biomes.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
+        for (n, name) in biomes.iter().take(4) {
+            println!("[diag] failing-column biome: {name} x{n}");
+        }
+        for s in samples.iter().take(14) {
+            println!(
+                "[diag] ({},{}) vtop={} vground={} ourground={} dtop={} C={:.4} E={:.4} W={:.4} PV={:.4} off={:.4}",
+                s.0, s.1, s.2, s.3, s.4, s.5, s.6, s.7, s.8, s.9, s.10
+            );
+        }
+        // Per-layer term breakdown at the first sample column.
+        if let Some(s) = samples.first() {
+            let (wx, wz) = (s.0, s.1);
+            let start_x = wx.div_euclid(16) * 16;
+            let start_z = wz.div_euclid(16) * 16;
+            let mut ctx = ChunkCtx::new(start_x, start_z, -64, 384);
+            println!("[diag] terms at ({wx},{wz}): y final cheese base3d ent ent5 depth");
+            for y in 58..=72 {
+                let g = &loader.graph;
+                println!(
+                    "[diag]   {y} {:>8.4} {:>8.4} {:>7.4} {:>7.4} {:>7.4} {:>7.4}",
+                    sample_node(g, &mut ctx, final_fn, wx, y, wz),
+                    sample_node(g, &mut ctx, cheese, wx, y, wz),
+                    sample_node(g, &mut ctx, base3d, wx, y, wz),
+                    sample_node(g, &mut ctx, entrances, wx, y, wz),
+                    5.0 * sample_node(g, &mut ctx, entrances, wx, y, wz),
+                    sample_node(g, &mut ctx, depth_fn, wx, y, wz),
+                );
+            }
+        }
+    }
+
     /// Full-graph smoke: the pinned configs produce a sane chunk and a
     /// repeatable one.
     #[test]
