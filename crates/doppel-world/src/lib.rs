@@ -16,6 +16,11 @@ pub mod noise;
 pub mod registry;
 pub mod structures;
 pub mod terrain;
+// NOTE(worldgen): the server still selects FlatGenerator for generated
+// chunks (byte parity with the captured flat world pins that default).
+// Switching to terrain::HeightmapGenerator + structures::generate_chunk
+// happens once the density-graph parity gate converges; both generators
+// expose with_seed for that swap.
 pub mod worldgen;
 
 pub use anvil_to_wire::WorldDir;
