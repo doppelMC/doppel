@@ -11,8 +11,7 @@
 //! re-evaluated against the live world at fire time — no pulse
 //! stretching, no refresh ticker.
 //!
-//! Deferred (no engine model yet): container/inventory analog sources
-//! containers, item-frame
+//! Deferred (no engine model yet): item-frame
 //! entities and the look-through-a-conductor branch (spec 1c), the
 //! right-click MODE toggle (`useWithoutItem`), and TickPriority (the
 //! scheduler is FIFO within a tick, so the HIGH/NORMAL distinction does
@@ -185,6 +184,10 @@ impl Game {
             return 0;
         }
         let (tx, tz) = (x + dx, z + dz);
+        // --- containers hook (containers.rs): container fill sources ---
+        if let Some(signal) = self.container_analog_output(tx, y, tz) {
+            return signal;
+        }
         let Some((name, props)) = self.get_block(tx, y, tz) else {
             return 0;
         };

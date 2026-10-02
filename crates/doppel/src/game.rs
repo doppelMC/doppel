@@ -131,6 +131,20 @@ pub enum Inbound {
         hand: u8,
         sequence: i32,
     },
+    // --- containers hooks (containers.rs) ---
+    /// `opencontainer x y z` (harness driver): open the container menu
+    /// at a block position.
+    OpenContainer {
+        conn: ConnId,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    /// `container_close`: the client closed one of its menus.
+    ContainerClose {
+        conn: ConnId,
+        container_id: i32,
+    },
     Left {
         conn: ConnId,
     },
@@ -157,6 +171,9 @@ pub(crate) struct Player {
     pending_keep_alive: Option<(i64, Instant)>,
     // --- inventory hook (inventory.rs) ---
     pub(crate) inv: crate::inventory::PlayerInvState,
+    // --- containers hooks (containers.rs) ---
+    pub(crate) menu: Option<containers::OpenMenu>,
+    pub(crate) container_counter: i32,
 }
 
 /// One cached, versioned chunk. `wire` is the sendable form; block
@@ -210,6 +227,8 @@ pub struct Game {
     moving: Vec<MovingPiston>,
     /// Comparator stored output (vanilla ComparatorBlockEntity OutputSignal).
     comparator_outputs: std::collections::HashMap<(i32, i32, i32), i32>,
+    // --- containers hooks (containers.rs) ---
+    containers: containers::ContainersState,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -282,6 +301,10 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
 #[path = "comparator.rs"]
 mod comparator;
 
+// --- containers hooks (containers.rs) ---
+#[path = "containers.rs"]
+pub(crate) mod containers;
+
 const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -320,6 +343,7 @@ impl Game {
             block_events: Vec::new(),
             moving: Vec::new(),
             comparator_outputs: std::collections::HashMap::new(),
+            containers: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -428,8 +452,14 @@ impl Game {
         // Block events (vanilla `runBlockEvents`): piston world mutations
         // happen here, in the same tick they were queued.
         self.run_block_events();
+        // --- containers hooks (containers.rs) ---
+        // Block-entity phase: chest lids, menu range checks, hoppers.
+        self.tick_containers();
         // Block-entity phase: moving pistons advance +0.5 and land.
         self.tick_moving_pistons();
+        // --- containers hooks (containers.rs) ---
+        // Changed block entities sync their data packet.
+        self.flush_block_entities();
     }
 
     pub(crate) fn handle(&mut self, event: Inbound) {
@@ -464,6 +494,8 @@ impl Game {
                         teleport_id: 1,
                         pending_keep_alive: None,
                         inv: Default::default(),
+                        menu: None,
+                        container_counter: 0,
                     },
                 );
             }
@@ -561,7 +593,18 @@ impl Game {
                 hand,
                 ..
             } => self.place_from_hand(conn, x, y, z, face, hand),
+            // --- containers hooks (containers.rs) ---
+            Inbound::OpenContainer { conn, x, y, z } => {
+                self.open_container(conn, x, y, z);
+                self.send_command_feedback(conn);
+            }
+            Inbound::ContainerClose { conn, container_id } => {
+                self.client_closed_container(conn, container_id)
+            }
             Inbound::Left { conn } => {
+                // --- containers hooks (containers.rs) ---
+                // The carried stack of an open menu drops with the player.
+                self.close_menu(conn, false, true);
                 let Some(p) = self.players.remove(&conn) else {
                     return;
                 };
@@ -682,7 +725,7 @@ impl Game {
                 .map(|s| s.with_count(s.count() - 1))
                 .filter(|s| !s.is_empty());
             p.inv.inventory.set(slot, remaining);
-            let state_id = p.inv.next_state_id();
+            let state_id = p.inv.session.next_state_id();
             match crate::inventory::container_to_menu(slot) {
                 Some(menu) => crate::inventory::encode_container_set_slot(
                     0,
@@ -871,6 +914,9 @@ impl Game {
             self.scheduled
                 .push((self.tick, (x, y, z), TickAction::NeighborUpdate));
         }
+        // --- containers hooks (containers.rs) ---
+        // A successful write re-syncs the block-entity map with the block.
+        self.sync_block_entity(x, y, z);
     }
 
     /// The state id for a spec like "name[k=v]".
@@ -942,6 +988,8 @@ impl Game {
             }
             "minecraft:repeater" => self.update_repeater(x, y, z, &props),
             "minecraft:comparator" => self.update_comparator(x, y, z, &props),
+            // --- containers hooks (containers.rs) ---
+            "minecraft:hopper" => self.update_hopper(x, y, z, &props),
             "minecraft:piston" | "minecraft:sticky_piston" => self.update_piston(x, y, z),
             // The head forwards neighbor updates to its base
             // (`PistonHeadBlock.neighborChanged`).
@@ -2105,6 +2153,8 @@ impl Game {
                 teleport_id: 1,
                 pending_keep_alive: None,
                 inv: Default::default(),
+                menu: None,
+                container_counter: 0,
             },
         );
         for c in chunks {

@@ -6,9 +6,9 @@
 //! jar's own data generator (`--reports`), the same source as
 //! `pins/blocks.json`, and hold for the pinned 26.3 build only.
 //!
-//! Scope: the always-open player inventory menu (containerId 0). Chest and
-//! hopper block entities are deliberately out of scope; `menu_to_container`
-//! and the per-slot accessors are the extension points they will plug into.
+//! Scope: the always-open player inventory menu (containerId 0) plus the
+//! shared click engine (`MenuSlots`): container menus (containers.rs)
+//! implement the same trait over their own storage.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -32,12 +32,12 @@ pub const PACKET_CONTAINER_SET_DATA: i32 = 0x13;
 /// 0x12 anchor.
 pub const PACKET_CONTAINER_SET_SLOT: i32 = 0x14;
 /// `set_cursor_item` (carried stack, no containerId). 26.3 registration
-/// order — wire-verify against the oracle before relying on it.
+/// order - wire-verify against the oracle before relying on it.
 pub const PACKET_SET_CURSOR_ITEM: i32 = 0x62;
 /// `set_held_slot`: the join capture sends `6b 00`
 /// immediately after the abilities burst.
 pub const PACKET_SET_HELD_SLOT: i32 = 0x6b;
-/// `set_player_inventory`. 26.3 registration order — wire-verify.
+/// `set_player_inventory`. 26.3 registration order - wire-verify.
 pub const PACKET_SET_PLAYER_INVENTORY: i32 = 0x6e;
 
 /// Serverbound `container_click`.
@@ -72,7 +72,7 @@ pub mod component {
 
 /// One component value in a patch. `Unit` and `VarInt` cover the scalar
 /// components (and round-trip); `Bytes` passes a pre-encoded payload
-/// through on encode only — decoding it back requires the component's own
+/// through on encode only - decoding it back requires the component's own
 /// stream codec, which arrives with full component support.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComponentValue {
@@ -169,7 +169,7 @@ pub struct ItemStack {
 
 /// Vanilla's absolute cap on any stack count (`ABSOLUTE_MAX_STACK_SIZE`).
 pub const ABSOLUTE_MAX_STACK_SIZE: i32 = 99;
-/// `Item.DEFAULT_MAX_STACK_SIZE` — the prototype default when the patch
+/// The prototype default when the patch
 /// carries no `max_stack_size`. NOTE(inventory): per-item prototypes need
 /// the item registry pin; until then every item defaults to 64, so
 /// unstackable items (swords, ...) merge like stackables on click paths.
@@ -449,6 +449,12 @@ pub fn item_id(name: &str) -> Option<i32> {
     item_table().id_of(name)
 }
 
+/// Reverse lookup: the registry name of a curated item id (block-entity
+/// NBT writes item names, not ids).
+pub fn item_name(id: i32) -> Option<&'static str> {
+    ITEM_IDS.iter().find(|(_, v)| *v == id).map(|(k, _)| *k)
+}
+
 // ---------------------------------------------------------------------
 // Player inventory (container-slot space)
 // ---------------------------------------------------------------------
@@ -497,7 +503,7 @@ impl PlayerInventory {
         self.selected
     }
 
-    /// `setSelectedSlot` — hotbar indices only (vanilla throws otherwise).
+    /// Hotbar indices only (vanilla rejects anything else).
     pub fn set_selected(&mut self, slot: u8) {
         if slot < 9 {
             self.selected = slot;
@@ -555,7 +561,7 @@ impl PlayerInventory {
 pub const INVENTORY_MENU_SIZE: usize = 46;
 
 /// Menu slot index -> backing container slot. `None` for the crafting view
-/// (result + 2x2 grid): those slots have no container backing yet — the
+/// (result + 2x2 grid): those slots have no container backing yet - the
 /// extension point crafting plugs into.
 pub fn menu_to_container(menu_slot: usize) -> Option<usize> {
     match menu_slot {
@@ -591,7 +597,7 @@ pub fn container_to_menu(container_slot: usize) -> Option<usize> {
 /// Slot max stack: armor menu slots cap at 1 (`ArmorSlot`), everything
 /// else inherits the container default 99; the effective cap is against
 /// the stack's own max as well.
-fn slot_max_stack(menu_slot: usize, stack: &ItemStack) -> i32 {
+fn inventory_slot_max_stack(menu_slot: usize, stack: &ItemStack) -> i32 {
     let slot_cap = if (5..=8).contains(&menu_slot) {
         1
     } else {
@@ -603,7 +609,7 @@ fn slot_max_stack(menu_slot: usize, stack: &ItemStack) -> i32 {
 /// `Slot.mayPlace` for the inventory menu: only container-backed slots
 /// accept items. NOTE(inventory): equippability checks (`ArmorSlot`
 /// `isEquippableInSlot`, curses) arrive with equipment data.
-fn slot_may_place(menu_slot: usize) -> bool {
+fn inventory_slot_may_place(menu_slot: usize) -> bool {
     menu_to_container(menu_slot).is_some()
 }
 
@@ -725,19 +731,116 @@ pub fn parse_set_carried_item(body: &[u8]) -> Result<i16> {
 // Click semantics (vanilla `AbstractContainerMenu.doClick`, inventory menu)
 // ---------------------------------------------------------------------
 
-/// Per-player inventory-menu state: the inventory, the carried stack, the
-/// quick-craft drag machine, the sync state id, and the materials flag
-/// gating CLONE / clone-drags.
+/// Per-menu click session: the cursor stack, the quick-craft drag
+/// machine, and the menu sync state id. One per open menu; the player's
+/// inventory menu keeps its session inside `PlayerInvState`.
 #[derive(Default)]
-pub struct PlayerInvState {
-    pub inventory: PlayerInventory,
+pub struct MenuSession {
     /// The stack held on the cursor.
     pub carried: Option<ItemStack>,
     quickcraft: QuickCraftState,
     state_id: i32,
+}
+
+impl MenuSession {
+    /// The menu sync counter, wrapping at 0x7FFF (`incrementStateId`).
+    pub(crate) fn next_state_id(&mut self) -> i32 {
+        self.state_id = (self.state_id + 1) & 0x7fff;
+        self.state_id
+    }
+}
+
+/// Per-player inventory state: the inventory itself, the always-open
+/// inventory menu's session (containerId 0), and the materials flag
+/// gating CLONE / clone-drags.
+#[derive(Default)]
+pub struct PlayerInvState {
+    pub inventory: PlayerInventory,
+    /// The inventory menu's click session.
+    pub session: MenuSession,
     /// `hasInfiniteMaterials` (creative). No gamemode system yet, so this
     /// starts false; the harness flips it via `set_creative_for_test`.
     pub creative: bool,
+}
+
+/// The slot access a menu's click engine runs against: menu slot ids
+/// mapped onto slot storage plus the menu-specific placement rules.
+/// `PlayerInventory` implements the player side shared by every menu;
+/// container menus (containers.rs) implement the container-grid side.
+pub trait MenuSlots {
+    /// Total menu slot count; valid menu ids are `0..menu_size()`.
+    fn menu_size(&self) -> usize;
+    fn menu_get(&self, slot: usize) -> Option<ItemStack>;
+    fn menu_set(&mut self, slot: usize, stack: Option<ItemStack>);
+    /// The effective stack cap for a placement into this slot.
+    fn slot_max_stack(&self, slot: usize, stack: &ItemStack) -> i32;
+    /// `Slot.mayPlace`.
+    fn slot_may_place(&self, slot: usize) -> bool;
+    /// `canTakeItemForPickAll`.
+    fn may_pick_all(&self, slot: usize) -> bool;
+    /// QUICK_MOVE destination range (exclusive end) and walk order.
+    fn quick_move_bounds(&self, slot: usize) -> (usize, usize, bool);
+    /// SWAP partner access in player-inventory container space (hotbar
+    /// 0..9, offhand 40).
+    fn swap_get(&self, container_slot: usize) -> Option<ItemStack>;
+    fn swap_set(&mut self, container_slot: usize, stack: Option<ItemStack>);
+    /// Best-effort insert into the player inventory (SWAP overflow).
+    fn insert_into_inventory(&mut self, stack: ItemStack) -> Option<ItemStack>;
+}
+
+impl MenuSlots for PlayerInventory {
+    fn menu_size(&self) -> usize {
+        INVENTORY_MENU_SIZE
+    }
+
+    fn menu_get(&self, slot: usize) -> Option<ItemStack> {
+        menu_slot_get(self, slot)
+    }
+
+    fn menu_set(&mut self, slot: usize, stack: Option<ItemStack>) {
+        menu_slot_set(self, slot, stack)
+    }
+
+    fn slot_max_stack(&self, slot: usize, stack: &ItemStack) -> i32 {
+        inventory_slot_max_stack(slot, stack)
+    }
+
+    fn slot_may_place(&self, slot: usize) -> bool {
+        inventory_slot_may_place(slot)
+    }
+
+    fn may_pick_all(&self, slot: usize) -> bool {
+        slot != 0
+    }
+
+    /// QUICK_MOVE bounds for the inventory menu: result/craft/armor/
+    /// offhand sources move over menu 9..45 (main + hotbar, the offhand
+    /// excluded as a destination), main and hotbar swap.
+    fn quick_move_bounds(&self, slot: usize) -> (usize, usize, bool) {
+        match slot {
+            // Result slot: into the inventory, from the end.
+            0 => (9, 45, true),
+            // Craft grid + armor: into the inventory.
+            1..=8 => (9, 45, false),
+            // Main <-> hotbar.
+            9..=35 => (36, 45, false),
+            36..=44 => (9, 36, false),
+            // Offhand: into the inventory.
+            _ => (9, 45, false),
+        }
+    }
+
+    fn swap_get(&self, container_slot: usize) -> Option<ItemStack> {
+        self.get(container_slot)
+    }
+
+    fn swap_set(&mut self, container_slot: usize, stack: Option<ItemStack>) {
+        self.set(container_slot, stack)
+    }
+
+    fn insert_into_inventory(&mut self, stack: ItemStack) -> Option<ItemStack> {
+        self.add(stack)
+    }
 }
 
 #[derive(Default, Debug)]
@@ -754,31 +857,38 @@ impl QuickCraftState {
     }
 }
 
-/// Applies one click to the player's inventory menu. `doClick` semantics:
-/// special slot -999 (outside) drops the carried stack; unknown container
-/// ids are rejected by the caller before this runs.
-pub fn apply_click(state: &mut PlayerInvState, click: &ContainerClick) {
+/// Applies one click to an open menu. `doClick` semantics: special slot
+/// -999 (outside) drops the carried stack; unknown container ids are
+/// rejected by the caller before this runs.
+pub fn apply_click<S: MenuSlots + ?Sized>(
+    session: &mut MenuSession,
+    slots: &mut S,
+    creative: bool,
+    click: &ContainerClick,
+) {
     match click.kind {
         ClickKind::Pickup => {
             if is_click_button(click.button_num) {
-                apply_pickup_or_drop(state, click.slot_num, click.button_num == 0);
+                apply_pickup_or_drop(session, slots, click.slot_num, click.button_num == 0);
             }
         }
         ClickKind::QuickMove => {
             if is_click_button(click.button_num) {
-                apply_quick_move(state, click.slot_num);
+                apply_quick_move(slots, click.slot_num);
             }
         }
         ClickKind::Swap => {
             let button = click.button_num as i32;
             if (0..9).contains(&button) || button == 40 {
-                apply_swap(state, click.slot_num, button);
+                apply_swap(slots, click.slot_num, button);
             }
         }
-        ClickKind::Clone => apply_clone(state, click.slot_num),
-        ClickKind::Throw => apply_throw(state, click.slot_num, click.button_num),
-        ClickKind::QuickCraft => apply_quick_craft(state, click.slot_num, click.button_num),
-        ClickKind::PickupAll => apply_pickup_all(state, click.slot_num, click.button_num),
+        ClickKind::Clone => apply_clone(session, slots, creative, click.slot_num),
+        ClickKind::Throw => apply_throw(session, slots, click.slot_num, click.button_num),
+        ClickKind::QuickCraft => {
+            apply_quick_craft(session, slots, creative, click.slot_num, click.button_num)
+        }
+        ClickKind::PickupAll => apply_pickup_all(session, slots, click.slot_num, click.button_num),
     }
 }
 
@@ -786,9 +896,9 @@ fn is_click_button(button: i8) -> bool {
     button == 0 || button == 1
 }
 
-fn valid_menu_slot(slot_num: i16) -> Option<usize> {
+fn valid_menu_slot<S: MenuSlots + ?Sized>(slots: &S, slot_num: i16) -> Option<usize> {
     let slot = usize::try_from(slot_num).ok()?;
-    (slot < INVENTORY_MENU_SIZE).then_some(slot)
+    (slot < slots.menu_size()).then_some(slot)
 }
 
 /// `canItemQuickReplace(slot, stack, ignoreSize=true)`: the slot is empty
@@ -802,30 +912,35 @@ fn can_quick_replace(slot_stack: Option<&ItemStack>, stack: &ItemStack) -> bool 
 
 /// PICKUP (and the -999 outside drop): primary/secondary button semantics
 /// per `doClick`.
-fn apply_pickup_or_drop(state: &mut PlayerInvState, slot_num: i16, primary: bool) {
+fn apply_pickup_or_drop<S: MenuSlots + ?Sized>(
+    session: &mut MenuSession,
+    slots: &mut S,
+    slot_num: i16,
+    primary: bool,
+) {
     if slot_num == -999 {
         // Outside drop: primary drops the whole carried stack, secondary
-        // one item. No item entities yet — the drop leaves the inventory
+        // one item. No item entities yet - the drop leaves the inventory
         // (NOTE(inventory): entity sync is the follow-up).
-        if let Some(mut carried) = state.carried.take() {
+        if let Some(mut carried) = session.carried.take() {
             if !primary {
                 carried.shrink(1);
                 if !carried.is_empty() {
-                    state.carried = Some(carried);
+                    session.carried = Some(carried);
                 }
             }
         }
         return;
     }
-    let Some(menu_slot) = valid_menu_slot(slot_num) else {
+    let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
         return;
     };
-    let clicked = menu_slot_get(&state.inventory, menu_slot);
-    match (clicked, state.carried.clone()) {
+    let clicked = slots.menu_get(menu_slot);
+    match (clicked, session.carried.clone()) {
         (None, None) => {}
         (None, Some(carried)) => {
             let amount = if primary { carried.count() } else { 1 };
-            state.carried = safe_insert(&mut state.inventory, menu_slot, carried, amount);
+            session.carried = safe_insert(slots, menu_slot, carried, amount);
         }
         (Some(clicked), None) => {
             let amount = if primary {
@@ -833,16 +948,16 @@ fn apply_pickup_or_drop(state: &mut PlayerInvState, slot_num: i16, primary: bool
             } else {
                 (clicked.count() + 1) / 2
             };
-            let taken = take_from_slot(&mut state.inventory, menu_slot, amount);
-            state.carried = taken.filter(|s| !s.is_empty());
+            let taken = take_from_slot(slots, menu_slot, amount);
+            session.carried = taken.filter(|s| !s.is_empty());
         }
         (Some(clicked), Some(carried)) => {
             if ItemStack::same_item_same_components(&clicked, &carried) {
                 let amount = if primary { carried.count() } else { 1 };
-                state.carried = safe_insert(&mut state.inventory, menu_slot, carried, amount);
-            } else if carried.count() <= slot_max_stack(menu_slot, &carried) {
-                menu_slot_set(&mut state.inventory, menu_slot, Some(carried));
-                state.carried = Some(clicked);
+                session.carried = safe_insert(slots, menu_slot, carried, amount);
+            } else if carried.count() <= slots.slot_max_stack(menu_slot, &carried) {
+                slots.menu_set(menu_slot, Some(carried));
+                session.carried = Some(clicked);
             }
         }
     }
@@ -850,81 +965,68 @@ fn apply_pickup_or_drop(state: &mut PlayerInvState, slot_num: i16, primary: bool
 
 /// `Slot.safeInsert`: moves up to `amount` of `input` into the slot,
 /// returning the carried leftover.
-fn safe_insert(
-    inv: &mut PlayerInventory,
+fn safe_insert<S: MenuSlots + ?Sized>(
+    slots: &mut S,
     menu_slot: usize,
     input: ItemStack,
     amount: i32,
 ) -> Option<ItemStack> {
-    if input.is_empty() || !slot_may_place(menu_slot) {
+    if input.is_empty() || !slots.slot_may_place(menu_slot) {
         return Some(input);
     }
     let mut input = input;
-    let occupant = menu_slot_get(inv, menu_slot);
+    let occupant = slots.menu_get(menu_slot);
     let occupant_count = occupant.as_ref().map_or(0, ItemStack::count);
     let transferable = amount
         .min(input.count())
-        .min(slot_max_stack(menu_slot, &input) - occupant_count);
+        .min(slots.slot_max_stack(menu_slot, &input) - occupant_count);
     if transferable <= 0 {
         return Some(input);
     }
     match occupant {
         None => {
             let placed = input.split(transferable);
-            menu_slot_set(inv, menu_slot, Some(placed));
+            slots.menu_set(menu_slot, Some(placed));
         }
         Some(occupant) => {
             input.shrink(transferable);
             let mut grown = occupant;
             grown.grow(transferable);
-            menu_slot_set(inv, menu_slot, Some(grown));
+            slots.menu_set(menu_slot, Some(grown));
         }
     }
     (!input.is_empty()).then_some(input)
 }
 
 /// `Slot.tryRemove`/`removeItem`: takes up to `amount` out of the slot.
-fn take_from_slot(inv: &mut PlayerInventory, menu_slot: usize, amount: i32) -> Option<ItemStack> {
-    let occupant = menu_slot_get(inv, menu_slot)?;
+fn take_from_slot<S: MenuSlots + ?Sized>(
+    slots: &mut S,
+    menu_slot: usize,
+    amount: i32,
+) -> Option<ItemStack> {
+    let occupant = slots.menu_get(menu_slot)?;
     let taken = occupant.with_count(amount.min(occupant.count()));
     let rest = occupant.count() - taken.count();
-    menu_slot_set(
-        inv,
-        menu_slot,
-        (rest > 0).then(|| occupant.with_count(rest)),
-    );
+    slots.menu_set(menu_slot, (rest > 0).then(|| occupant.with_count(rest)));
     (!taken.is_empty()).then_some(taken)
 }
 
-/// QUICK_MOVE on the inventory menu: `InventoryMenu.quickMoveStack` bounds
-/// plus the doClick repeat loop. End bounds are exclusive: vanilla moves
-/// result/craft/armor/offhand sources over menu 9..45 (main + hotbar, the
-/// offhand excluded as a shift-click destination) and swap main <-> hotbar.
+/// QUICK_MOVE: the menu's destination bounds plus the doClick repeat loop.
 /// NOTE(inventory): equipment routing (armor/offhand preference for
 /// equippable items) needs the equipment registry; moves use the plain
 /// ranges.
-fn apply_quick_move(state: &mut PlayerInvState, slot_num: i16) {
-    let Some(menu_slot) = valid_menu_slot(slot_num) else {
+fn apply_quick_move<S: MenuSlots + ?Sized>(slots: &mut S, slot_num: i16) {
+    let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
         return;
     };
-    let inv = &mut state.inventory;
-    while let Some(current) = menu_slot_get(inv, menu_slot) {
-        let (start, end, backwards) = match menu_slot {
-            // Result slot: into the inventory, from the end.
-            0 => (9, 45, true),
-            // Craft grid + armor: into the inventory.
-            1..=8 => (9, 45, false),
-            // Main <-> hotbar.
-            9..=35 => (36, 45, false),
-            36..=44 => (9, 36, false),
-            // Offhand: into the inventory.
-            _ => (9, 45, false),
-        };
-        let moved = move_stack_to(inv, menu_slot, start, end, backwards);
+    while let Some(current) = slots.menu_get(menu_slot) {
+        let (start, end, backwards) = slots.quick_move_bounds(menu_slot);
+        let moved = move_stack_to(slots, menu_slot, start, end, backwards);
         if !moved {
             break;
         }
-        let still_same = menu_slot_get(inv, menu_slot)
+        let still_same = slots
+            .menu_get(menu_slot)
             .is_some_and(|after| ItemStack::same_item_same_components(&after, &current));
         if !still_same {
             break;
@@ -935,14 +1037,14 @@ fn apply_quick_move(state: &mut PlayerInvState, slot_num: i16) {
 /// `moveItemStackTo`: merge the stack at `menu_slot` into same-item stacks
 /// in the menu range first, then into empty placeable slots. `backwards`
 /// walks the range from the end.
-fn move_stack_to(
-    inv: &mut PlayerInventory,
+fn move_stack_to<S: MenuSlots + ?Sized>(
+    slots: &mut S,
     menu_slot: usize,
     start: usize,
     end: usize,
     backwards: bool,
 ) -> bool {
-    let Some(mut stack) = menu_slot_get(inv, menu_slot) else {
+    let Some(mut stack) = slots.menu_get(menu_slot) else {
         return false;
     };
     let mut changed = false;
@@ -956,22 +1058,22 @@ fn move_stack_to(
             if stack.is_empty() {
                 break;
             }
-            let Some(occupant) = menu_slot_get(inv, *dest) else {
+            let Some(occupant) = slots.menu_get(*dest) else {
                 continue;
             };
             if !ItemStack::same_item_same_components(&occupant, &stack) {
                 continue;
             }
-            let max = slot_max_stack(*dest, &stack);
+            let max = slots.slot_max_stack(*dest, &stack);
             let total = occupant.count() + stack.count();
             if total <= max {
                 stack.set_count(0);
-                menu_slot_set(inv, *dest, Some(occupant.with_count(total)));
+                slots.menu_set(*dest, Some(occupant.with_count(total)));
                 changed = true;
             } else if occupant.count() < max {
                 let moved = max - occupant.count();
                 stack.shrink(moved);
-                menu_slot_set(inv, *dest, Some(occupant.with_count(max)));
+                slots.menu_set(*dest, Some(occupant.with_count(max)));
                 changed = true;
             }
         }
@@ -981,106 +1083,116 @@ fn move_stack_to(
             if stack.is_empty() {
                 break;
             }
-            if menu_slot_get(inv, *dest).is_some() || !slot_may_place(*dest) {
+            if slots.menu_get(*dest).is_some() || !slots.slot_may_place(*dest) {
                 continue;
             }
-            let placed = stack.split(stack.count().min(slot_max_stack(*dest, &stack)));
-            menu_slot_set(inv, *dest, Some(placed));
+            let placed = stack.split(stack.count().min(slots.slot_max_stack(*dest, &stack)));
+            slots.menu_set(*dest, Some(placed));
             changed = true;
         }
     }
-    menu_slot_set(inv, menu_slot, (!stack.is_empty()).then_some(stack));
+    slots.menu_set(menu_slot, (!stack.is_empty()).then_some(stack));
     changed
 }
 
 /// SWAP with hotbar slots (button 0..8) or the offhand (button 40).
-fn apply_swap(state: &mut PlayerInvState, slot_num: i16, button: i32) {
-    let Some(menu_slot) = valid_menu_slot(slot_num) else {
+fn apply_swap<S: MenuSlots + ?Sized>(slots: &mut S, slot_num: i16, button: i32) {
+    let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
         return;
     };
     let swap_slot = button as usize;
-    let source = state.inventory.get(swap_slot);
-    let target = menu_slot_get(&state.inventory, menu_slot);
+    let source = slots.swap_get(swap_slot);
+    let target = slots.menu_get(menu_slot);
     match (source, target) {
         (None, None) => {}
         (None, Some(target)) => {
-            // mayPickup is unconditional for the inventory menu.
-            state.inventory.set(swap_slot, Some(target));
-            menu_slot_set(&mut state.inventory, menu_slot, None);
+            // mayPickup is unconditional for these menus.
+            slots.swap_set(swap_slot, Some(target));
+            slots.menu_set(menu_slot, None);
         }
         (Some(source), None) => {
-            if !slot_may_place(menu_slot) {
+            if !slots.slot_may_place(menu_slot) {
                 return;
             }
-            let max = slot_max_stack(menu_slot, &source);
+            let max = slots.slot_max_stack(menu_slot, &source);
             if source.count() > max {
                 let head = source.with_count(max);
                 let rest = source.with_count(source.count() - max);
-                state.inventory.set(swap_slot, Some(rest));
-                menu_slot_set(&mut state.inventory, menu_slot, Some(head));
+                slots.swap_set(swap_slot, Some(rest));
+                slots.menu_set(menu_slot, Some(head));
             } else {
-                state.inventory.set(swap_slot, None);
-                menu_slot_set(&mut state.inventory, menu_slot, Some(source));
+                slots.swap_set(swap_slot, None);
+                slots.menu_set(menu_slot, Some(source));
             }
         }
         (Some(source), Some(target)) => {
-            if !slot_may_place(menu_slot) {
+            if !slots.slot_may_place(menu_slot) {
                 return;
             }
-            let max = slot_max_stack(menu_slot, &source);
+            let max = slots.slot_max_stack(menu_slot, &source);
             if source.count() > max {
                 let head = source.with_count(max);
                 let rest = source.with_count(source.count() - max);
-                state.inventory.set(swap_slot, Some(rest));
-                menu_slot_set(&mut state.inventory, menu_slot, Some(head));
+                slots.swap_set(swap_slot, Some(rest));
+                slots.menu_set(menu_slot, Some(head));
                 // The displaced target stack goes back into the inventory;
                 // overflow would drop (no entities yet, so it is discarded).
-                let _ = state.inventory.add(target);
+                let _ = slots.insert_into_inventory(target);
             } else {
-                state.inventory.set(swap_slot, Some(target));
-                menu_slot_set(&mut state.inventory, menu_slot, Some(source));
+                slots.swap_set(swap_slot, Some(target));
+                slots.menu_set(menu_slot, Some(source));
             }
         }
     }
 }
 
 /// CLONE: creative-only copy of the clicked stack at its own max size.
-fn apply_clone(state: &mut PlayerInvState, slot_num: i16) {
-    if !state.creative || state.carried.is_some() {
+fn apply_clone<S: MenuSlots + ?Sized>(
+    session: &mut MenuSession,
+    slots: &S,
+    creative: bool,
+    slot_num: i16,
+) {
+    if !creative || session.carried.is_some() {
         return;
     }
-    let Some(menu_slot) = valid_menu_slot(slot_num) else {
+    let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
         return;
     };
-    let Some(clicked) = menu_slot_get(&state.inventory, menu_slot) else {
+    let Some(clicked) = slots.menu_get(menu_slot) else {
         return;
     };
-    state.carried = Some(clicked.with_count(clicked.max_stack_size()));
+    session.carried = Some(clicked.with_count(clicked.max_stack_size()));
 }
 
 /// THROW: button 0 throws one item, button 1 the whole stack (with the
 /// ctrl-loop draining same-item follow-ups). `canDropItems` is true (no
 /// spectator state yet).
-fn apply_throw(state: &mut PlayerInvState, slot_num: i16, button: i8) {
-    if state.carried.is_some() || slot_num < 0 {
+fn apply_throw<S: MenuSlots + ?Sized>(
+    session: &MenuSession,
+    slots: &mut S,
+    slot_num: i16,
+    button: i8,
+) {
+    if session.carried.is_some() || slot_num < 0 {
         return;
     }
-    let Some(menu_slot) = valid_menu_slot(slot_num) else {
+    let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
         return;
     };
-    let Some(current) = menu_slot_get(&state.inventory, menu_slot) else {
+    let Some(current) = slots.menu_get(menu_slot) else {
         return;
     };
     let amount = if button == 0 { 1 } else { current.count() };
-    let thrown = take_from_slot(&mut state.inventory, menu_slot, amount);
+    let thrown = take_from_slot(slots, menu_slot, amount);
     // No item entities yet: the thrown stack leaves the inventory.
     let _ = thrown;
     if button == 1 {
-        while let Some(next) = menu_slot_get(&state.inventory, menu_slot) {
+        while let Some(next) = slots.menu_get(menu_slot) {
             if !ItemStack::same_item_same_components(&next, &current) || next.is_empty() {
                 break;
             }
-            let _ = take_from_slot(&mut state.inventory, menu_slot, next.count());
+            let _ = take_from_slot(slots, menu_slot, next.count());
         }
     }
 }
@@ -1088,37 +1200,36 @@ fn apply_throw(state: &mut PlayerInvState, slot_num: i16, button: i8) {
 /// PICKUP_ALL: the double-click gather. Two passes over the menu (forward
 /// for button 0, backward for 1); the first pass skips full stacks. The
 /// result slot is excluded (`canTakeItemForPickAll`).
-fn apply_pickup_all(state: &mut PlayerInvState, slot_num: i16, button: i8) {
+fn apply_pickup_all<S: MenuSlots + ?Sized>(
+    session: &mut MenuSession,
+    slots: &mut S,
+    slot_num: i16,
+    button: i8,
+) {
     // Vanilla gates on the clicked slot being empty or takeable;
-    // mayPickup always holds for this menu, so only the range check
+    // mayPickup always holds for these menus, so only the range check
     // remains. Out-of-range clicks are a no-op here (vanilla would throw
     // on slots.get).
-    if valid_menu_slot(slot_num).is_none() {
+    if valid_menu_slot(slots, slot_num).is_none() {
         return;
     }
-    let Some(mut carried) = state.carried.clone() else {
+    let size = slots.menu_size();
+    let Some(mut carried) = session.carried.clone() else {
         return;
     };
     let step: i32 = if button == 0 { 1 } else { -1 };
-    let start: i32 = if button == 0 {
-        0
-    } else {
-        INVENTORY_MENU_SIZE as i32 - 1
-    };
+    let start: i32 = if button == 0 { 0 } else { size as i32 - 1 };
     for pass in 0..2 {
         let mut i = start;
-        while (0..INVENTORY_MENU_SIZE as i32).contains(&i)
-            && carried.count() < carried.max_stack_size()
-        {
+        while (0..size as i32).contains(&i) && carried.count() < carried.max_stack_size() {
             let menu = i as usize;
-            if menu != 0 {
-                if let Some(occupant) = menu_slot_get(&state.inventory, menu) {
+            if slots.may_pick_all(menu) {
+                if let Some(occupant) = slots.menu_get(menu) {
                     if can_quick_replace(Some(&occupant), &carried)
                         && !(pass == 0 && occupant.count() == occupant.max_stack_size())
                     {
                         let room = carried.max_stack_size() - carried.count();
-                        if let Some(taken) =
-                            take_from_slot(&mut state.inventory, menu, occupant.count().min(room))
+                        if let Some(taken) = take_from_slot(slots, menu, occupant.count().min(room))
                         {
                             carried.grow(taken.count());
                         }
@@ -1128,99 +1239,101 @@ fn apply_pickup_all(state: &mut PlayerInvState, slot_num: i16, button: i8) {
             i += step;
         }
     }
-    state.carried = (!carried.is_empty()).then_some(carried);
+    session.carried = (!carried.is_empty()).then_some(carried);
 }
 
 /// QUICK_CRAFT (drag): the header/type machine from `doClick`. The button
 /// byte packs header (bits 0-1: 0 start, 1 continue, 2 end) and type
 /// (bits 2-3: 0 charitable, 1 greedy, 2 clone).
-fn apply_quick_craft(state: &mut PlayerInvState, slot_num: i16, button: i8) {
+fn apply_quick_craft<S: MenuSlots + ?Sized>(
+    session: &mut MenuSession,
+    slots: &mut S,
+    creative: bool,
+    slot_num: i16,
+    button: i8,
+) {
     let header = (button & 3) as u8;
     let kind = ((button >> 2) & 3) as u8;
-    let expected = state.quickcraft.status;
-    state.quickcraft.status = header;
+    let expected = session.quickcraft.status;
+    session.quickcraft.status = header;
     // Only (continue->end) and same-header clicks extend a drag; anything
     // else resets it.
     if !((expected == 1 && header == 2) || expected == header) {
-        state.quickcraft.reset();
+        session.quickcraft.reset();
         return;
     }
-    if state.carried.is_none() {
-        state.quickcraft.reset();
+    if session.carried.is_none() {
+        session.quickcraft.reset();
         return;
     }
     match header {
         0 => {
             // START: arm the drag with this click's type.
-            state.quickcraft.kind = kind;
-            if is_valid_quickcraft_type(kind, state.creative) {
-                state.quickcraft.status = 1;
-                state.quickcraft.slots.clear();
+            session.quickcraft.kind = kind;
+            if is_valid_quickcraft_type(kind, creative) {
+                session.quickcraft.status = 1;
+                session.quickcraft.slots.clear();
             } else {
-                state.quickcraft.reset();
+                session.quickcraft.reset();
             }
         }
         1 => {
             // CONTINUE: add one slot to the drag set.
-            let Some(menu_slot) = valid_menu_slot(slot_num) else {
+            let Some(menu_slot) = valid_menu_slot(slots, slot_num) else {
                 return;
             };
-            let Some(carried) = state.carried.clone() else {
+            let Some(carried) = session.carried.clone() else {
                 return;
             };
-            let occupant = menu_slot_get(&state.inventory, menu_slot);
+            let occupant = slots.menu_get(menu_slot);
             if !can_quick_replace(occupant.as_ref(), &carried)
-                || !slot_may_place(menu_slot)
-                || (state.quickcraft.kind != 2
-                    && carried.count() <= state.quickcraft.slots.len() as i32)
-                || state.quickcraft.slots.contains(&menu_slot)
+                || !slots.slot_may_place(menu_slot)
+                || (session.quickcraft.kind != 2
+                    && carried.count() <= session.quickcraft.slots.len() as i32)
+                || session.quickcraft.slots.contains(&menu_slot)
             {
                 return;
             }
-            state.quickcraft.slots.push(menu_slot);
+            session.quickcraft.slots.push(menu_slot);
         }
         2 => {
             // END: distribute (a single-slot drag degenerates to a PICKUP
             // with the drag type as the button).
-            let slots = state.quickcraft.slots.clone();
-            let kind = state.quickcraft.kind;
-            state.quickcraft.reset();
-            if slots.len() == 1 {
-                apply_pickup_or_drop(state, slots[0] as i16, kind == 0);
+            let drag_slots = session.quickcraft.slots.clone();
+            let kind = session.quickcraft.kind;
+            session.quickcraft.reset();
+            if drag_slots.len() == 1 {
+                apply_pickup_or_drop(session, slots, drag_slots[0] as i16, kind == 0);
                 return;
             }
-            if slots.is_empty() {
+            if drag_slots.is_empty() {
                 return;
             }
-            let Some(source) = state.carried.clone() else {
+            let Some(source) = session.carried.clone() else {
                 return;
             };
-            let per = quickcraft_place_count(slots.len() as i32, kind, &source);
+            let per = quickcraft_place_count(drag_slots.len() as i32, kind, &source);
             let mut remaining = source.count();
-            for menu_slot in slots.iter().copied() {
-                let Some(carried) = state.carried.clone() else {
+            for menu_slot in drag_slots.iter().copied() {
+                let Some(carried) = session.carried.clone() else {
                     break;
                 };
-                let occupant = menu_slot_get(&state.inventory, menu_slot);
+                let occupant = slots.menu_get(menu_slot);
                 if !can_quick_replace(occupant.as_ref(), &carried)
-                    || !slot_may_place(menu_slot)
-                    || (kind != 2 && carried.count() < slots.len() as i32)
+                    || !slots.slot_may_place(menu_slot)
+                    || (kind != 2 && carried.count() < drag_slots.len() as i32)
                 {
                     continue;
                 }
                 let carry = occupant.as_ref().map_or(0, ItemStack::count);
-                let max = slot_max_stack(menu_slot, &source);
+                let max = slots.slot_max_stack(menu_slot, &source);
                 let new_count = (per + carry).min(max);
                 remaining -= new_count - carry;
-                menu_slot_set(
-                    &mut state.inventory,
-                    menu_slot,
-                    Some(source.with_count(new_count)),
-                );
+                slots.menu_set(menu_slot, Some(source.with_count(new_count)));
             }
-            state.carried = (remaining > 0).then(|| source.with_count(remaining));
+            session.carried = (remaining > 0).then(|| source.with_count(remaining));
         }
-        _ => state.quickcraft.reset(),
+        _ => session.quickcraft.reset(),
     }
 }
 
@@ -1331,18 +1444,10 @@ fn read_i32be(r: &mut Reader) -> Result<i32> {
 // Game-thread hooks
 // ---------------------------------------------------------------------
 
-impl PlayerInvState {
-    /// The menu sync counter, wrapping at 0x7FFF (`incrementStateId`).
-    pub(crate) fn next_state_id(&mut self) -> i32 {
-        self.state_id = (self.state_id + 1) & 0x7fff;
-        self.state_id
-    }
-}
-
 impl Game {
     /// `/give <target> <item> [count]` (harness driver): resolves the item,
     /// adds the stack, and broadcasts the player's inventory menu.
-    /// NOTE(inventory): ungated by gamemode — the creative check arrives
+    /// NOTE(inventory): ungated by gamemode - the creative check arrives
     /// with the abilities system.
     pub(crate) fn give_item(&mut self, conn: ConnId, item: &str, count: i32) {
         let Some(item) = item_id(item) else {
@@ -1379,34 +1484,39 @@ impl Game {
     /// NOTE(inventory): the client's HashedStack predictions are decoded
     /// for shape validation but not applied; the response is one
     /// authoritative container_set_content of the affected container after
-    /// applying the click server-side (always a correct server response —
+    /// applying the click server-side (always a correct server response  -
     /// full CRC32C hash prediction is future work and is not faked here).
     pub(crate) fn container_clicked(&mut self, conn: ConnId, click: &ContainerClick) {
-        // Only the inventory menu (containerId 0) exists; vanilla ignores
-        // clicks against a menu the player does not have open.
+        // Vanilla ignores clicks against a menu the player does not have
+        // open; container menus route through containers.rs.
         if click.container_id != 0 {
+            // --- containers hooks (containers.rs) ---
+            self.container_menu_clicked(conn, click);
             return;
         }
         let Some(p) = self.players.get_mut(&conn) else {
             return;
         };
-        apply_click(&mut p.inv, click);
+        let creative = p.inv.creative;
+        apply_click(&mut p.inv.session, &mut p.inv.inventory, creative, click);
         self.broadcast_inventory(conn);
     }
 
     /// Full resync of the player's inventory menu: one
     /// container_set_content with every menu slot plus the carried stack.
     fn broadcast_inventory(&mut self, conn: ConnId) {
-        let Some(p) = self.players.get_mut(&conn) else {
-            return;
+        let body = {
+            let Some(p) = self.players.get_mut(&conn) else {
+                return;
+            };
+            let state_id = p.inv.session.next_state_id();
+            let mut slots = Vec::with_capacity(INVENTORY_MENU_SIZE);
+            for menu_slot in 0..INVENTORY_MENU_SIZE {
+                slots.push(menu_slot_get(&p.inv.inventory, menu_slot));
+            }
+            let carried = p.inv.session.carried.clone();
+            encode_container_set_content(0, state_id, &slots, carried.as_ref())
         };
-        let state_id = p.inv.next_state_id();
-        let mut slots = Vec::with_capacity(INVENTORY_MENU_SIZE);
-        for menu_slot in 0..INVENTORY_MENU_SIZE {
-            slots.push(menu_slot_get(&p.inv.inventory, menu_slot));
-        }
-        let carried = p.inv.carried.clone();
-        let body = encode_container_set_content(0, state_id, &slots, carried.as_ref());
         self.send(conn, PACKET_CONTAINER_SET_CONTENT, &body);
         // The carried stack rides inside set_content (the client applies
         // it via initializeContents); set_cursor_item exists for the
@@ -1604,7 +1714,7 @@ mod tests {
             encode_set_cursor_item(Some(&ItemStack::new(1, 7))),
             vec![0x07, 0x01, 0x00, 0x00]
         );
-        // set_held_slot: slot 0 — byte-identical to the capture's `6b 00`.
+        // set_held_slot: slot 0 - byte-identical to the capture's `6b 00`.
         assert_eq!(encode_set_held_slot(0), vec![0x00]);
         // set_player_inventory: raw container slot 40, empty stack.
         assert_eq!(encode_set_player_inventory(40, None), vec![0x28, 0x00]);
@@ -1636,7 +1746,7 @@ mod tests {
         let mut inv = PlayerInventory::default();
         inv.set_selected(3);
         // Empty inventory: no partial stacks, so the first free slot (0)
-        // wins — vanilla `getFreeSlot` scans the 36-item list in order.
+        // wins - the free-slot scan runs the 36-item list in order.
         let leftover = inv.add(ItemStack::new(1, 5));
         assert!(leftover.is_none());
         assert_eq!(inv.get(0).map(|s| s.count()), Some(5));
@@ -1656,7 +1766,7 @@ mod tests {
     // -- game-thread integration -------------------------------------------
 
     /// A game with one viewer registered for outbound frames (no chunks or
-    /// registry needed — inventory state is chunk-independent).
+    /// registry needed - inventory state is chunk-independent).
     fn harness() -> (Game, std::sync::mpsc::Receiver<Outbound>) {
         let (_tx, rx) = std::sync::mpsc::channel::<Inbound>();
         let mut g = Game::new(rx, None, None);
@@ -1678,7 +1788,7 @@ mod tests {
     }
 
     /// The next set_content frame, decoded to (containerId, stateId,
-    /// slots, carried) — container 0, stateId 1 on the first broadcast.
+    /// slots, carried) - container 0, stateId 1 on the first broadcast.
     fn next_content(
         rx: &std::sync::mpsc::Receiver<Outbound>,
     ) -> (i32, i32, Vec<Option<ItemStack>>, Option<ItemStack>) {

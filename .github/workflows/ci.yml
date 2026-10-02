@@ -49,6 +49,8 @@ jobs:
         run: cargo run --release -p doppel-oracle -- parity-blocks
       - name: Differential redstone test
         run: cargo run --release -p doppel-oracle -- parity-redstone
+      - name: Differential placement test
+        run: cargo run --release -p doppel-oracle -- parity-placement
 
   capture-vanilla:
     name: capture - vanilla login transcript
