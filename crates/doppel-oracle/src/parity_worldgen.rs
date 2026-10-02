@@ -56,8 +56,15 @@ pub fn run() -> Result<bool> {
         pin.protocol.unwrap_or(0),
         &capture::login_start_c("Doppel"),
         &bot::CaptureOpts {
-            idle_timeout: Some(Duration::from_secs(60)),
-            max_packets: Some(320),
+            // The session reads until it goes idle. Vanilla keep-alives
+            // every 15s would keep a longer timeout alive indefinitely, and
+            // the answered keep-alives reset the reader, so the timeout must
+            // fit between those beats to end the capture after the burst.
+            idle_timeout: Some(Duration::from_secs(12)),
+            // Normal terrain streams entity traffic alongside the chunk
+            // burst; a cap sized for the entity-free flat capture truncates
+            // the join before all spawn chunks arrive.
+            max_packets: Some(6000),
             dump_dir: Some(&dump_dir),
             commands: &[],
             walk_chunks: None,
@@ -82,6 +89,16 @@ pub fn run() -> Result<bool> {
         }
     }
     println!("[worldgen] captured {} spawn-area chunks", chunks.len());
+    let chunk_packets = packets.iter().filter(|p| p.id == 0x2e).count();
+    let end_note = packets
+        .iter()
+        .find(|p| p.id == -1)
+        .and_then(|p| p.note.as_deref());
+    println!(
+        "[worldgen] capture: {} packets total, {chunk_packets} chunk packets, ended by {}",
+        packets.len(),
+        end_note.unwrap_or("reaching the packet cap")
+    );
     if chunks.len() < MIN_CHUNKS {
         bail!(
             "only {} chunks captured (need {MIN_CHUNKS}): join burst incomplete",
@@ -196,8 +213,14 @@ fn compare(
         println!("[worldgen]   {name}: {d:+}");
     }
 
-    // Cell agreement and biome spread.
-    let agreement = cells_equal as f64 / cells_total as f64;
+    // Cell agreement and biome spread. Zero compared cells must fail rather
+    // than divide to NaN, which every threshold comparison would treat as
+    // passing.
+    let agreement = if cells_total == 0 {
+        0.0
+    } else {
+        cells_equal as f64 / cells_total as f64
+    };
     println!("[worldgen] exact cell agreement: {agreement:.3} ({cells_equal}/{cells_total})");
     let mut biome_list: Vec<(u64, u32)> = biomes.into_iter().map(|(k, v)| (v, k)).collect();
     biome_list.sort_unstable_by_key(|(count, _)| std::cmp::Reverse(*count));
@@ -229,6 +252,12 @@ fn compare(
     .ok();
 
     let mut ok = true;
+    if map_types.iter().all(|t| t.is_none()) {
+        // Without a shared heightmap type the delta and correlation metrics
+        // above never ran; their zero-initialized worsts would pass vacuously.
+        println!("[worldgen] FAIL no shared heightmap type between vanilla and generated chunks");
+        ok = false;
+    }
     if worst_median > MAX_MEDIAN_DELTA {
         println!("[worldgen] FAIL median height delta {worst_median:.1} > {MAX_MEDIAN_DELTA}");
         ok = false;
