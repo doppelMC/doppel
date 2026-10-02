@@ -133,18 +133,6 @@ pub fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
     (((x as i64) & 0x3ff_ffff) << 38) | (((z as i64) & 0x3ff_ffff) << 12) | ((y as i64) & 0xfff)
 }
 
-/// set_creative_mode_slot body: menu slot plus one item stack
-/// (count 1, id, empty component patch).
-pub fn build_set_creative_slot(slot: i16, item: i32) -> Vec<u8> {
-    let mut b = slot.to_be_bytes().to_vec();
-    b.push(1); // present: the nullable stack codec's boolean prefix
-    doppel_protocol::write_varint(&mut b, 1);
-    doppel_protocol::write_varint(&mut b, item);
-    doppel_protocol::write_varint(&mut b, 0);
-    doppel_protocol::write_varint(&mut b, 0);
-    b
-}
-
 /// use_item_on body against the top face of the clicked block.
 pub fn build_use_item_on_top(x: i32, y: i32, z: i32, sequence: i32) -> Vec<u8> {
     let mut b = Vec::new();
