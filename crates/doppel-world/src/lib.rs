@@ -15,6 +15,7 @@ pub mod biome;
 pub mod chunk_codec;
 pub mod decoration;
 pub mod density;
+mod features;
 pub mod noise;
 pub mod registry;
 pub mod structures;

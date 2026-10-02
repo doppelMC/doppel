@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::biome::BiomeTable;
 use crate::chunk_codec::WireChunk;
+use crate::features;
 use crate::noise::Xoroshiro;
 use crate::registry::BlockRegistry;
 use crate::terrain::{HeightmapGenerator, SectionBiomes};
@@ -75,6 +76,11 @@ impl DecorRng {
         self.rng.next_f32()
     }
 
+    /// The boolean draw: the low bit of one full stream step.
+    pub fn next_bool(&mut self) -> bool {
+        self.rng.next_long() & 1 == 1
+    }
+
     /// The per-chunk decoration seed: two odd draws scale the chunk
     /// origin, the world seed folds in, and the stream reseeds from the
     /// result. Input coordinates are block coordinates.
@@ -108,7 +114,7 @@ impl DecorRng {
 /// An integer draw: constant draws nothing; the others consume the
 /// stream in fixed shapes.
 #[derive(Clone)]
-enum IntDraw {
+pub(crate) enum IntDraw {
     Constant(i32),
     Uniform {
         min: i32,
@@ -118,6 +124,10 @@ enum IntDraw {
         min: i32,
         max: i32,
         plateau: i32,
+    },
+    Biased {
+        min: i32,
+        max: i32,
     },
     Clamped {
         min: i32,
@@ -131,7 +141,7 @@ enum IntDraw {
 }
 
 impl IntDraw {
-    fn parse(v: &Value) -> Result<IntDraw> {
+    pub(crate) fn parse(v: &Value) -> Result<IntDraw> {
         // A bare integer is the constant draw (the reference codec accepts
         // the literal form everywhere a provider fits).
         if let Some(n) = v.as_i64() {
@@ -154,6 +164,10 @@ impl IntDraw {
                 min: int(v, "min")?,
                 max: int(v, "max")?,
                 plateau: int(v, "plateau")?,
+            }),
+            "minecraft:biased_to_bottom" => Ok(IntDraw::Biased {
+                min: int(v, "min_inclusive")?,
+                max: int(v, "max_inclusive")?,
             }),
             "minecraft:clamped" => Ok(IntDraw::Clamped {
                 min: int(v, "min_inclusive")?,
@@ -185,7 +199,7 @@ impl IntDraw {
         }
     }
 
-    fn sample(&self, rng: &mut DecorRng) -> i32 {
+    pub(crate) fn sample(&self, rng: &mut DecorRng) -> i32 {
         match self {
             IntDraw::Constant(value) => *value,
             IntDraw::Uniform { min, max } => rng.next_int(max - min + 1) + min,
@@ -200,6 +214,10 @@ impl IntDraw {
                 let plateau_start = (range - plateau) / 2;
                 let plateau_end = range - plateau_start;
                 min + rng.next_int(plateau_end + 1) + rng.next_int(plateau_start + 1)
+            }
+            IntDraw::Biased { min, max } => {
+                let inner = rng.next_int(max - min + 1);
+                min + rng.next_int(inner + 1)
             }
             IntDraw::Clamped { min, max, source } => source.sample(rng).clamp(*min, *max),
             IntDraw::Weighted { total, entries } => {
@@ -273,6 +291,111 @@ impl Anchor {
     }
 }
 
+/// A block predicate for placement filters and feature checks.
+#[derive(Clone)]
+pub(crate) enum Predicate {
+    Blocks {
+        names: Vec<String>,
+        offset: [i32; 3],
+    },
+    Tag {
+        tag: String,
+        offset: [i32; 3],
+    },
+    Fluids {
+        names: Vec<String>,
+        offset: [i32; 3],
+    },
+    /// The named state's block must survive at the position.
+    Survive {
+        name: String,
+    },
+    Replaceable,
+    AllOf(Vec<Predicate>),
+    AnyOf(Vec<Predicate>),
+    Not(Box<Predicate>),
+    True,
+}
+
+fn predicate_offset(v: &Value) -> [i32; 3] {
+    let mut offset = [0i32; 3];
+    if let Some(list) = v.get("offset").and_then(Value::as_array) {
+        for (slot, n) in list.iter().take(3).enumerate() {
+            offset[slot] = n.as_i64().unwrap_or(0) as i32;
+        }
+    }
+    offset
+}
+
+fn name_list(v: &Value, key: &str) -> Vec<String> {
+    match v.get(key) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl Predicate {
+    pub(crate) fn parse(v: &Value) -> Result<Predicate> {
+        let kind = v.get("type").and_then(Value::as_str).context("predicate")?;
+        match kind {
+            "minecraft:matching_blocks" => Ok(Predicate::Blocks {
+                names: name_list(v, "blocks"),
+                offset: predicate_offset(v),
+            }),
+            "minecraft:matching_block_tag" => {
+                let tag = v
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .context("predicate tag")?;
+                let tag = tag.strip_prefix("minecraft:").unwrap_or(tag);
+                Ok(Predicate::Tag {
+                    tag: tag.to_string(),
+                    offset: predicate_offset(v),
+                })
+            }
+            "minecraft:matching_fluids" => Ok(Predicate::Fluids {
+                names: name_list(v, "fluids"),
+                offset: predicate_offset(v),
+            }),
+            "minecraft:would_survive" => {
+                let state = v
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .context("survive state")?;
+                let (name, _) = BlockRegistry::split_state(state);
+                Ok(Predicate::Survive {
+                    name: name.to_string(),
+                })
+            }
+            "minecraft:replaceable" => Ok(Predicate::Replaceable),
+            "minecraft:all_of" | "minecraft:any_of" => {
+                let inner: Vec<Predicate> = v
+                    .get("predicates")
+                    .and_then(Value::as_array)
+                    .context("predicate list")?
+                    .iter()
+                    .map(Predicate::parse)
+                    .collect::<Result<_>>()?;
+                if kind == "minecraft:all_of" {
+                    Ok(Predicate::AllOf(inner))
+                } else {
+                    Ok(Predicate::AnyOf(inner))
+                }
+            }
+            "minecraft:not" => Ok(Predicate::Not(Box::new(Predicate::parse(
+                v.get("predicate").context("not predicate")?,
+            )?))),
+            "minecraft:true" => Ok(Predicate::True),
+            other => bail!("unsupported predicate {other}"),
+        }
+    }
+}
+
 /// One modifier in a placed feature's placement stack.
 #[derive(Clone)]
 enum Modifier {
@@ -292,6 +415,7 @@ enum Modifier {
         min: i32,
         max: i32,
     },
+    Filter(Predicate),
     /// Recognized but not evaluated: features carrying one are skipped.
     Unsupported,
 }
@@ -351,8 +475,10 @@ impl Modifier {
                     .and_then(Value::as_i64)
                     .unwrap_or(i32::MAX as i64) as i32,
             }),
-            "minecraft:block_predicate_filter"
-            | "minecraft:environment_scan"
+            "minecraft:block_predicate_filter" => Ok(Modifier::Filter(Predicate::parse(
+                v.get("predicate").context("filter predicate")?,
+            )?)),
+            "minecraft:environment_scan"
             | "minecraft:count_on_every_layer"
             | "minecraft:noise_based_count"
             | "minecraft:noise_threshold_count"
@@ -377,13 +503,23 @@ impl PlacedFeatureCfg {
             .with_context(|| format!("reading {}", path.display()))?;
         let v: Value =
             serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        PlacedFeatureCfg::from_value(&v)
+    }
+
+    /// Parses a placed feature from its json object (the pinned files and
+    /// the inline references share the shape).
+    pub(crate) fn from_value(v: &Value) -> Result<PlacedFeatureCfg> {
         let placement = v
             .get("placement")
             .and_then(Value::as_array)
-            .context("placement stack")?
-            .iter()
-            .map(Modifier::parse)
-            .collect::<Result<Vec<_>>>()?;
+            .map(|stack| {
+                stack
+                    .iter()
+                    .map(Modifier::parse)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(PlacedFeatureCfg {
             feature: v.get("feature").cloned().unwrap_or(Value::Null),
             placement,
@@ -711,9 +847,14 @@ pub struct Decorator<'a> {
     pins: std::path::PathBuf,
     registry: &'a BlockRegistry,
     features: HashMap<usize, Option<PlacedFeatureCfg>>,
+    named: HashMap<String, Option<PlacedFeatureCfg>>,
+    feature_configs: HashMap<String, Option<Value>>,
     chunks: HashMap<(i32, i32), ChunkState>,
     traits: StateTraits,
     tags: TagResolver,
+    /// Probe of the placements that reached a feature, for tests.
+    #[cfg(test)]
+    pub(crate) visits: Option<Vec<(String, i32, i32, i32)>>,
 }
 
 impl<'a> Decorator<'a> {
@@ -735,8 +876,12 @@ impl<'a> Decorator<'a> {
             pins,
             registry,
             features: HashMap::new(),
+            named: HashMap::new(),
+            feature_configs: HashMap::new(),
             chunks: HashMap::new(),
             traits: StateTraits::default(),
+            #[cfg(test)]
+            visits: None,
         })
     }
 
@@ -762,7 +907,7 @@ impl<'a> Decorator<'a> {
     }
 
     /// Ensures the chunk exists in the region (terrain + biomes).
-    fn ensure_chunk(&mut self, cx: i32, cz: i32) {
+    pub(crate) fn ensure_chunk(&mut self, cx: i32, cz: i32) {
         if self.chunks.contains_key(&(cx, cz)) {
             return;
         }
@@ -785,11 +930,7 @@ impl<'a> Decorator<'a> {
     /// Decorates the chunk exactly once: possible biomes come from the
     /// 3x3 neighborhood's stored cells, and each candidate feature
     /// reseeds from its step and index before its placement runs.
-    /// `place` receives the final positions.
-    pub fn decorate<F>(&mut self, cx: i32, cz: i32, place: &mut F)
-    where
-        F: FnMut(&mut Decorator<'a>, usize, &mut DecorRng, i32, i32, i32) -> bool,
-    {
+    pub fn decorate(&mut self, cx: i32, cz: i32) {
         for dx in -1..=1 {
             for dz in -1..=1 {
                 self.ensure_chunk(cx + dx, cz + dz);
@@ -821,25 +962,45 @@ impl<'a> Decorator<'a> {
             for index in indices {
                 let key = self.plan.steps[step][index];
                 rng.set_feature_seed(decoration_seed, index as i32, step as i32);
-                self.place_placed(key, &mut rng, cx * EDGE, cz * EDGE, place);
+                self.place_placed(key, &mut rng, cx * EDGE, cz * EDGE);
             }
         }
     }
 
-    /// Runs one placed feature's placement stack from the chunk origin.
-    fn place_placed<F>(&mut self, key: usize, rng: &mut DecorRng, ox: i32, oz: i32, place: &mut F)
-    where
-        F: FnMut(&mut Decorator<'a>, usize, &mut DecorRng, i32, i32, i32) -> bool,
-    {
+    /// Runs one placed feature of the plan from the chunk origin.
+    fn place_placed(&mut self, key: usize, rng: &mut DecorRng, ox: i32, oz: i32) {
         let Some(cfg) = self.load_feature(key).cloned() else {
             return;
         };
-        if cfg.has_unsupported() || cfg.placement.is_empty() {
+        let name = self.plan.names[key].clone();
+        self.eval_placement(&name, Some(key), &cfg, rng, ox, MIN_Y, oz);
+    }
+
+    /// The placement worklist: modifier entries resolve to a position
+    /// list, deeper modifiers run the resolved positions depth-first, and
+    /// the last modifier's outputs run the feature itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn eval_placement(
+        &mut self,
+        name: &str,
+        key: Option<usize>,
+        cfg: &PlacedFeatureCfg,
+        rng: &mut DecorRng,
+        ox: i32,
+        oy: i32,
+        oz: i32,
+    ) {
+        if cfg.has_unsupported() {
+            return;
+        }
+        // An empty placement stack places at the position it was given.
+        if cfg.placement.is_empty() {
+            self.place_final(name, &cfg.feature, rng, ox, oy, oz);
             return;
         }
         let span = LAYERS as i32;
         // Worklist entries: (x, y, z, modifier index).
-        let mut stack: Vec<(i32, i32, i32, usize)> = vec![(ox, MIN_Y, oz, 0)];
+        let mut stack: Vec<(i32, i32, i32, usize)> = vec![(ox, oy, oz, 0)];
         let mut out: Vec<(i32, i32, i32)> = Vec::new();
         while let Some((x, y, z, index)) = stack.pop() {
             out.clear();
@@ -867,7 +1028,9 @@ impl<'a> Decorator<'a> {
                     }
                 }
                 Modifier::Biome => {
-                    if self.plan.biome_has_feature(self.biome_at(x, y, z), key) {
+                    let listed =
+                        key.is_some_and(|k| self.plan.biome_has_feature(self.biome_at(x, y, z), k));
+                    if listed {
                         out.push((x, y, z));
                     }
                 }
@@ -893,6 +1056,11 @@ impl<'a> Decorator<'a> {
                         out.push((x, y, z));
                     }
                 }
+                Modifier::Filter(p) => {
+                    if features::test_predicate(self, p, x, y, z) {
+                        out.push((x, y, z));
+                    }
+                }
                 Modifier::Unsupported => return,
             }
             let next = index + 1;
@@ -902,10 +1070,29 @@ impl<'a> Decorator<'a> {
                 }
             } else {
                 for &(px, py, pz) in &out {
-                    place(self, key, rng, px, py, pz);
+                    self.place_final(name, &cfg.feature, rng, px, py, pz);
                 }
             }
         }
+    }
+
+    /// Runs the configured feature at one resolved position.
+    fn place_final(
+        &mut self,
+        _name: &str,
+        feature: &Value,
+        rng: &mut DecorRng,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) {
+        #[cfg(test)]
+        if let Some(log) = self.visits.as_mut() {
+            if !_name.is_empty() {
+                log.push((_name.to_string(), x, y, z));
+            }
+        }
+        features::run_feature(self, feature, rng, x, y, z);
     }
 
     /// Loads (and caches) a placed feature config; None marks a pin that
@@ -916,6 +1103,28 @@ impl<'a> Decorator<'a> {
             self.features.insert(key, cfg);
         }
         self.features.get(&key).and_then(|c| c.as_ref())
+    }
+
+    /// Loads a placed feature config by id (the inner references inside
+    /// feature configs).
+    pub(crate) fn load_named(&mut self, id: &str) -> Option<PlacedFeatureCfg> {
+        if !self.named.contains_key(id) {
+            let cfg = PlacedFeatureCfg::load(&self.pins, id).ok();
+            self.named.insert(id.to_string(), cfg);
+        }
+        self.named.get(id).cloned().flatten()
+    }
+
+    /// Loads (and caches) a raw feature config by id: the configured
+    /// feature a placed feature's feature field names.
+    pub(crate) fn load_feature_config(&mut self, id: &str) -> Option<Value> {
+        if !self.feature_configs.contains_key(id) {
+            let cfg = std::fs::read_to_string(self.pins.join("feature").join(format!("{id}.json")))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            self.feature_configs.insert(id.to_string(), cfg);
+        }
+        self.feature_configs.get(id).cloned().flatten()
     }
 
     /// The climate biome at a block position, from the stored section
@@ -935,7 +1144,7 @@ impl<'a> Decorator<'a> {
 
     /// The cached height of a kind at a column; the first query scans
     /// the chunk's columns, later writes keep the cache current.
-    fn height(&mut self, kind: HeightKind, x: i32, z: i32) -> i32 {
+    pub(crate) fn height(&mut self, kind: HeightKind, x: i32, z: i32) -> i32 {
         let cx = x.div_euclid(EDGE);
         let cz = z.div_euclid(EDGE);
         let column = (z.rem_euclid(EDGE) * EDGE + x.rem_euclid(EDGE)) as usize;
@@ -1011,6 +1220,26 @@ impl<'a> Decorator<'a> {
         self.chunks
             .get(&(cx, cz))
             .map_or(0, |c| c.blocks[layer * COLUMNS + column])
+    }
+
+    /// The block registry the region resolves states against.
+    pub(crate) fn registry(&self) -> &BlockRegistry {
+        self.registry
+    }
+
+    /// The block name of a state id (empty when unknown).
+    pub(crate) fn block_name(&self, state: u32) -> &str {
+        self.registry.state_of(state).map_or("", |(name, _)| name)
+    }
+
+    /// The state id of a block name plus property text.
+    pub(crate) fn state_id_of(&self, name: &str, props: &str) -> Option<u32> {
+        self.registry.state_id(name, props)
+    }
+
+    /// Whether a block tag (pinned) lists the block name.
+    pub(crate) fn tag_contains(&mut self, tag: &str, name: &str) -> bool {
+        self.tags.contains(tag, name)
     }
 
     /// Emits the chunk as a wire chunk from its current buffer.
@@ -1262,40 +1491,73 @@ mod tests {
 
     /// The driver over the pins at the spawn seed: features fire only in
     /// their biomes, positions stay inside the chunk column band the
-    /// modifiers can produce, and the visit list is a pure function of the
-    /// chunk.
+    /// modifiers can produce, the trees write logs and leaves, and the
+    /// visit list is a pure function of the chunk.
     #[test]
     fn decorates_dark_forest_chunk() {
         let reg = registry();
         let terrain = HeightmapGenerator::with_seed(42, &reg).expect("density generator");
         assert_eq!(terrain.biome_at(0, 64, 0), 9, "spawn chunk is dark forest");
         let mut dec = Decorator::new(&terrain, &reg, 42).expect("decorator");
+        let vegetal = dec.key_of("dark_forest_vegetation").expect("plan key");
 
-        let mut visits: Vec<(String, i32, i32, i32)> = Vec::new();
-        {
-            let mut sink =
-                |d: &mut Decorator, key: usize, _rng: &mut DecorRng, x: i32, y: i32, z: i32| {
-                    visits.push((d.feature_name(key).to_string(), x, y, z));
-                    true
-                };
-            dec.decorate(0, 0, &mut sink);
+        // The river crossing the spawn window drowns the spawn chunk's
+        // own trees (its water depth filter rejects every position), so
+        // the tree assertions ride on the first dry forest chunk around
+        // it.
+        let mut tree_chunk = None;
+        'search: for cx in -2..=2i32 {
+            for cz in -2..=2i32 {
+                let (x, z) = (cx * 16 + 8, cz * 16 + 8);
+                dec.ensure_chunk(cx, cz);
+                let floor = dec.height(HeightKind::OceanFloor, x, z);
+                let surface = dec.height(HeightKind::WorldSurface, x, z);
+                let biome = dec.biome_at(x, floor, z);
+                if surface == floor && dec.biome_has_feature(biome, vegetal) {
+                    tree_chunk = Some((cx, cz));
+                    break 'search;
+                }
+            }
         }
-        assert!(!visits.is_empty(), "supported features placed");
-        for (name, x, y, z) in &visits {
-            assert!(
-                (0..16).contains(x) && (0..16).contains(z),
-                "{name} landed at ({x},{z})"
-            );
-            assert!(
-                *y >= MIN_Y && *y < MIN_Y + LAYERS as i32,
-                "{name} height {y}"
-            );
-            assert!(
-                dec.biome_has_feature(dec.biome_at(*x, *y, *z), dec.key_of(name).unwrap()),
-                "{name} placed outside its biome"
-            );
-        }
-        let count = |name: &str| visits.iter().filter(|(n, ..)| n == name).count();
+        let tree_chunk = tree_chunk.expect("a dry forest chunk in the neighborhood");
+
+        dec.visits = Some(Vec::new());
+        dec.decorate(0, 0);
+        let spawn_visits = dec.visits.take().expect("probe armed");
+        dec.visits = Some(Vec::new());
+        dec.decorate(tree_chunk.0, tree_chunk.1);
+        let tree_visits = dec.visits.take().expect("probe armed");
+
+        let check = |dec: &Decorator, visits: &[(String, i32, i32, i32)], cx: i32, cz: i32| {
+            assert!(!visits.is_empty(), "supported features placed");
+            let (bx, bz) = (cx * 16, cz * 16);
+            for (name, x, y, z) in visits {
+                // The square pick stays in the chunk; an offset modifier
+                // may then walk a position into the neighboring band.
+                assert!(
+                    (bx - 16..bx + 32).contains(x) && (bz - 16..bz + 32).contains(z),
+                    "{name} landed at ({x},{z})"
+                );
+                assert!(
+                    *y >= MIN_Y && *y < MIN_Y + LAYERS as i32,
+                    "{name} height {y}"
+                );
+                // The biome gate runs mid-stack, so an offset can carry a
+                // visit into a biome that never listed the feature; only
+                // a stack without offsets gates where the visit lands.
+                if name == "glow_lichen" {
+                    let key = dec.key_of("glow_lichen").expect("glow lichen key");
+                    assert!(
+                        dec.biome_has_feature(dec.biome_at(*x, *y, *z), key),
+                        "glow_lichen placed outside its biome"
+                    );
+                }
+            }
+        };
+        check(&dec, &spawn_visits, 0, 0);
+        check(&dec, &tree_visits, tree_chunk.0, tree_chunk.1);
+
+        let count = |name: &str| spawn_visits.iter().filter(|(n, ..)| n == name).count();
         assert!(count("glow_lichen") > 0, "glow lichen survived all filters");
         assert!(count("glow_lichen") <= 157, "count bounds the visits");
         assert!(
@@ -1312,19 +1574,42 @@ mod tests {
             0,
             "predicate filter skips wholesale"
         );
+        assert_eq!(count("kelp_cold"), 0, "noise count skips wholesale");
+        assert_eq!(
+            count("patch_tall_grass_2"),
+            0,
+            "noise threshold skips wholesale"
+        );
 
-        // The visit list is a pure function of the chunk: a fresh region
-        // over the same terrain reproduces it exactly.
-        let mut again = Decorator::new(&terrain, &reg, 42).expect("decorator");
-        let mut replay: Vec<(String, i32, i32, i32)> = Vec::new();
-        {
-            let mut sink =
-                |d: &mut Decorator, key: usize, _rng: &mut DecorRng, x: i32, y: i32, z: i32| {
-                    replay.push((d.feature_name(key).to_string(), x, y, z));
-                    true
-                };
-            again.decorate(0, 0, &mut sink);
+        let (bx, bz) = (tree_chunk.0 * 16, tree_chunk.1 * 16);
+        let mut logs = 0;
+        let mut leaves = 0;
+        for y in MIN_Y..MIN_Y + LAYERS as i32 {
+            for x in bx..bx + 16 {
+                for z in bz..bz + 16 {
+                    let name = dec.block_name(dec.block(x, y, z));
+                    if name.ends_with("_log") {
+                        logs += 1;
+                    }
+                    if name.ends_with("_leaves") {
+                        leaves += 1;
+                    }
+                }
+            }
         }
-        assert_eq!(visits, replay, "decoration is deterministic");
+        assert!(logs > 0, "trees wrote logs");
+        assert!(leaves > 0, "trees wrote leaves");
+
+        // The visit lists are a pure function of the chunk set: a fresh
+        // region over the same terrain reproduces them exactly.
+        let mut again = Decorator::new(&terrain, &reg, 42).expect("decorator");
+        again.visits = Some(Vec::new());
+        again.decorate(0, 0);
+        let replay_spawn = again.visits.take().expect("probe armed");
+        again.visits = Some(Vec::new());
+        again.decorate(tree_chunk.0, tree_chunk.1);
+        let replay_tree = again.visits.take().expect("probe armed");
+        assert_eq!(spawn_visits, replay_spawn, "decoration is deterministic");
+        assert_eq!(tree_visits, replay_tree, "decoration is deterministic");
     }
 }
