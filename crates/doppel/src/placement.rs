@@ -15,7 +15,7 @@ use crate::game::{DIR_DOWN, DIR_EAST, DIR_NORTH, DIR_SOUTH, DIR_UP, DIR_WEST};
 /// 0x42; 26.3 inserts `punch` at 0x2e, shifting every later serverbound id
 /// +1 (the same shift that moves set_carried_item 0x35 -> 0x36). The
 /// registration order in the pinned 26.3 jar confirms 0x43.
-pub const SERVERBOUND_USE_ITEM_ON: i32 = 0x43;
+pub const SERVERBOUND_USE_ITEM_ON: i32 = 0x42;
 
 /// Serverbound `move_player_rot`: yaw f32, pitch f32, flags u8.
 pub const SERVERBOUND_MOVE_PLAYER_ROT: i32 = 0x20;

@@ -433,9 +433,8 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
             Some(game::Inbound::SetCarriedItem { conn, slot })
         }
         // set_creative_mode_slot: creative clients push their picked
-        // stacks. 26.3 id derived from the 26.2 registration order
-        // shift; wire-verify against a capture.
-        0x39 => {
+        // stacks.
+        0x38 => {
             let set = inventory::parse_set_creative_slot(body).ok()?;
             Some(game::Inbound::CreativeSlot { conn, set })
         }
@@ -455,9 +454,8 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
             })
         }
         // --- placement hooks (placement.rs) ---
-        // use_item_on: right-click a block face. Id is 26.3's (26.2's
-        // 0x42 + the inserted-punch shift); see placement.rs.
-        0x43 => {
+        // use_item_on: right-click a block face.
+        0x42 => {
             let hit = match placement::parse_use_item_on(body) {
                 Ok(hit) => hit,
                 Err(e) => {

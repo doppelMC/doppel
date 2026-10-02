@@ -1171,8 +1171,8 @@ pub fn parity_placement() -> Result<bool> {
         .map(|s| s.to_string())
         .collect();
     let raw: Vec<(i32, Vec<u8>)> = vec![
-        (0x39, bot::build_set_creative_slot(36, 1)),
-        (0x43, bot::build_use_item_on_top(10, 99, 10, 1)),
+        (0x38, bot::build_set_creative_slot(36, 1)),
+        (0x42, bot::build_use_item_on_top(10, 99, 10, 1)),
     ];
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
