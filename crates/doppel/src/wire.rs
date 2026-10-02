@@ -914,7 +914,9 @@ fn placement_shape(host: &mut impl WireHost, p: Pos, props: &str) -> String {
             host.set_wire_state(p.0, p.1, p.2, state);
         }
     }
-    get(host, p).map(|(_, p2)| p2).unwrap_or_else(|| props.to_string())
+    get(host, p)
+        .map(|(_, p2)| p2)
+        .unwrap_or_else(|| props.to_string())
 }
 
 /// The directional shape update: recompute only the side facing the

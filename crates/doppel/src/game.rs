@@ -863,7 +863,11 @@ impl Game {
         }
         let powered = props.contains("powered=true");
         if std::env::var_os("OBS_TRACE").is_some() {
-            eprintln!("[obs] tick {} toggle at ({x},{y},{z}): {}", self.tick, if powered { "off" } else { "on" });
+            eprintln!(
+                "[obs] tick {} toggle at ({x},{y},{z}): {}",
+                self.tick,
+                if powered { "off" } else { "on" }
+            );
         }
         let new_props = doppel_world::registry::BlockRegistry::with_prop(
             &props,
