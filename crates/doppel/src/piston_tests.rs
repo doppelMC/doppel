@@ -441,6 +441,61 @@ fn circuit_trace() {
 }
 
 #[test]
+fn ci_placement_path_repro() {
+    let (mut g, rx) = harness();
+    cmd(&mut g, "setblock 1 -60 1 minecraft:stone");
+    g.tick_once_for_test();
+    g.handle(Inbound::Tp {
+        conn: 0,
+        x: 1.0,
+        y: -59.0,
+        z: 3.0,
+    });
+    g.tick_once_for_test();
+    g.handle(Inbound::Give {
+        conn: 0,
+        item: "minecraft:stone".to_string(),
+        count: 64,
+    });
+    g.tick_once_for_test();
+    let _ = rx;
+    // The exact wire bytes the oracle bot sends.
+    let mut body = Vec::new();
+    body.push(0); // hand
+    let packed: i64 = (1i64 << 38) | (1i64 << 12) | (-60i64 & 0xfff);
+    body.extend_from_slice(&packed.to_be_bytes());
+    body.push(1); // face up
+    body.extend_from_slice(&0.5f32.to_be_bytes());
+    body.extend_from_slice(&1.0f32.to_be_bytes());
+    body.extend_from_slice(&0.5f32.to_be_bytes());
+    body.push(0);
+    body.push(0);
+    body.push(1); // sequence
+    let hit = match crate::placement::parse_use_item_on(&body) {
+        Ok(h) => h,
+        Err(e) => panic!("parse failed: {e:#}"),
+    };
+    g.handle(Inbound::UseItemOn {
+        conn: 0,
+        x: hit.x,
+        y: hit.y,
+        z: hit.z,
+        face: hit.face,
+        cursor_x: hit.cursor_x,
+        cursor_y: hit.cursor_y,
+        cursor_z: hit.cursor_z,
+        hand: hit.hand,
+        sequence: hit.sequence,
+    });
+    g.tick_once_for_test();
+    assert_eq!(
+        g.block_label_for_test(1, -59, 1),
+        "minecraft:stone[]",
+        "the clicked block lands"
+    );
+}
+
+#[test]
 fn lever_state_ids() {
     let (_tx, _rx) = std::sync::mpsc::channel::<Inbound>();
     let g = Game::new(_rx, None, None);
