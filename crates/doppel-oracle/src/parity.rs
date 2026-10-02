@@ -1167,14 +1167,13 @@ pub fn parity_placement() -> Result<bool> {
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
     let commands: Vec<String> = [
-        "setblock 10 99 10 minecraft:stone",
-        "tp @s 10 101 12",
+        "setblock 1 -60 1 minecraft:stone",
         "give @s minecraft:stone 64",
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(10, 99, 10, 1))];
+    let raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(1, -60, 1, 1))];
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
@@ -1276,8 +1275,8 @@ pub fn parity_placement() -> Result<bool> {
             dw.len()
         ));
     }
-    if !vw.iter().any(|(p, _)| *p == (10, 100, 10)) {
-        failures.push("the placed block at (10,100,10) is missing".to_string());
+    if !vw.iter().any(|(p, _)| *p == (1, -59, 1)) {
+        failures.push("the placed block at (1,-59,1) is missing".to_string());
     }
 
     if failures.is_empty() {
