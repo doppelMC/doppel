@@ -143,6 +143,19 @@ impl BiomeTable {
         self.rows[0].biome
     }
 
+    /// The distinct biomes in generation (first-appearance) order: the
+    /// order the biome source lists them in, which drives feature-order
+    /// construction.
+    pub fn biome_order(&self) -> Vec<u32> {
+        let mut order: Vec<u32> = Vec::new();
+        for row in &self.rows {
+            if !order.contains(&row.biome) {
+                order.push(row.biome);
+            }
+        }
+        order
+    }
+
     /// The number of table rows.
     pub fn len(&self) -> usize {
         self.rows.len()
