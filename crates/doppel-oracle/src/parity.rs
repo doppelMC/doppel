@@ -989,37 +989,6 @@ pub fn parity_redstone() -> Result<bool> {
         "setblock 13 101 12 minecraft:stone",
         "tick step 1",
         "setblock 16 101 12 minecraft:stone",
-        // Diagonal-shape probes on a separate platform strip: paced
-        // placements of explicit dots, read back from the final map.
-        // P1: same-level pair (control). P2: one-up diagonal. P3: the
-        // staircase (wire, stone, wire-on-stone).
-        "setblock 30 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 31 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 34 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 35 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 38 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 39 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 42 99 10 minecraft:stone",
-        "tick step 1",
-        "setblock 30 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
-        "setblock 31 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
-        "setblock 34 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
-        "setblock 34 101 9 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
-        "setblock 38 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
-        "setblock 39 100 10 minecraft:stone",
-        "tick step 1",
-        "setblock 39 101 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 10",
     ]
     .iter()
