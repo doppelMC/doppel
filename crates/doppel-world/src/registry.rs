@@ -68,10 +68,29 @@ impl BlockRegistry {
         if let Some(id) = self.by_key.get(&key(name, &props)) {
             return Some(*id);
         }
-        // Fill unspecified props from the block's default state.
+        // Fill unspecified props from the property defaults first, then
+        // from the enumeration's first state for anything unknown: the
+        // generator lists states in property-value order, not with the
+        // default first (a bare wire enumerates "up" before "none").
+        let mut pairs: Vec<String> = Vec::new();
+        let known = self.by_id.values().find(|(n, _)| n == name);
+        if let Some((_, first_props)) = known {
+            for pair in first_props.split(',').filter(|p| !p.is_empty()) {
+                if let Some((k, _)) = pair.split_once('=') {
+                    pairs.push(format!("{k}={}", prop_default(k)));
+                }
+            }
+        }
+        let base = pairs.join(",");
+        let merged = merge_props(&base, &props);
+        if let Some(id) = self.by_key.get(&key(name, &merged)) {
+            return Some(*id);
+        }
+        // Fall back to the first state's values for props without a
+        // known default.
         let default_id = *self.defaults.get(name)?;
         let (_, default_props) = self.by_id.get(&default_id)?;
-        let merged = merge_props(default_props, &props);
+        let merged = merge_props(default_props, &merged);
         self.by_key.get(&key(name, &merged)).copied()
     }
 
@@ -110,6 +129,26 @@ impl BlockRegistry {
             .collect();
         pairs.push(format!("{name}={value}"));
         canonical_props(&pairs.join(","))
+    }
+}
+
+/// The default value of a block-state property. Keyed per property, not
+/// per block: defaults are uniform across the families the engine models.
+fn prop_default(prop: &str) -> &'static str {
+    match prop {
+        "powered" => "false",
+        "lit" => "true",
+        "locked" => "false",
+        "delay" => "1",
+        "mode" => "compare",
+        "facing" => "north",
+        "face" => "floor",
+        "power" => "0",
+        "east" | "north" | "south" | "west" => "none",
+        "extended" => "false",
+        "waterlogged" => "false",
+        "snowy" => "false",
+        _ => "",
     }
 }
 

@@ -780,9 +780,9 @@ fn broadcast_stream_trace() {
         "tick step 1",
         "setblock 14 100 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 1",
-        "setblock 15 101 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
-        "tick step 1",
         "setblock 15 100 12 minecraft:stone",
+        "tick step 1",
+        "setblock 15 101 12 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
         "tick step 1",
         "setblock 13 101 12 minecraft:stone",
         "tick step 1",
@@ -891,6 +891,16 @@ fn broadcast_stream_trace() {
         "[stream] final lever map state: {:?}",
         map.get(&(10, 100, 10))
     );
+    let reg = g.registry_snapshot_for_test();
+    let mut finals: Vec<_> = map.iter().collect();
+    finals.sort();
+    for (pos, st) in finals {
+        let label = reg
+            .state_of(*st)
+            .map(|(n, p)| format!("{n}[{p}]"))
+            .unwrap_or_else(|| st.to_string());
+        eprintln!("[stream] final {pos:?} = {label}");
+    }
     eprintln!(
         "[stream] engine get_state_id: {:?}",
         g.block_label_for_test(10, 100, 10)

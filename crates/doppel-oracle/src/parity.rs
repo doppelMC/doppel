@@ -1135,7 +1135,7 @@ pub fn parity_redstone() -> Result<bool> {
         Ok(true)
     } else {
         println!("FAIL: {} redstone difference(s):", failures.len());
-        for f in failures.iter().take(8) {
+        for f in failures.iter().take(40) {
             println!("  {f}");
         }
         Ok(false)

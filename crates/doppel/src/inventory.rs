@@ -40,7 +40,7 @@ pub const PACKET_SET_HELD_SLOT: i32 = 0x6b;
 /// `set_player_inventory`. 26.3 registration order — wire-verify.
 pub const PACKET_SET_PLAYER_INVENTORY: i32 = 0x6e;
 
-/// Serverbound `container_click`. 
+/// Serverbound `container_click`.
 pub const SERVERBOUND_CONTAINER_CLICK: i32 = 0x12;
 /// Serverbound `set_carried_item` (hotbar select, i16 slot). Derived from
 /// the 26.3 registration order: the 26.2 tail of the protocol notes said

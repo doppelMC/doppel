@@ -791,6 +791,7 @@ fn update_wire_strength(host: &mut impl WireHost, p: Pos, props: &str, queue: &m
 fn execute_update(host: &mut impl WireHost, queue: &mut NeighborQueue, p: Pos) {
     if let Some((name, props)) = get(host, p) {
         if is_wire(&name) {
+            let props = refresh_wire_shape(host, p, &props);
             update_wire_strength(host, p, &props, queue);
         } else {
             host.dispatch_neighbor_changed(p.0, p.1, p.2);
@@ -798,12 +799,37 @@ fn execute_update(host: &mut impl WireHost, queue: &mut NeighborQueue, p: Pos) {
     }
 }
 
+/// The shape-update phase: a wire notified of a neighbor change
+/// recomputes its connection sides from the world. A connection-only
+/// change writes the state without any power fan-out; the power recompute
+/// that arrived with the same notification follows separately.
+fn refresh_wire_shape(host: &mut impl WireHost, p: Pos, props: &str) -> String {
+    let stored = Connections::from_props(props);
+    let live = get_connection_state(host, p, props);
+    if std::env::var_os("SHAPE_TRACE").is_some() {
+        eprintln!("[shape] {p:?} stored {stored:?} live {live:?}");
+    }
+    if live == stored {
+        return props.to_string();
+    }
+    let power = wire_power_of(props);
+    if let Some(state) = host.resolve_wire_state(&live, power) {
+        if get(host, p).is_some_and(|(name, _)| is_wire(&name)) {
+            host.set_wire_state(p.0, p.1, p.2, state);
+        }
+    }
+    get(host, p)
+        .map(|(_, p2)| p2)
+        .unwrap_or_else(|| props.to_string())
+}
+
 /// Entry point from `Game::update_wire`: recompute one wire, then drain
 /// the entire same-tick cascade. No scheduled ticks anywhere on this
 /// path — the whole propagation is synchronous.
 pub fn update_wire_cascade(host: &mut impl WireHost, x: i32, y: i32, z: i32, props: &str) {
     let mut queue = NeighborQueue::new();
-    update_wire_strength(host, (x, y, z), props, &mut queue);
+    let props = refresh_wire_shape(host, (x, y, z), props);
+    update_wire_strength(host, (x, y, z), &props, &mut queue);
     queue.drain(host);
 }
 

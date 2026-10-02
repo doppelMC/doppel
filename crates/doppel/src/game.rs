@@ -716,6 +716,16 @@ impl Game {
             _ => false,
         };
         if needs_floor_support && !self.is_support(x, y - 1, z) {
+            if std::env::var_os("POP_TRACE").is_some() {
+                let below = self
+                    .get_block(x, y - 1, z)
+                    .map(|(n, p)| format!("{n}[{p}]"))
+                    .unwrap_or_else(|| "none".into());
+                eprintln!(
+                    "[pop] tick {} {name} at ({x},{y},{z}): below={below}",
+                    self.tick
+                );
+            }
             self.set_block(x, y, z, 0, true);
             return false;
         }
@@ -849,6 +859,14 @@ impl Game {
                 }
                 "minecraft:lever" if p.contains("powered=true") => return 15,
                 "minecraft:repeater" if p.contains("powered=true") => return 15,
+                "minecraft:comparator" if p.contains("powered=true") => return 15,
+                "minecraft:redstone_torch" | "minecraft:redstone_wall_torch"
+                    if !p.contains("lit=false") =>
+                {
+                    return 15
+                }
+                "minecraft:redstone_block" => return 15,
+                "minecraft:observer" if p.contains("powered=true") => return 15,
                 _ => {}
             }
         }
