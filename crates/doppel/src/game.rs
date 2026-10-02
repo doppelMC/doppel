@@ -201,10 +201,13 @@ pub(crate) struct Player {
     /// The last destruction stage sent for this player (dedup guard;
     /// -1 means no overlay).
     last_stage: i32,
+    /// Ticks since this player joined: the counter dig progress runs on
+    /// (vanilla's per-player game-mode ticks, not world time).
+    game_ticks: u64,
 }
 
-/// One active dig. `start_tick` is the absolute game tick the dig began
-/// (vanilla's destroyProgressStart).
+/// One active dig. `start_tick` is the digger's own tick count when the
+/// dig began (vanilla's destroyProgressStart).
 #[derive(Clone, Copy)]
 struct DigState {
     pos: (i32, i32, i32),
@@ -445,6 +448,10 @@ impl Game {
         // Dig progress advances with the tick counter (the reference's
         // per-player game mode tick); breaks land in this tick's flush.
         self.advance_digs();
+        // --- inventory hooks (inventory.rs) ---
+        // The per-tick menu broadcast: non-click inventory changes sync
+        // here unless a container menu masks them.
+        self.broadcast_pending_inventory();
         if self.tick.is_multiple_of(20) {
             // set_time (0x73): gameTime i64 + day counter. Static world
             // placeholder until time simulation lands.
@@ -553,6 +560,7 @@ impl Game {
                         dig: None,
                         delayed_destroy: None,
                         last_stage: -1,
+                        game_ticks: 0,
                     },
                 );
             }
@@ -802,31 +810,20 @@ impl Game {
         if creative {
             return;
         }
-        let body = {
-            let Some(p) = self.players.get_mut(&conn) else {
-                return;
-            };
-            let remaining = p
-                .inv
-                .inventory
-                .get(slot)
-                .map(|s| s.with_count(s.count() - 1))
-                .filter(|s| !s.is_empty());
-            p.inv.inventory.set(slot, remaining);
-            let state_id = p.inv.session.next_state_id();
-            match crate::inventory::container_to_menu(slot) {
-                Some(menu) => crate::inventory::encode_container_set_slot(
-                    0,
-                    state_id,
-                    menu as i16,
-                    p.inv.inventory.get(slot).as_ref(),
-                ),
-                None => Vec::new(),
-            }
+        // The spent stack queues for the per-tick menu broadcast: a
+        // container menu open by broadcast time masks the sync (its open
+        // snapshot already carries the new count).
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
         };
-        if !body.is_empty() {
-            self.send(conn, crate::inventory::PACKET_CONTAINER_SET_SLOT, &body);
-        }
+        let remaining = p
+            .inv
+            .inventory
+            .get(slot)
+            .map(|s| s.with_count(s.count() - 1))
+            .filter(|s| !s.is_empty());
+        p.inv.inventory.set(slot, remaining);
+        p.inv.pending_sync.insert(slot);
     }
 
     // --- breaking hooks (placement.rs) ---
@@ -946,9 +943,10 @@ impl Game {
             };
             // NOTE(breaking): interrupting a different dig echoes the old
             // target's block to the actor in the reference; skipped.
+            let start_tick = p.game_ticks;
             p.dig = Some(DigState {
                 pos,
-                start_tick: self.tick,
+                start_tick,
                 direction,
             });
         }
@@ -960,13 +958,11 @@ impl Game {
     }
 
     fn stop_destroy(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
-        let start_tick = self
-            .players
-            .get(&conn)
-            .and_then(|p| p.dig)
-            .filter(|d| d.pos == pos)
-            .map(|d| d.start_tick);
-        let Some(start_tick) = start_tick else {
+        let Some((start_tick, now)) = self.players.get(&conn).and_then(|p| {
+            p.dig
+                .filter(|d| d.pos == pos)
+                .map(|d| (d.start_tick, p.game_ticks))
+        }) else {
             return;
         };
         let Some((name, _)) = self.get_block(pos.0, pos.1, pos.2) else {
@@ -977,7 +973,7 @@ impl Game {
         }
         let (dt, tool) = crate::placement::hardness(&name);
         let progress =
-            crate::placement::per_tick_progress(dt, tool) * (self.tick - start_tick + 1) as f32;
+            crate::placement::per_tick_progress(dt, tool) * (now - start_tick + 1) as f32;
         if progress >= 0.7 {
             if let Some(p) = self.players.get_mut(&conn) {
                 p.dig = None;
@@ -1025,47 +1021,30 @@ impl Game {
 
     /// Spends the held stack: whole stack for drop-all, one item for the
     /// single drop. The discarded half is the same gap as break drops.
+    /// The slot change queues for the per-tick menu broadcast like any
+    /// other non-click change.
     fn drop_held(&mut self, conn: ConnId, all: bool) {
-        let slot = {
-            let Some(p) = self.players.get(&conn) else {
-                return;
-            };
-            p.inv.inventory.selected() as usize
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
         };
-        let body = {
-            let Some(p) = self.players.get_mut(&conn) else {
-                return;
-            };
-            let held = p.inv.inventory.get(slot);
-            if held.is_none() {
-                return;
-            }
-            let remaining = if all {
-                None
-            } else {
-                held.map(|s| s.with_count(s.count() - 1))
-                    .filter(|s| !s.is_empty())
-            };
-            p.inv.inventory.set(slot, remaining);
-            let state_id = p.inv.session.next_state_id();
-            crate::inventory::container_to_menu(slot).map(|menu| {
-                crate::inventory::encode_container_set_slot(
-                    0,
-                    state_id,
-                    menu as i16,
-                    p.inv.inventory.get(slot).as_ref(),
-                )
-            })
-        };
-        if let Some(body) = body {
-            if !body.is_empty() {
-                self.send(conn, crate::inventory::PACKET_CONTAINER_SET_SLOT, &body);
-            }
+        let slot = p.inv.inventory.selected() as usize;
+        let held = p.inv.inventory.get(slot);
+        if held.is_none() {
+            return;
         }
+        let remaining = if all {
+            None
+        } else {
+            held.map(|s| s.with_count(s.count() - 1))
+                .filter(|s| !s.is_empty())
+        };
+        p.inv.inventory.set(slot, remaining);
+        p.inv.pending_sync.insert(slot);
     }
 
     /// Per-tick dig advance: delayed destroys finish, active digs deepen
-    /// their overlay. Breaks land in this tick's flush.
+    /// their overlay. The two are exclusive per player (a pending delayed
+    /// destroy starves the active dig). Breaks land in this tick's flush.
     fn advance_digs(&mut self) {
         enum Step {
             ClearDelayed,
@@ -1076,6 +1055,11 @@ impl Game {
         }
         let conns: Vec<ConnId> = self.players.keys().copied().collect();
         for conn in conns {
+            // The dig clock is per player and counts every tick, dig or
+            // not (the reference increments its counter before branching).
+            if let Some(p) = self.players.get_mut(&conn) {
+                p.game_ticks += 1;
+            }
             let step = {
                 let Some(p) = self.players.get(&conn) else {
                     continue;
@@ -1085,8 +1069,8 @@ impl Game {
                         Some((n, _)) if n != "minecraft:air" => {
                             let (dt, tool) = crate::placement::hardness(&n);
                             // The delayed path passes the START tick, not
-                            // the ticks since the STOP: a long-running
-                            // server completes these on the next tick.
+                            // the ticks since the STOP: progress is frozen
+                            // unless the dig began late in the session.
                             let progress = crate::placement::per_tick_progress(dt, tool)
                                 * (d.tick_start + 1) as f32;
                             let stage = crate::placement::destroy_stage(progress);
@@ -1104,7 +1088,7 @@ impl Game {
                     match self.get_block(dig.pos.0, dig.pos.1, dig.pos.2) {
                         Some((n, _)) if n != "minecraft:air" => {
                             let (dt, tool) = crate::placement::hardness(&n);
-                            let spent = (self.tick - dig.start_tick) as f32;
+                            let spent = (p.game_ticks - dig.start_tick) as f32;
                             let progress =
                                 crate::placement::per_tick_progress(dt, tool) * (spent + 1.0);
                             let stage = crate::placement::destroy_stage(progress);
@@ -2611,6 +2595,7 @@ impl Game {
                 dig: None,
                 delayed_destroy: None,
                 last_stage: -1,
+                game_ticks: 0,
             },
         );
         for c in chunks {

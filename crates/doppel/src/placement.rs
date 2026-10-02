@@ -871,13 +871,11 @@ mod tests {
         use_on(&mut g, 5, 100, 5, DIR_DOWN, 0);
         assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
         // Five placements consumed five items; the refused click did not.
-        // Each placement queues its own slot sync; the last shows the
-        // final count.
-        let mut last_slot_sync = None;
-        while let Some(frame) = next_set_slot(&rx) {
-            last_slot_sync = Some(frame);
-        }
-        let (container_id, _, slot, stack) = last_slot_sync.expect("slot syncs queued");
+        // The spent stack syncs on the next tick's menu broadcast, which
+        // runs ahead of that tick's world flush; the one frame carries
+        // the final count.
+        g.tick_once_for_test();
+        let (container_id, _, slot, stack) = next_set_slot(&rx).expect("slot sync queued");
         assert_eq!(container_id, 0);
         assert_eq!(slot, 36, "hotbar 0 presents as menu slot 36");
         let stack = stack.expect("59 left after five placements");
@@ -885,7 +883,8 @@ mod tests {
             (stack.count(), stack.item()),
             (59, item_id("minecraft:stone").unwrap())
         );
-        // The flush broadcasts the placements like any setblock.
+        // The flush queued the five placement broadcasts behind the slot
+        // sync; the drain helper's own tick adds nothing.
         let frames = tick(&mut g, &rx);
         assert_eq!(frames.len(), 5, "{frames:?}");
     }
@@ -896,6 +895,7 @@ mod tests {
         give(&mut g, "minecraft:stone", 2);
         use_on(&mut g, 5, 99, 5, DIR_UP, 0);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (_, _, _, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(stack.map(|s| s.count()), Some(1));
         // Click the same floor face again: the target holds the first block.
@@ -913,6 +913,7 @@ mod tests {
         give(&mut g, "minecraft:stone", 1);
         use_on(&mut g, 5, 99, 5, DIR_UP, 0);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (container_id, _, slot, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(container_id, 0);
         assert_eq!(slot, 36);
@@ -1058,6 +1059,7 @@ mod tests {
         click_swap(&mut g, 37, 40);
         use_on(&mut g, 5, 99, 5, DIR_UP, 1);
         assert_eq!(at(&g, 5, 100, 5), "minecraft:stone[]");
+        g.tick_once_for_test();
         let (_, _, slot, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(slot, 45, "offhand presents as menu slot 45");
         assert_eq!(stack.map(|s| s.count()), Some(4));
@@ -1092,6 +1094,9 @@ mod tests {
             at(&g, 6, 101, 5),
             "minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=none]"
         );
+        // The spent dust syncs and the pop fires in the same tick: the
+        // menu broadcast runs ahead of the world flush.
+        g.tick_once_for_test();
         let (_, _, _, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(stack, None, "the dust was consumed");
         let frames = tick(&mut g, &rx);
@@ -1292,8 +1297,8 @@ mod tests {
     #[test]
     fn stop_below_threshold_breaks_next_tick() {
         let (mut g, rx1) = dig_harness();
-        // A booted server's tick counter is already large when a dig
-        // starts; the delayed path multiplies progress by that counter.
+        // The digger has been in the world 200 ticks when the dig starts;
+        // the delayed pass multiplies progress by that per-player counter.
         for _ in 0..200 {
             g.tick_once_for_test();
         }
@@ -1310,6 +1315,48 @@ mod tests {
         // The delayed pass multiplies by the dig's start tick, so the
         // closing stage wraps past the byte's 0..10 overlay range.
         assert!(frames[1].2 != 0 && frames[1].2 != -1, "{frames:?}");
+    }
+
+    #[test]
+    fn stop_below_threshold_arms_frozen_delayed_destroy() {
+        let (mut g, rx1) = dig_harness();
+        // Sixty ticks in the world when the dig starts: the delayed pass
+        // multiplies one tick of stone progress by the start tick.
+        for _ in 0..60 {
+            g.tick_once_for_test();
+        }
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        g.tick_once_for_test();
+        // Start stage 0, then the frozen delayed stage (61/150 -> 4); the
+        // progress never grows again, so nothing more broadcasts.
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0, 4], "{stages:?}");
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        for _ in 0..40 {
+            g.tick_once_for_test();
+        }
+        assert!(dig_frames(&rx1).is_empty());
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+    }
+
+    #[test]
+    fn armed_delayed_destroy_starves_held_dig() {
+        let (mut g, rx1) = dig_harness();
+        // Release a fresh dig below the threshold: the pending delayed
+        // destroy owns the per-tick pass, so a later dig never deepens.
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0]);
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        let stages: Vec<i32> = dig_frames(&rx1).into_iter().map(|f| f.2).collect();
+        assert_eq!(stages, vec![0]);
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        assert!(dig_frames(&rx1).is_empty());
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
     }
 
     #[test]
@@ -1464,7 +1511,15 @@ mod tests {
     #[test]
     fn drop_all_then_drop_item() {
         let (mut g, rx) = harness();
+        // A drop's slot change rides the next tick's menu broadcast, not
+        // the drop itself.
+        let held_count = |g: &Game| {
+            let inv = g.player_inv_state_for_test(0).unwrap();
+            let slot = inv.inventory.selected() as usize;
+            inv.inventory.get(slot).map(|s| s.count())
+        };
         give(&mut g, "minecraft:stone", 5);
+        assert_eq!(held_count(&g), Some(5));
         g.handle(Inbound::PlayerAction {
             conn: 0,
             act: PlayerAction {
@@ -1476,9 +1531,15 @@ mod tests {
                 sequence: 1,
             },
         });
+        assert_eq!(held_count(&g), None, "drop-all empties the slot");
+        assert!(
+            next_set_slot(&rx).is_none(),
+            "the sync waits for the next tick"
+        );
+        g.tick_once_for_test();
         let (_, _, slot, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(slot, 36);
-        assert_eq!(stack, None, "drop-all empties the slot");
+        assert_eq!(stack, None, "the broadcast shows the emptied slot");
         // Dropping from an empty hand changes nothing.
         g.handle(Inbound::PlayerAction {
             conn: 0,
@@ -1491,6 +1552,8 @@ mod tests {
                 sequence: 2,
             },
         });
+        assert_eq!(held_count(&g), None);
+        g.tick_once_for_test();
         assert!(next_set_slot(&rx).is_none());
         // The single drop spends one item.
         give(&mut g, "minecraft:stone", 3);
@@ -1505,6 +1568,8 @@ mod tests {
                 sequence: 3,
             },
         });
+        assert_eq!(held_count(&g), Some(2));
+        g.tick_once_for_test();
         let (_, _, _, stack) = next_set_slot(&rx).unwrap();
         assert_eq!(stack.map(|s| s.count()), Some(2));
     }

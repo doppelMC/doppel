@@ -767,6 +767,9 @@ pub struct PlayerInvState {
     /// `hasInfiniteMaterials` (creative). No gamemode system yet, so this
     /// starts false; the harness flips it via `set_creative_for_test`.
     pub creative: bool,
+    /// Slots changed outside a click (a placement's spent stack, a drop)
+    /// awaiting the per-tick menu broadcast.
+    pub pending_sync: std::collections::BTreeSet<usize>,
 }
 
 /// The slot access a menu's click engine runs against: menu slot ids
@@ -1527,6 +1530,47 @@ impl Game {
         // The carried stack rides inside set_content (the client applies
         // it via initializeContents); set_cursor_item exists for the
         // targeted cursor-only syncs vanilla sends on click prediction.
+    }
+
+    /// The per-tick menu broadcast: each slot changed outside a click
+    /// syncs as its own set_slot, and only while the inventory menu is
+    /// the open menu (a container menu open at broadcast time masks the
+    /// change; its open snapshot already carries it).
+    pub(crate) fn broadcast_pending_inventory(&mut self) {
+        let conns: Vec<ConnId> = self.players.keys().copied().collect();
+        for conn in conns {
+            let frames = {
+                let Some(p) = self.players.get_mut(&conn) else {
+                    continue;
+                };
+                if p.menu.is_some() {
+                    p.inv.pending_sync.clear();
+                    continue;
+                }
+                let slots = std::mem::take(&mut p.inv.pending_sync);
+                if slots.is_empty() {
+                    continue;
+                }
+                slots
+                    .into_iter()
+                    .filter_map(|slot| {
+                        let state_id = p.inv.session.next_state_id();
+                        let menu = crate::inventory::container_to_menu(slot)?;
+                        Some(crate::inventory::encode_container_set_slot(
+                            0,
+                            state_id,
+                            menu as i16,
+                            p.inv.inventory.get(slot).as_ref(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for body in frames {
+                if !body.is_empty() {
+                    self.send(conn, PACKET_CONTAINER_SET_SLOT, &body);
+                }
+            }
+        }
     }
 }
 
