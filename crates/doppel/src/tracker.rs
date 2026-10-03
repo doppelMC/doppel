@@ -252,7 +252,15 @@ impl Game {
         let players: Vec<(ConnId, f64, f64, i32, i32)> = self
             .players
             .iter()
-            .map(|(&c, p)| (c, p.x, p.z, p.x.div_euclid(16.0) as i32, p.z.div_euclid(16.0) as i32))
+            .map(|(&c, p)| {
+                (
+                    c,
+                    p.x,
+                    p.z,
+                    p.x.div_euclid(16.0) as i32,
+                    p.z.div_euclid(16.0) as i32,
+                )
+            })
             .collect();
         let mut states = std::mem::take(&mut self.tracking.states);
         let mut last_section = std::mem::take(&mut self.tracking.last_section);
@@ -307,7 +315,8 @@ impl Game {
                 let (bx, by, bz) = state.base;
                 let (dx, dy, dz) = (s.x - bx, s.y - by, s.z - bz);
                 let position_changed = dx * dx + dy * dy + dz * dz >= POSITION_CHANGED_EPS;
-                let should_send_position = position_changed || state.tick_count % FULL_SYNC_INTERVAL == 0;
+                let should_send_position =
+                    position_changed || state.tick_count % FULL_SYNC_INTERVAL == 0;
                 // The move packet choice: a ground flip or a very stale
                 // delay forces the full packet; else a short delta when
                 // the cadence asks and the delta fits.
@@ -316,8 +325,8 @@ impl Game {
                     Pos(i16, i16, i16),
                     None,
                 }
-                let full = state.teleport_delay > TELEPORT_DELAY_CAP
-                    || state.was_on_ground != s.on_ground;
+                let full =
+                    state.teleport_delay > TELEPORT_DELAY_CAP || state.was_on_ground != s.on_ground;
                 let kind = if full {
                     state.was_on_ground = s.on_ground;
                     state.teleport_delay = 0;
@@ -350,7 +359,11 @@ impl Game {
                     Move::None
                 };
                 // The motion packet rides ahead of the move packet.
-                let (mvx, mvy, mvz) = (s.vx - state.last_movement.0, s.vy - state.last_movement.1, s.vz - state.last_movement.2);
+                let (mvx, mvy, mvz) = (
+                    s.vx - state.last_movement.0,
+                    s.vy - state.last_movement.1,
+                    s.vz - state.last_movement.2,
+                );
                 let diff = mvx * mvx + mvy * mvy + mvz * mvz;
                 let still = s.vx == 0.0 && s.vy == 0.0 && s.vz == 0.0;
                 if diff > MOTION_EPS || (diff > 0.0 && still) {
@@ -360,7 +373,8 @@ impl Game {
                 }
                 match kind {
                     Move::Sync => {
-                        let body = encode_position_sync(s.id, s.x, s.y, s.z, s.yaw, 0.0, s.on_ground);
+                        let body =
+                            encode_position_sync(s.id, s.x, s.y, s.z, s.yaw, 0.0, s.on_ground);
                         state.base = (s.x, s.y, s.z);
                         self.entity_broadcast(s.id, PACKET_ENTITY_POSITION_SYNC, &body);
                     }

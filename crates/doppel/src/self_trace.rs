@@ -289,7 +289,10 @@ fn record_session() -> Vec<String> {
     );
     // The entangled window: a block write, a menu broadcast, and the
     // spawned drop's movement frames land in the same ticks.
-    t.step("setblock dirt beside the drop", setblock(0, 4, 100, 6, "minecraft:dirt"));
+    t.step(
+        "setblock dirt beside the drop",
+        setblock(0, 4, 100, 6, "minecraft:dirt"),
+    );
     t.step(
         "give 8 dirt",
         Inbound::Give {

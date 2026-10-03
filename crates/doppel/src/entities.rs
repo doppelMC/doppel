@@ -649,7 +649,11 @@ fn move_towards_closest_space(g: &Game, m: &mut Motion, next_f32: &mut dyn FnMut
     m.vx *= 0.75;
     m.vy *= 0.75;
     m.vz *= 0.75;
-    let step = if best_positive { speed as f64 } else { -(speed as f64) };
+    let step = if best_positive {
+        speed as f64
+    } else {
+        -(speed as f64)
+    };
     match best_axis {
         0 => m.vx = step,
         1 => m.vy = step,
@@ -760,15 +764,7 @@ impl Game {
         let yaw = self.survival.next_f32() * 360.0;
         let vx = self.survival.next_unit() * 0.2 - 0.1;
         let vz = self.survival.next_unit() * 0.2 - 0.1;
-        self.spawn_item(
-            x,
-            y,
-            z,
-            (vx, 0.2, vz),
-            yaw,
-            ItemStack::new(item, 1),
-            None,
-        );
+        self.spawn_item(x, y, z, (vx, 0.2, vz), yaw, ItemStack::new(item, 1), None);
     }
 
     /// Spawns a player-thrown drop: at eye height minus 0.3, on the
@@ -913,13 +909,11 @@ impl Game {
                 }
                 // The merge cadence: every 2 ticks while crossing cells,
                 // else every 40.
-                let moved = (motion.x.floor() as i32, motion.y.floor() as i32, motion.z.floor()
-                    as i32)
-                    != (
-                        xo.floor() as i32,
-                        yo.floor() as i32,
-                        zo.floor() as i32,
-                    );
+                let moved = (
+                    motion.x.floor() as i32,
+                    motion.y.floor() as i32,
+                    motion.z.floor() as i32,
+                ) != (xo.floor() as i32, yo.floor() as i32, zo.floor() as i32);
                 let rate = if moved { 2 } else { 40 };
                 if tick_count % rate == 0 && self.survival.items[i].mergable() {
                     let absorbed_here = self.merge_from(i, &mut dead);
@@ -975,7 +969,10 @@ impl Game {
                     && (other.y - y).abs() < 0.25
                     && (other.z - z).abs() < 0.75
                     && other.mergable()
-                    && ItemStack::same_item_same_components(&other.stack, &self.survival.items[i].stack)
+                    && ItemStack::same_item_same_components(
+                        &other.stack,
+                        &self.survival.items[i].stack,
+                    )
                     && other.stack.count() + self.survival.items[i].stack.count() <= MAX_MERGE
             };
             if !near {
@@ -983,13 +980,12 @@ impl Game {
                 continue;
             }
             // The strictly smaller stack folds; ties fold this one.
-            let (victim, keeper) = if self.survival.items[i].stack.count()
-                > self.survival.items[j].stack.count()
-            {
-                (j, i)
-            } else {
-                (i, j)
-            };
+            let (victim, keeper) =
+                if self.survival.items[i].stack.count() > self.survival.items[j].stack.count() {
+                    (j, i)
+                } else {
+                    (i, j)
+                };
             let (vcount, vage, vdelay) = {
                 let v = &self.survival.items[victim];
                 (v.stack.count(), v.age, v.pickup_delay)
@@ -1390,7 +1386,10 @@ mod tests {
             encode_move_pos(2, -1, 0, 4096, true),
             vec![0x02, 0x01, 0xff, 0xff, 0x00, 0x00, 0x10, 0x00]
         );
-        assert_eq!(encode_move_pos(2, 0, 0, 0, false), vec![0x02, 0x00, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            encode_move_pos(2, 0, 0, 0, false),
+            vec![0x02, 0x00, 0, 0, 0, 0, 0, 0]
+        );
         // The packed movement's zero vector is one zero byte.
         assert_eq!(encode_set_motion(2, 0.0, 0.0, 0.0), vec![0x02, 0x00]);
     }

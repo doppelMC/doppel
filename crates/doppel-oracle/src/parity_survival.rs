@@ -149,8 +149,7 @@ fn rd_lp_vec3(raw: &[u8], o: &mut usize) -> Option<(f64, f64, f64)> {
         i64::from(b0 & 0x03)
     };
     let unpack = |shift: u32| ((buffer >> shift) & 0x7fff) as f64;
-    let decode =
-        |stored: f64| (stored / 32766.0 * 2.0 - 1.0) * scale as f64;
+    let decode = |stored: f64| (stored / 32766.0 * 2.0 - 1.0) * scale as f64;
     Some((decode(unpack(3)), decode(unpack(18)), decode(unpack(33))))
 }
 
@@ -253,10 +252,7 @@ impl Obs {
         self.eframes
             .iter()
             .skip(last_add + 1)
-            .filter(|f| {
-                f.entity() == id
-                    && !matches!(f, EFrame::Add(..) | EFrame::Data(_))
-            })
+            .filter(|f| f.entity() == id && !matches!(f, EFrame::Add(..) | EFrame::Data(_)))
             .copied()
             .collect()
     }
@@ -357,9 +353,11 @@ fn analyze(pkts: &[bot::CapturedPacket], marker: Option<usize>) -> Obs {
                     continue;
                 };
                 let ground = props & 1 != 0;
-                if let (Some(xa), Some(ya), Some(za)) =
-                    (rd_i16(&raw, &mut o), rd_i16(&raw, &mut o), rd_i16(&raw, &mut o))
-                {
+                if let (Some(xa), Some(ya), Some(za)) = (
+                    rd_i16(&raw, &mut o),
+                    rd_i16(&raw, &mut o),
+                    rd_i16(&raw, &mut o),
+                ) {
                     obs.eframes
                         .push(EFrame::Pos(id, ground, [xa as i32, ya as i32, za as i32]));
                 }
@@ -371,11 +369,16 @@ fn analyze(pkts: &[bot::CapturedPacket], marker: Option<usize>) -> Obs {
                     continue;
                 };
                 let ground = props & 1 != 0;
-                if let (Some(xa), Some(ya), Some(za)) =
-                    (rd_i16(&raw, &mut o), rd_i16(&raw, &mut o), rd_i16(&raw, &mut o))
-                {
-                    obs.eframes
-                        .push(EFrame::PosRot(id, ground, [xa as i32, ya as i32, za as i32]));
+                if let (Some(xa), Some(ya), Some(za)) = (
+                    rd_i16(&raw, &mut o),
+                    rd_i16(&raw, &mut o),
+                    rd_i16(&raw, &mut o),
+                ) {
+                    obs.eframes.push(EFrame::PosRot(
+                        id,
+                        ground,
+                        [xa as i32, ya as i32, za as i32],
+                    ));
                 }
             }
             // set_entity_motion: id plus the packed movement vector.
@@ -693,7 +696,11 @@ fn sim_tick(s: &mut SimDrop, floor: f64) {
     let horizontal = s.vx * s.vx + s.vz * s.vz;
     if !s.on_ground || horizontal > 1.0e-5 || (s.tick + s.id).rem_euclid(4) == 0 {
         // The floor plane is the only collider in the scenario's field.
-        let dy = if s.y + s.vy < floor { floor - s.y } else { s.vy };
+        let dy = if s.y + s.vy < floor {
+            floor - s.y
+        } else {
+            s.vy
+        };
         s.y += dy;
         s.x += s.vx;
         s.z += s.vz;
@@ -723,8 +730,7 @@ fn sim_pass(s: &mut SimDrop, out: &mut Vec<SimFrame>) {
         let (bx, by, bz) = s.base;
         let (dx, dy, dz) = (s.x - bx, s.y - by, s.z - bz);
         let position_changed = dx * dx + dy * dy + dz * dz >= TRACK_POSITION_EPS;
-        let should_send_position =
-            position_changed || s.pass % TRACK_FULL_INTERVAL == 0;
+        let should_send_position = position_changed || s.pass % TRACK_FULL_INTERVAL == 0;
         let (xa, ya, za) = (
             track_encode(s.x) - track_encode(bx),
             track_encode(s.y) - track_encode(by),
@@ -736,12 +742,8 @@ fn sim_pass(s: &mut SimDrop, out: &mut Vec<SimFrame>) {
             s.teleport_delay = 0;
             2
         } else if should_send_position {
-            let too_big = xa < -32768
-                || xa > 32767
-                || ya < -32768
-                || ya > 32767
-                || za < -32768
-                || za > 32767;
+            let too_big =
+                xa < -32768 || xa > 32767 || ya < -32768 || ya > 32767 || za < -32768 || za > 32767;
             let full_precision = (s.vertical_collision
                 && (xa != 0 && track_loss(s.x) != 0.0 || za != 0 && track_loss(s.z) != 0.0))
                 || (s.horizontal_collision
@@ -825,12 +827,7 @@ fn simulate(spawn: &(i32, i32, f64, f64, f64, [f64; 3])) -> Vec<SimFrame> {
 /// away-view work completes), and each capture's end jitters a couple
 /// of ticks, so the tails may differ in length by up to 4 frames; the
 /// shared prefix carries the comparison.
-fn compare_obs_pair(
-    name: &str,
-    a: &[EFrame],
-    b: &[EFrame],
-    failures: &mut Vec<String>,
-) {
+fn compare_obs_pair(name: &str, a: &[EFrame], b: &[EFrame], failures: &mut Vec<String>) {
     let head = |f: &[EFrame]| -> String {
         f.iter()
             .take(12)
@@ -887,9 +884,7 @@ fn compare_obs_pair(
                     || (oy - dy).abs() > 5.0e-3
                     || (oz - dz).abs() > 5.0e-3
             }
-            (EFrame::Take(oi, op, oa), EFrame::Take(di, dp, da)) => {
-                (oi, op, oa) != (di, dp, da)
-            }
+            (EFrame::Take(oi, op, oa), EFrame::Take(di, dp, da)) => (oi, op, oa) != (di, dp, da),
             _ => false,
         };
         if bad {
@@ -992,7 +987,10 @@ fn tail_pair_ok(o: &EFrame, s: &SimFrame) -> bool {
 /// frame landed inside it.
 fn settle_mark(frames: &[EFrame]) -> Option<usize> {
     let zero = |f: &EFrame| {
-        matches!(f, EFrame::Pos(_, _, [0, 0, 0]) | EFrame::PosRot(_, _, [0, 0, 0]))
+        matches!(
+            f,
+            EFrame::Pos(_, _, [0, 0, 0]) | EFrame::PosRot(_, _, [0, 0, 0])
+        )
     };
     let first_rest = frames
         .get(1..)
@@ -1122,15 +1120,17 @@ fn compare_tail(
             _ => false,
         });
         match land {
-            Some(i) if i > 0 => f[i + 1..]
-                .iter()
-                .filter(|x| match x {
-                    EFrame::Motion(_, v) => v[0] != 0.0 || v[2] != 0.0,
-                    EFrame::Pos(_, _, d) | EFrame::PosRot(_, _, d) => d[0] != 0 || d[2] != 0,
-                    _ => false,
-                })
-                .count()
-                >= 2,
+            Some(i) if i > 0 => {
+                f[i + 1..]
+                    .iter()
+                    .filter(|x| match x {
+                        EFrame::Motion(_, v) => v[0] != 0.0 || v[2] != 0.0,
+                        EFrame::Pos(_, _, d) | EFrame::PosRot(_, _, d) => d[0] != 0 || d[2] != 0,
+                        _ => false,
+                    })
+                    .count()
+                    >= 2
+            }
             _ => false,
         }
     };
@@ -1146,9 +1146,8 @@ fn compare_tail(
         || (shared >= 8
             && op.len().abs_diff(sp.len()) <= 6
             && pair_ok(&op[..shared], &sp[..shared]))
-        || (0..op.len()).any(|i| {
-            matches!(op[i], EFrame::Motion(..)) && pair_ok(&drop_a_motion(op, i), sp)
-        })
+        || (0..op.len())
+            .any(|i| matches!(op[i], EFrame::Motion(..)) && pair_ok(&drop_a_motion(op, i), sp))
         || (0..sp.len()).any(|i| {
             matches!(sim[i], SimFrame::Motion(_)) && {
                 let mut cut = sim.to_vec();
@@ -1264,15 +1263,7 @@ pub fn parity_survival() -> Result<bool> {
             .unwrap_or_default()
     };
     for (who, digger, walker, s, walk, all, wit) in [
-        (
-            "vanilla",
-            &v_digger,
-            &v_walker,
-            &v,
-            &v_walk,
-            &v_all,
-            &v_wit,
-        ),
+        ("vanilla", &v_digger, &v_walker, &v, &v_walk, &v_all, &v_wit),
         ("doppel", &d_digger, &d_walker, &d, &d_walk, &d_all, &d_wit),
     ] {
         println!(
@@ -1285,10 +1276,7 @@ pub fn parity_survival() -> Result<bool> {
             walker.len(),
             histogram(walker)
         );
-        for (name, note) in [
-            ("digger", end_note(digger)),
-            ("walker", end_note(walker)),
-        ] {
+        for (name, note) in [("digger", end_note(digger)), ("walker", end_note(walker))] {
             if !note.is_empty() {
                 println!("[oracle] {who} {name} {note}");
             }
@@ -1340,9 +1328,7 @@ pub fn parity_survival() -> Result<bool> {
             println!("[oracle] {who} remove: count={count} first={first}");
         }
         for (item, player, amount) in &walk.takes {
-            println!(
-                "[oracle] {who} walker take: item={item} player={player} amount={amount}"
-            );
+            println!("[oracle] {who} walker take: item={item} player={player} amount={amount}");
         }
         for (count, first) in &walk.removes {
             println!("[oracle] {who} walker remove: count={count} first={first}");
@@ -1394,10 +1380,7 @@ pub fn parity_survival() -> Result<bool> {
     // witness hold each spawn pairing once (their adds carry the spawn
     // position, inside the cell window); the walker's pairings are
     // id-keyed below (its adds carry the settled position).
-    for (who, s, wit) in [
-        ("vanilla", &v, &v_wit),
-        ("doppel", &d, &d_wit),
-    ] {
+    for (who, s, wit) in [("vanilla", &v, &v_wit), ("doppel", &d, &d_wit)] {
         for (name, cell) in [("A", TORCH), ("B", TORCH_B)] {
             if s.adds_in(cell).len() != 1 {
                 failures.push(format!(
@@ -1468,9 +1451,7 @@ pub fn parity_survival() -> Result<bool> {
         let vs = v.adds_in(cell);
         let ds = d.adds_in(cell);
         if let (Some(vv), Some(dd)) = (vs.first(), ds.first()) {
-            for (axis, a, b) in
-                [("x", vv.2, dd.2), ("y", vv.3, dd.3), ("z", vv.4, dd.4)]
-            {
+            for (axis, a, b) in [("x", vv.2, dd.2), ("y", vv.3, dd.3), ("z", vv.4, dd.4)] {
                 if (a - b).abs() > 0.5 + 1.0e-9 {
                     failures.push(format!(
                         "drop {name} spawn {axis} drifts across servers: {a:.4} vs {b:.4}"
@@ -1498,8 +1479,14 @@ pub fn parity_survival() -> Result<bool> {
     // The pairing's entity data carries the same one-item stack per drop.
     let stack_of = |s: &Obs, id: i32| s.stacks.iter().copied().find(|(eid, _, _)| *eid == id);
     for (name, cell) in [("A", TORCH), ("B", TORCH_B)] {
-        let v_stack = v.adds_in(cell).first().and_then(|(id, ..)| stack_of(&v, *id));
-        let d_stack = d.adds_in(cell).first().and_then(|(id, ..)| stack_of(&d, *id));
+        let v_stack = v
+            .adds_in(cell)
+            .first()
+            .and_then(|(id, ..)| stack_of(&v, *id));
+        let d_stack = d
+            .adds_in(cell)
+            .first()
+            .and_then(|(id, ..)| stack_of(&d, *id));
         match (v_stack, d_stack) {
             (Some((_, vc, vi)), Some((_, dc, di))) => {
                 if vc != 1 || dc != 1 {
@@ -1560,8 +1547,7 @@ pub fn parity_survival() -> Result<bool> {
                         "{who}: drop {name} walker removal frames {}, want 2 (unpair + discard)",
                         removes.len()
                     ));
-                } else if !(adds[0] < removes[0] && removes[0] < adds[1] && adds[1] < removes[1])
-                {
+                } else if !(adds[0] < removes[0] && removes[0] < adds[1] && adds[1] < removes[1]) {
                     failures.push(format!(
                         "{who}: drop {name} walker re-pair ordering: adds {adds:?} removes {removes:?}"
                     ));
@@ -1647,13 +1633,7 @@ pub fn parity_survival() -> Result<bool> {
                         )),
                     }
                 }
-                compare_tail(
-                    who,
-                    &format!("{name}/{stream}"),
-                    &tail,
-                    &sim,
-                    &mut failures,
-                );
+                compare_tail(who, &format!("{name}/{stream}"), &tail, &sim, &mut failures);
                 if !taken && tail.len() < 15 {
                     failures.push(format!(
                         "{who}: drop {name}/{stream} sent {} resting movement frames, want >= 15",
@@ -1725,9 +1705,7 @@ pub fn parity_survival() -> Result<bool> {
             t
         };
         let (vt, dt) = (tail(&v_wit), tail(&d_wit));
-        let kinds = |t: &[EFrame]| -> Vec<&str> {
-            t.iter().map(|f| f.kind()).collect::<Vec<_>>()
-        };
+        let kinds = |t: &[EFrame]| -> Vec<&str> { t.iter().map(|f| f.kind()).collect::<Vec<_>>() };
         let (vk, dk) = (kinds(&vt), kinds(&dt));
         let head = |k: &[&str]| k.iter().take(12).copied().collect::<Vec<_>>().join(",");
         let (Some(vm), Some(dm)) = (settle_mark(&vt), settle_mark(&dt)) else {
@@ -1747,9 +1725,7 @@ pub fn parity_survival() -> Result<bool> {
         let (vp, dp) = (&vk[..=vm], &dk[..=dm]);
         let shared = vp.len().min(dp.len());
         if kinds_delete_distance(vp, dp) > 3
-            && !(shared >= 8
-                && vp.len().abs_diff(dp.len()) <= 6
-                && vp[..shared] == dp[..shared])
+            && !(shared >= 8 && vp.len().abs_diff(dp.len()) <= 6 && vp[..shared] == dp[..shared])
         {
             failures.push(format!(
                 "drop {name} witness fall/slide kinds differ: vanilla [{}] vs doppel [{}]",
@@ -1770,7 +1746,9 @@ pub fn parity_survival() -> Result<bool> {
         let mut r_ok = false;
         for shift in 0..8 {
             let check = |a: &[&str], b: &[&str]| -> bool {
-                !a.is_empty() && a.len() >= 12 && a.len() <= b.len()
+                !a.is_empty()
+                    && a.len() >= 12
+                    && a.len() <= b.len()
                     && a.iter().zip(b.iter()).all(|(x, y)| x == y)
             };
             if (vr.len() > shift && check(&vr[shift..], &dr))
@@ -1799,7 +1777,9 @@ pub fn parity_survival() -> Result<bool> {
         ));
     } else if v_slots.is_empty() {
         failures.push("no set_slot frames carry the picked-up stack".into());
-    } else if let Some((_, _, vi)) = stack_of(&v, v.adds_in(TORCH).first().map(|a| a.0).unwrap_or(-1)) {
+    } else if let Some((_, _, vi)) =
+        stack_of(&v, v.adds_in(TORCH).first().map(|a| a.0).unwrap_or(-1))
+    {
         for (slot, item, count) in &v_slots {
             if *item != vi || *count != 1 {
                 failures.push(format!(
