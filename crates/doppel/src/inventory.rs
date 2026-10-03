@@ -1563,7 +1563,7 @@ impl Game {
                 let Some(p) = self.players.get_mut(&conn) else {
                     continue;
                 };
-                if p.menu.is_some() {
+                if p.menu.menu.is_some() {
                     p.inv.pending_sync.clear();
                     continue;
                 }

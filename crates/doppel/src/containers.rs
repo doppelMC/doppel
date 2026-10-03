@@ -225,6 +225,14 @@ pub(crate) struct OpenMenu {
     pub session: MenuSession,
 }
 
+/// The per-player menu state grouped on Player: the open container menu
+/// and the rotating container id counter (ids cycle 1..=100).
+#[derive(Default)]
+pub(crate) struct PlayerMenuState {
+    pub(crate) menu: Option<OpenMenu>,
+    pub(crate) container_counter: i32,
+}
+
 fn menu_positions(kind: &OpenKind) -> Vec<Pos> {
     match kind {
         OpenKind::Chest { halves, .. } => halves.clone(),
@@ -613,6 +621,7 @@ impl Game {
             .iter()
             .filter(|(_, p)| {
                 p.menu
+                    .menu
                     .as_ref()
                     .is_some_and(|m| menu_positions(&m.kind).contains(&pos))
             })
@@ -806,8 +815,8 @@ impl Game {
         let Some(p) = self.players.get_mut(&conn) else {
             return;
         };
-        p.container_counter = p.container_counter % 100 + 1;
-        let id = p.container_counter;
+        p.menu.container_counter = p.menu.container_counter % 100 + 1;
+        let id = p.menu.container_counter;
         if let OpenKind::Chest { halves, .. } = &kind {
             for half in halves.clone() {
                 if let Some(be) = self.containers.block_entities.get_mut(&half) {
@@ -823,7 +832,7 @@ impl Game {
         body.extend_from_slice(&title);
         self.send(conn, PACKET_OPEN_SCREEN, &body);
         if let Some(p) = self.players.get_mut(&conn) {
-            p.menu = Some(OpenMenu {
+            p.menu.menu = Some(OpenMenu {
                 id,
                 kind,
                 session: MenuSession::default(),
@@ -841,7 +850,7 @@ impl Game {
             let Some(p) = self.players.get(&conn) else {
                 return;
             };
-            let Some(menu) = p.menu.as_ref() else {
+            let Some(menu) = p.menu.menu.as_ref() else {
                 return;
             };
             if menu.id != click.container_id {
@@ -862,7 +871,7 @@ impl Game {
                 return;
             };
             let creative = p.inv.creative;
-            let Some(menu) = p.menu.as_mut() else {
+            let Some(menu) = p.menu.menu.as_mut() else {
                 return;
             };
             let mut view = ContainerMenuView {
@@ -883,7 +892,7 @@ impl Game {
     /// counts decrement with lid events, and the close packet goes out
     /// when the server initiated the close.
     pub(super) fn close_menu(&mut self, conn: ConnId, send_close: bool, discard_carried: bool) {
-        let menu = self.players.get_mut(&conn).and_then(|p| p.menu.take());
+        let menu = self.players.get_mut(&conn).and_then(|p| p.menu.menu.take());
         let Some(menu) = menu else {
             return;
         };
@@ -917,7 +926,7 @@ impl Game {
         let matches = self
             .players
             .get(&conn)
-            .and_then(|p| p.menu.as_ref())
+            .and_then(|p| p.menu.menu.as_ref())
             .is_some_and(|m| m.id == container_id);
         if matches {
             self.close_menu(conn, false, false);
@@ -936,7 +945,7 @@ impl Game {
             let Some(p) = players.get_mut(&conn) else {
                 return;
             };
-            let Some(menu) = p.menu.as_mut() else {
+            let Some(menu) = p.menu.menu.as_mut() else {
                 return;
             };
             let state_id = menu.session.next_state_id();
@@ -984,7 +993,7 @@ impl Game {
         const REACH: f64 = 8.5;
         let mut stale: Vec<ConnId> = Vec::new();
         for (conn, p) in &self.players {
-            let Some(menu) = &p.menu else {
+            let Some(menu) = &p.menu.menu else {
                 continue;
             };
             let near = menu_positions(&menu.kind).iter().any(|pos| {

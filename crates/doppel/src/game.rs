@@ -197,8 +197,7 @@ pub(crate) struct Player {
     // --- inventory hook (inventory.rs) ---
     pub(crate) inv: crate::inventory::PlayerInvState,
     // --- containers hooks (containers.rs) ---
-    pub(crate) menu: Option<containers::OpenMenu>,
-    pub(crate) container_counter: i32,
+    pub(crate) menu: containers::PlayerMenuState,
     // --- breaking hooks (dig.rs) ---
     /// The wire identity destruction overlays key on. Vanilla assigns
     /// incremental entity ids; this build has no entity model, so a
@@ -558,8 +557,7 @@ impl Game {
                         pending_keep_alive: None,
                         keep_alive_idle: Instant::now(),
                         inv: Default::default(),
-                        menu: None,
-                        container_counter: 0,
+                        menu: Default::default(),
                         entity_id,
                         dig: Default::default(),
                     },
@@ -2138,8 +2136,7 @@ impl Game {
                 pending_keep_alive: None,
                 keep_alive_idle: Instant::now(),
                 inv: Default::default(),
-                menu: None,
-                container_counter: 0,
+                menu: Default::default(),
                 entity_id,
                 dig: Default::default(),
             },
