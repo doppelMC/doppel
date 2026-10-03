@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::decoration::{DecorRng, Decorator, IntDraw};
+use crate::decoration::{DecorRng, Decorator, HeightKind, IntDraw, Predicate};
 
 /// Whether a block name is one of the air family.
 pub(crate) fn is_air_name(name: &str) -> bool {
@@ -436,6 +436,170 @@ pub(crate) fn run_vines(
     false
 }
 
+/// One root system: the tree it tries at climbing positions above the
+/// origin, the rooted-dirt column a success leaves, and the hanging
+/// roots around the origin.
+pub(crate) struct RootCfg {
+    feature: Value,
+    required_space: i32,
+    level_test_distance: i32,
+    max_level_deviation: i32,
+    root_radius: i32,
+    root_replaceable: ReplaceSet,
+    root_state: u32,
+    root_attempts: i32,
+    column_max: i32,
+    hanging_radius: i32,
+    hanging_span: i32,
+    hanging_state: u32,
+    hanging_attempts: i32,
+    allowed_water: i32,
+    allowed_tree_position: Predicate,
+}
+
+/// Parses a root system config; None marks a shape this engine does not
+/// run (the root and hanging states must resolve to plain states).
+pub(crate) fn parse_root(d: &Decorator, v: &Value) -> Option<RootCfg> {
+    Some(RootCfg {
+        feature: v.get("feature")?.clone(),
+        required_space: int_field(v, "required_vertical_space_for_tree", 1),
+        level_test_distance: int_field(v, "level_test_distance", 0),
+        max_level_deviation: int_field(v, "max_level_deviation", 0),
+        root_radius: int_field(v, "root_radius", 1),
+        root_replaceable: ReplaceSet::parse(v.get("root_replaceable")?)?,
+        root_state: crate::features::plain_state(d, v.get("root_state_provider")?)?,
+        root_attempts: int_field(v, "root_placement_attempts", 1),
+        column_max: int_field(v, "root_column_max_height", 1),
+        hanging_radius: int_field(v, "hanging_root_radius", 1),
+        hanging_span: int_field(v, "hanging_roots_vertical_span", 1),
+        hanging_state: crate::features::plain_state(d, v.get("hanging_root_state_provider")?)?,
+        hanging_attempts: int_field(v, "hanging_root_placement_attempts", 1),
+        allowed_water: int_field(v, "allowed_vertical_water_for_tree", 1),
+        allowed_tree_position: Predicate::parse(v.get("allowed_tree_position")?).ok()?,
+    })
+}
+
+/// Runs a root system: the origin must be air, tree positions climb
+/// from just above the origin until one stands on growable ground below
+/// the world surface, and a standing tree plants the dirt column back
+/// down to the origin and hangs roots around it. The stream moves only
+/// for the tree, the dirt scatter, and the roots.
+pub(crate) fn run_root(
+    d: &mut Decorator,
+    v: &Value,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    let Some(cfg) = parse_root(d, v) else {
+        return false;
+    };
+    if !is_air_name(d.block_name(d.block(x, y, z))) {
+        return false;
+    }
+    let mut tree_step = None;
+    for step in 0..cfg.column_max {
+        let wy = y + step + 1;
+        if d.height(HeightKind::WorldSurface, x, z) < wy {
+            break;
+        }
+        if !crate::features::test_predicate(d, &cfg.allowed_tree_position, x, wy, z)
+            || !space_for_tree(d, &cfg, x, wy, z)
+        {
+            continue;
+        }
+        let below = d.block_name(d.block(x, wy - 1, z)).to_string();
+        // Lava and the grow-on set's one motionless block both refuse
+        // the ground the tree would stand on.
+        if below == "minecraft:lava" || below == "minecraft:powder_snow" {
+            break;
+        }
+        if !crate::features::run_placed_value(d, Some(&cfg.feature), rng, x, wy, z) {
+            continue;
+        }
+        tree_step = Some(step);
+        break;
+    }
+    if let Some(step) = tree_step {
+        place_dirt(d, &cfg, rng, x, y, z, y + step);
+        place_roots(d, &cfg, rng, x, y, z);
+    }
+    true
+}
+
+/// The cells above a tree position: air, or water within the allowed
+/// depth; a level test distance adds a shared ceiling and floor check
+/// on the four horizontal neighbors.
+fn space_for_tree(d: &mut Decorator, cfg: &RootCfg, x: i32, y: i32, z: i32) -> bool {
+    for i in 1..=cfg.required_space {
+        let name = d.block_name(d.block(x, y + i, z)).to_string();
+        if !is_air_name(&name) && (i + 1 > cfg.allowed_water || name != "minecraft:water") {
+            return false;
+        }
+    }
+    if cfg.level_test_distance > 0 {
+        // The horizontal plane order: south, west, north, east.
+        for &(dx, dz) in &[(0, 1), (-1, 0), (0, -1), (1, 0)] {
+            let cx = x + dx * cfg.level_test_distance;
+            let cz = z + dz * cfg.level_test_distance;
+            let below = d
+                .block_name(d.block(cx, y - cfg.max_level_deviation, cz))
+                .to_string();
+            let above = d
+                .block_name(d.block(cx, y + cfg.max_level_deviation, cz))
+                .to_string();
+            if is_air_name(&below) || !is_air_name(&above) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Roots the column between the origin and the tree: each cell scatters
+/// rooted dirt within the root radius, the four offset draws always
+/// spent and the write gated on replaceable ground.
+fn place_dirt(
+    d: &mut Decorator,
+    cfg: &RootCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    top: i32,
+) {
+    for yy in y..top {
+        for _ in 0..cfg.root_attempts {
+            let dx = rng.next_int(cfg.root_radius) - rng.next_int(cfg.root_radius);
+            let dz = rng.next_int(cfg.root_radius) - rng.next_int(cfg.root_radius);
+            let name = d.block_name(d.block(x + dx, yy, z + dz)).to_string();
+            if cfg.root_replaceable.test(d, &name) {
+                d.set_block(x + dx, yy, z + dz, cfg.root_state);
+            }
+        }
+    }
+}
+
+/// Hangs roots around the origin: six draws per attempt, and only an
+/// air cell under a sturdy face takes the root.
+fn place_roots(d: &mut Decorator, cfg: &RootCfg, rng: &mut DecorRng, x: i32, y: i32, z: i32) {
+    for _ in 0..cfg.hanging_attempts {
+        let dx = rng.next_int(cfg.hanging_radius) - rng.next_int(cfg.hanging_radius);
+        let dy = rng.next_int(cfg.hanging_span) - rng.next_int(cfg.hanging_span);
+        let dz = rng.next_int(cfg.hanging_radius) - rng.next_int(cfg.hanging_radius);
+        let (rx, ry, rz) = (x + dx, y + dy, z + dz);
+        if !is_air_name(d.block_name(d.block(rx, ry, rz))) {
+            continue;
+        }
+        let above = d.block_name(d.block(rx, ry + 1, rz)).to_string();
+        if !d.tag_contains("blocks_motion_no_leaves", &above) {
+            continue;
+        }
+        d.set_block(rx, ry, rz, cfg.hanging_state);
+    }
+}
+
 /// Sets the waterlogged property on a cell the flooded patch just grew
 /// vegetation into.
 fn waterlog_cell(d: &mut Decorator, x: i32, y: i32, z: i32) {
@@ -569,6 +733,126 @@ mod tests {
         }
         assert!(clay > 4, "clay ground written, found {clay}");
         assert!(water > 0, "sheltered cells flooded, found {water}");
+    }
+
+    /// The azalea tree grows a leaning trunk over rooted dirt with a
+    /// wide canopy of azalea leaves.
+    #[test]
+    fn azalea_tree_bends_and_scatters_leaves() {
+        let mut d = region();
+        let top = d.height(crate::decoration::HeightKind::WorldSurface, 8, 8);
+        let floor = top - 10;
+        let air = d.state_id_of("minecraft:air", "").expect("air");
+        for dx in -6..=6 {
+            for dz in -6..=6 {
+                for dy in 0..10 {
+                    d.set_block(8 + dx, floor + dy, 8 + dz, air);
+                }
+            }
+        }
+        let cfg = feature_value("azalea_tree");
+        let mut rng = DecorRng::new();
+        rng.set_feature_seed(7, 0, 9);
+        let placed = crate::features::run_feature(&mut d, &cfg, &mut rng, 8, floor, 8);
+        assert!(placed, "the tree grew");
+        assert_eq!(
+            d.block_name(d.block(8, floor - 1, 8)),
+            "minecraft:rooted_dirt",
+            "rooted dirt under the trunk"
+        );
+        assert_eq!(d.block_name(d.block(8, floor, 8)), "minecraft:oak_log");
+        let mut logs = 0;
+        let mut leaves = 0;
+        for dx in -6..=6 {
+            for dz in -6..=6 {
+                for dy in -1..10 {
+                    let name = d
+                        .block_name(d.block(8 + dx, floor + dy, 8 + dz))
+                        .to_string();
+                    match name.as_str() {
+                        "minecraft:oak_log" => logs += 1,
+                        "minecraft:azalea_leaves" | "minecraft:flowering_azalea_leaves" => {
+                            leaves += 1
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(logs >= 5, "the bending trunk wrote logs, found {logs}");
+        assert!(leaves > 10, "the canopy scattered leaves, found {leaves}");
+    }
+
+    /// The root system stands its tree on the first growable position
+    /// above the origin, roots the column to the tree, and hangs roots
+    /// under the ceiling around the origin.
+    #[test]
+    fn root_system_grows_tree_above_origin() {
+        let mut d = region();
+        let top = d.height(crate::decoration::HeightKind::WorldSurface, 8, 8);
+        assert!(top > MIN_TEST_Y + 24, "room to build a stone cavity");
+        let floor = top - 12;
+        let air = d.state_id_of("minecraft:air", "").expect("air");
+        let stone = d.state_id_of("minecraft:stone", "").expect("stone");
+        // A dry stone cavity: a lower cave around the origin, a shelf
+        // of moss one block above its ceiling, and open air above the
+        // shelf.
+        for dx in -5..=5 {
+            for dz in -5..=5 {
+                for dy in 0..21 {
+                    d.set_block(8 + dx, floor + dy, 8 + dz, stone);
+                }
+            }
+        }
+        for dx in -4..=4 {
+            for dz in -4..=4 {
+                for dy in 1..=5 {
+                    d.set_block(8 + dx, floor + dy, 8 + dz, air);
+                }
+            }
+        }
+        for dx in -4..=4 {
+            for dz in -4..=4 {
+                for dy in 8..20 {
+                    d.set_block(8 + dx, floor + dy, 8 + dz, air);
+                }
+            }
+        }
+        let moss = d.state_id_of("minecraft:moss_block", "").expect("moss");
+        d.set_block(8, floor + 7, 8, moss);
+        let cfg = feature_value("rooted_azalea_tree");
+        let mut rng = DecorRng::new();
+        rng.set_feature_seed(7, 0, 9);
+        let placed = run_root(&mut d, &cfg, &mut rng, 8, floor + 5, 8);
+        assert!(placed, "the feature placed once the origin is air");
+        assert_eq!(
+            d.block_name(d.block(8, floor + 8, 8)),
+            "minecraft:oak_log",
+            "the tree stands on the moss shelf"
+        );
+        let mut leaves = 0;
+        let mut rooted = 0;
+        let mut hanging = 0;
+        for dx in -4..=4 {
+            for dz in -4..=4 {
+                for dy in 0..20 {
+                    let name = d
+                        .block_name(d.block(8 + dx, floor + dy, 8 + dz))
+                        .to_string();
+                    match name.as_str() {
+                        "minecraft:azalea_leaves" | "minecraft:flowering_azalea_leaves" => {
+                            leaves += 1
+                        }
+                        "minecraft:rooted_dirt" => rooted += 1,
+                        "minecraft:hanging_roots" => hanging += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(leaves > 5, "the canopy scattered, found {leaves}");
+        assert!(rooted > 0, "the column rooted, found {rooted}");
+        assert!(hanging > 0, "roots hung under the ceiling, found {hanging}");
     }
 
     /// The floor is far underground, inside the build range the test

@@ -313,7 +313,7 @@ impl StateProvider {
 /// Feature kinds the pins carry but the engine places nothing for yet.
 /// Plan validation accepts exactly these and the dispatch arms; any other
 /// kind fails the plan load instead of skipping silently.
-pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 34] = [
+pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 33] = [
     "minecraft:overlay",
     "minecraft:block_pile",
     "minecraft:huge_fungus",
@@ -330,7 +330,6 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 34] = [
     "minecraft:fossil",
     "minecraft:iceberg",
     "minecraft:scattered_ore",
-    "minecraft:root_system",
     "minecraft:geode",
     "minecraft:blue_ice",
     "minecraft:bonus_chest",
@@ -353,7 +352,7 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 34] = [
 /// Trunk placers, foliage placers, and tree decorators the tree parser
 /// does not model: a tree config carrying one accepts as unplaced (the
 /// runtime rejects it there), and plan validation accepts exactly these.
-pub(crate) const UNPLACED_TREE_SHAPES: [&str; 23] = [
+pub(crate) const UNPLACED_TREE_SHAPES: [&str; 22] = [
     "minecraft:cherry_trunk_placer",
     "minecraft:forking_trunk_placer",
     "minecraft:giant_trunk_placer",
@@ -367,7 +366,6 @@ pub(crate) const UNPLACED_TREE_SHAPES: [&str; 23] = [
     "minecraft:mega_pine_foliage_placer",
     "minecraft:pine_foliage_placer",
     "minecraft:poplar_foliage_placer",
-    "minecraft:random_spread_foliage_placer",
     "minecraft:spruce_foliage_placer",
     "minecraft:alter_ground",
     "minecraft:attached_to_leaves",
@@ -500,6 +498,7 @@ pub(crate) fn run_feature(
             crate::lush::run_patch(d, v, rng, x, y, z)
         }
         "minecraft:vines" => crate::lush::run_vines(d, v, rng, x, y, z),
+        "minecraft:root_system" => crate::lush::run_root(d, v, rng, x, y, z),
         // One boolean draw picks the branch; the chosen placed feature
         // runs with the same stream.
         "minecraft:random_boolean_selector" => {
@@ -815,6 +814,7 @@ enum FoliageKind {
     Blob,
     Fancy,
     DarkOak,
+    RandomSpread,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -822,6 +822,7 @@ enum TrunkKind {
     Straight,
     DarkOak,
     Fancy,
+    Bending,
 }
 
 #[derive(Clone)]
@@ -830,6 +831,10 @@ struct FoliageCfg {
     radius: IntDraw,
     offset: IntDraw,
     height: i32,
+    /// The scattered canopy's height provider; the other kinds read the
+    /// plain height field.
+    spread_height: IntDraw,
+    attempts: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -908,6 +913,8 @@ pub(crate) struct TreeCfg {
     base: i32,
     rand_a: i32,
     rand_b: i32,
+    bend_length: IntDraw,
+    min_height_for_leaves: i32,
     foliage: FoliageCfg,
     size: SizeCfg,
     decorators: Vec<TreeDecoratorCfg>,
@@ -930,20 +937,38 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         "minecraft:straight_trunk_placer" => TrunkKind::Straight,
         "minecraft:dark_oak_trunk_placer" => TrunkKind::DarkOak,
         "minecraft:fancy_trunk_placer" => TrunkKind::Fancy,
+        "minecraft:bending_trunk_placer" => TrunkKind::Bending,
         _ => return None,
+    };
+    let (bend_length, min_height_for_leaves) = match trunk_kind {
+        TrunkKind::Bending => (
+            draw_field(trunk_placer, "bend_length")?,
+            int_field(trunk_placer, "min_height_for_leaves", 1),
+        ),
+        _ => (IntDraw::Constant(1), 0),
     };
     let foliage_json = v.get("foliage_placer")?;
     let kind = match foliage_json.get("type").and_then(Value::as_str)? {
         "minecraft:blob_foliage_placer" => FoliageKind::Blob,
         "minecraft:fancy_foliage_placer" => FoliageKind::Fancy,
         "minecraft:dark_oak_foliage_placer" => FoliageKind::DarkOak,
+        "minecraft:random_spread_foliage_placer" => FoliageKind::RandomSpread,
         _ => return None,
+    };
+    let (spread_height, attempts) = match kind {
+        FoliageKind::RandomSpread => (
+            draw_field(foliage_json, "foliage_height")?,
+            int_field(foliage_json, "leaf_placement_attempts", 0),
+        ),
+        _ => (IntDraw::Constant(0), 0),
     };
     let foliage = FoliageCfg {
         kind,
         radius: draw_field(foliage_json, "radius")?,
         offset: draw_field(foliage_json, "offset")?,
         height: int_field(foliage_json, "height", 0),
+        spread_height,
+        attempts,
     };
     let size_json = v.get("minimum_size")?;
     let min_clipped = size_json
@@ -1016,6 +1041,8 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         base: int_field(trunk_placer, "base_height", 0),
         rand_a: int_field(trunk_placer, "height_rand_a", 0),
         rand_b: int_field(trunk_placer, "height_rand_b", 0),
+        bend_length,
+        min_height_for_leaves,
         foliage,
         size: SizeCfg { kind, min_clipped },
         decorators,
@@ -1101,6 +1128,7 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
     let foliage_height = match cfg.foliage.kind {
         FoliageKind::Blob | FoliageKind::Fancy => cfg.foliage.height,
         FoliageKind::DarkOak => 4,
+        FoliageKind::RandomSpread => cfg.foliage.spread_height.sample(rng),
     };
     let leaf_radius = cfg.foliage.radius.sample(rng);
     #[cfg(test)]
@@ -1118,6 +1146,7 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
         TrunkKind::Straight => straight_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
         TrunkKind::DarkOak => dark_oak_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
         TrunkKind::Fancy => fancy_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
+        TrunkKind::Bending => bending_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
     };
     #[cfg(test)]
     let stage_trunk = rng.words;
@@ -1356,6 +1385,58 @@ fn max_free_tree_height(
         }
     }
     max_tree_height
+}
+
+/// The bending trunk: a vertical column that crooks one or two cells
+/// sideways near the top, then runs one or two further logs out along
+/// the same side, anchoring foliage from the leaf height upward.
+#[allow(clippy::too_many_arguments)]
+fn bending_trunk(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    tree_height: i32,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Vec<Attachment> {
+    let direction = HORIZONTAL[rng.next_int(4) as usize];
+    let log_height = tree_height - 1;
+    place_below_trunk(d, cfg, rng, x, y - 1, z, logs);
+    let mut attachments = Vec::new();
+    let (mut px, mut py, mut pz) = (x, y, z);
+    for i in 0..=log_height {
+        // The crook draw runs every level; once it fires the column
+        // keeps drifting sideways.
+        if i + 1 >= log_height + rng.next_int(2) {
+            px += direction.dx;
+            pz += direction.dz;
+        }
+        place_log(d, cfg, rng, px, py, pz, logs);
+        if i >= cfg.min_height_for_leaves {
+            attachments.push(Attachment {
+                x: px,
+                y: py,
+                z: pz,
+                double: false,
+            });
+        }
+        py += 1;
+    }
+    let dir_length = cfg.bend_length.sample(rng);
+    for _ in 0..=dir_length {
+        place_log(d, cfg, rng, px, py, pz, logs);
+        attachments.push(Attachment {
+            x: px,
+            y: py,
+            z: pz,
+            double: false,
+        });
+        px += direction.dx;
+        pz += direction.dz;
+    }
+    attachments
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1641,6 +1722,8 @@ fn should_skip(
             let fz = (mdz as f32) + 0.5;
             fx * fx + fz * fz > (radius * radius) as f32
         }
+        // The scattered canopy places per attempt, never in rows.
+        FoliageKind::RandomSpread => false,
         FoliageKind::DarkOak => {
             if y == -1 && !double {
                 return mdx == radius && mdz == radius;
@@ -1687,6 +1770,32 @@ fn place_leaves_row(
     }
 }
 
+/// Places one scattered leaf: a persistent leaf already at the cell
+/// refuses the write, the cell must accept tree placement, and the
+/// provider draws only then.
+fn try_place_leaf(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    leaves: &mut Vec<(i32, i32, i32)>,
+) {
+    let persistent = d
+        .registry()
+        .state_of(d.block(x, y, z))
+        .is_some_and(|(_, props)| props.split(',').any(|pair| pair == "persistent=true"));
+    if persistent || !valid_tree_pos(d, x, y, z) {
+        return;
+    }
+    if let Some(state) = cfg.leaves.sample(d, rng, x, y, z) {
+        let state = waterlogged_leaf(d, state, x, y, z);
+        d.set_block(x, y, z, state);
+        leaves.push((x, y, z));
+    }
+}
+
 /// A leaf state inside water logs itself.
 fn waterlogged_leaf(d: &mut Decorator, state: u32, x: i32, y: i32, z: i32) -> u32 {
     let (name, props) = d.registry().state_of(state).unwrap_or(("", ""));
@@ -1716,6 +1825,16 @@ fn create_foliage(
     let offset = cfg.foliage.offset.sample(rng);
     let kind = cfg.foliage.kind;
     match kind {
+        // The scattered canopy: each attempt draws its own offset, three
+        // doubled draws around the anchor.
+        FoliageKind::RandomSpread => {
+            for _ in 0..cfg.foliage.attempts {
+                let dx = rng.next_int(leaf_radius) - rng.next_int(leaf_radius);
+                let dy = rng.next_int(foliage_height) - rng.next_int(foliage_height);
+                let dz = rng.next_int(leaf_radius) - rng.next_int(leaf_radius);
+                try_place_leaf(d, cfg, rng, att.x + dx, att.y + dy, att.z + dz, leaves);
+            }
+        }
         FoliageKind::Blob => {
             for yo in ((offset - foliage_height)..=offset).rev() {
                 let r = (leaf_radius - 1 - yo / 2).max(0);

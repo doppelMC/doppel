@@ -1347,6 +1347,17 @@ impl<'a> Decorator<'a> {
                         self.validate_placed_ref(vegetation, &mut seen)
                     }
                     "minecraft:vines" => Ok(()),
+                    "minecraft:root_system" => {
+                        if crate::lush::parse_root(self, v).is_none() {
+                            bail!("root system config rejected by the parser");
+                        }
+                        let mut seen = std::collections::BTreeSet::new();
+                        self.validate_placed_ref(
+                            v.get("feature")
+                                .context("root system without a tree feature")?,
+                            &mut seen,
+                        )
+                    }
                     "minecraft:random_boolean_selector" => {
                         let mut seen = std::collections::BTreeSet::new();
                         self.validate_placed_ref(
