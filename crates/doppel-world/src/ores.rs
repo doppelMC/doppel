@@ -216,6 +216,10 @@ pub(crate) fn run_ore(d: &mut Decorator, v: &Value, rng: &mut DecorRng, ox: i32,
     }
 
     let mut tested = vec![false; (span_xz * span_y * span_xz) as usize];
+    // The dedup index leaves the x axis unscaled by the y span, so an
+    // index can run past the array; the reference bit set grows there
+    // instead of refusing, and this side set carries those cells.
+    let mut tested_over: std::collections::HashSet<i32> = std::collections::HashSet::new();
     for &(bx, by, bz, r) in &balls {
         if r < 0.0 {
             continue;
@@ -247,14 +251,20 @@ pub(crate) fn run_ore(d: &mut Decorator, v: &Value, rng: &mut DecorRng, ox: i32,
                     }
                     let bit =
                         (x - x_start) + (y - y_start) * span_xz + (z - z_start) * span_xz * span_y;
-                    if bit < 0 || bit as usize >= tested.len() {
+                    let inside = bit >= 0 && (bit as usize) < tested.len();
+                    let seen = if inside {
+                        tested[bit as usize]
+                    } else {
+                        tested_over.contains(&bit)
+                    };
+                    if seen {
                         continue;
                     }
-                    let bit = bit as usize;
-                    if tested[bit] {
-                        continue;
+                    if inside {
+                        tested[bit as usize] = true;
+                    } else {
+                        tested_over.insert(bit);
                     }
-                    tested[bit] = true;
                     let here = d.block_name(d.block(x, y, z)).to_string();
                     for (rule, state) in &cfg.targets {
                         if !rule.test(d, &here, y) {
