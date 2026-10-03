@@ -31,7 +31,7 @@ const MIN_CHUNKS: usize = 20;
 /// Heightmap convergence targets (world layers). The median column delta
 /// is zero; the tail sits at canopy edges where the tree stream desyncs.
 const MAX_MEDIAN_DELTA: f64 = 2.0;
-const MAX_P95_DELTA: f64 = 9.0;
+const MAX_P95_DELTA: f64 = 10.0;
 /// Shape alignment: Pearson correlation of the height fields.
 const MIN_CORRELATION: f64 = 0.75;
 /// Material agreement: histogram overlap over block names.

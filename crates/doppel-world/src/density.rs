@@ -3447,6 +3447,30 @@ mod tests {
         assert_eq!(blocks, repeat, "same seed refills identically");
     }
 
+    /// The barrier rule: fluid cells of differing kind (water against
+    /// lava) present a solid wall without sampling noise, and identical
+    /// statuses present no barrier.
+    #[test]
+    fn aquifer_barrier_between_fluids() {
+        let reg = registry();
+        let terrain = NoiseTerrain::with_seed(42, &reg, &pins()).expect("engine build");
+        let mut ctx = ChunkCtx::new(0, 0, terrain.min_y, terrain.height);
+        let water = FluidStatus {
+            level: 30,
+            lava: false,
+        };
+        let lava = FluidStatus {
+            level: -10,
+            lava: true,
+        };
+        let mut noise = f64::NAN;
+        let pressure = terrain.pressure(&mut ctx, 0, -20, 0, water, lava, &mut noise);
+        assert_eq!(pressure, 2.0);
+        assert!(noise.is_nan(), "the solid-wall rule reads no barrier noise");
+        let same = terrain.pressure(&mut ctx, 0, -20, 0, water, water, &mut noise);
+        assert_eq!(same, 0.0, "equal levels hold no barrier");
+    }
+
     /// Carve agreement against the captured vanilla chunks: air-like,
     /// water, and lava cells below y=50, full-column material deltas, and
     /// the y bands where moss and clay land on each side. Requires the

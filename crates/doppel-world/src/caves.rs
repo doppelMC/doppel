@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -734,15 +735,20 @@ fn update_vertical_radius(
 
 /// The carver set: pinned configs plus the per-biome carver lists that pick
 /// them, seeded by the world. Source-chunk biomes memoize because adjacent
-/// target chunks sweep overlapping neighborhoods.
+/// target chunks sweep overlapping neighborhoods; the memo drops itself when
+/// it outgrows the cap.
 pub(crate) struct Carvers {
     entries: Vec<Option<Carver>>,
     per_biome: Vec<Vec<Option<usize>>>,
     world_seed: i64,
     min_y: i32,
     height: i32,
-    biome_memo: std::cell::RefCell<std::collections::HashMap<(i32, i32), u32>>,
+    biome_memo: std::cell::RefCell<HashMap<(i32, i32), u32>>,
 }
+
+/// Memo ceiling; a sweep touches at most 289 sources, so a full cap spans
+/// many neighborhoods before clearing.
+const BIOME_MEMO_CAP: usize = 8192;
 
 fn large_feature_seed(seed: i64, chunk_x: i32, chunk_z: i32) -> Lcg48 {
     let mut rng = Lcg48::new(seed);
@@ -812,7 +818,7 @@ impl Carvers {
             world_seed,
             min_y,
             height,
-            biome_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
+            biome_memo: std::cell::RefCell::new(HashMap::new()),
         })
     }
 
@@ -826,9 +832,11 @@ impl Carvers {
             return *biome;
         }
         let biome = biome_of(source_x * EDGE, source_z * EDGE);
-        self.biome_memo
-            .borrow_mut()
-            .insert((source_x, source_z), biome);
+        let mut memo = self.biome_memo.borrow_mut();
+        if memo.len() >= BIOME_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert((source_x, source_z), biome);
         biome
     }
 
