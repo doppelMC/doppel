@@ -6,6 +6,7 @@ mod parity;
 mod parity_break;
 mod parity_survival;
 mod parity_worldgen;
+mod parity_worldgen_biome;
 mod registry;
 mod scenario;
 mod vanilla;
@@ -29,6 +30,9 @@ fn usage() -> ! {
                                        terrain, capture the spawn chunks, and
                                        structurally diff them against the
                                        seeded terrain generator
+  doppel-oracle parity-worldgen-biome same diff over chunks captured at
+                                       located biomes (cherry grove, mangrove
+                                       swamp) the bot teleports to
   doppel-oracle parity-survival     differential test: drops, pickup, grass
                                        decay/spread (break + random ticks)
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
@@ -82,6 +86,11 @@ fn run() -> Result<()> {
         }
         Some("parity-worldgen") => {
             if !parity_worldgen::run()? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-worldgen-biome") => {
+            if !parity_worldgen_biome::run()? {
                 std::process::exit(1);
             }
         }
