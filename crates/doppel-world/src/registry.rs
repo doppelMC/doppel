@@ -71,7 +71,7 @@ impl BlockRegistry {
                 let Some((k, v)) = pair.split_once('=') else {
                     continue;
                 };
-                let default = prop_default(k);
+                let default = prop_default(k, v);
                 if default.is_empty() {
                     pairs.push(pair.to_string());
                 } else {
@@ -127,8 +127,8 @@ impl BlockRegistry {
         let known = self.by_id.values().find(|(n, _)| n == name);
         if let Some((_, first_props)) = known {
             for pair in first_props.split(',').filter(|p| !p.is_empty()) {
-                if let Some((k, _)) = pair.split_once('=') {
-                    pairs.push(format!("{k}={}", prop_default(k)));
+                if let Some((k, v)) = pair.split_once('=') {
+                    pairs.push(format!("{k}={}", prop_default(k, v)));
                 }
             }
         }
@@ -185,7 +185,10 @@ impl BlockRegistry {
 
 /// The default value of a block-state property. Keyed per property, not
 /// per block: defaults are uniform across the families the engine models.
-fn prop_default(prop: &str) -> &'static str {
+/// The half property splits into two value families (upper/lower for
+/// plants and doors, top/bottom for stairs and dripleaves), so its
+/// default mirrors the first-listed value's opposite.
+fn prop_default<'a>(prop: &'a str, first: &'a str) -> &'a str {
     match prop {
         "powered" => "false",
         "lit" => "true",
@@ -201,6 +204,12 @@ fn prop_default(prop: &str) -> &'static str {
         "snowy" => "false",
         "distance" => "7",
         "persistent" => "false",
+        "berries" => "false",
+        "half" => match first {
+            "upper" => "lower",
+            "top" => "bottom",
+            other => other,
+        },
         _ => "",
     }
 }

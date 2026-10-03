@@ -1333,6 +1333,17 @@ impl<'a> Decorator<'a> {
                         }
                         Ok(())
                     }
+                    "minecraft:vegetation_patch" | "minecraft:waterlogged_vegetation_patch" => {
+                        let waterlogged = kind == "minecraft:waterlogged_vegetation_patch";
+                        if crate::lush::parse_patch(self, v, waterlogged).is_none() {
+                            bail!("patch config rejected by the parser");
+                        }
+                        let vegetation = v
+                            .get("vegetation_feature")
+                            .context("patch without a vegetation feature")?;
+                        let mut seen = std::collections::BTreeSet::new();
+                        self.validate_placed_ref(vegetation, &mut seen)
+                    }
                     other => bail!("unsupported feature kind {other}"),
                 }
             }
@@ -1510,19 +1521,20 @@ impl<'a> Decorator<'a> {
         ox: i32,
         oy: i32,
         oz: i32,
-    ) {
+    ) -> bool {
         if cfg.has_unsupported() {
-            return;
+            return false;
         }
         // An empty placement stack places at the position it was given.
         if cfg.placement.is_empty() {
-            self.place_final(name, &cfg.feature, rng, ox, oy, oz);
-            return;
+            return self.place_final(name, &cfg.feature, rng, ox, oy, oz);
         }
         let span = LAYERS as i32;
         // Worklist entries: (x, y, z, modifier index).
         let mut stack: Vec<(i32, i32, i32, usize)> = vec![(ox, oy, oz, 0)];
         let mut out: Vec<(i32, i32, i32)> = Vec::new();
+        // The reference ORs every final feature result; no early exit.
+        let mut placed_any = false;
         while let Some((x, y, z, index)) = stack.pop() {
             out.clear();
             match &cfg.placement[index] {
@@ -1646,7 +1658,7 @@ impl<'a> Decorator<'a> {
                         }
                     }
                 }
-                Modifier::Unsupported => return,
+                Modifier::Unsupported => return placed_any,
             }
             let next = index + 1;
             if next < cfg.placement.len() {
@@ -1655,13 +1667,15 @@ impl<'a> Decorator<'a> {
                 }
             } else {
                 for &(px, py, pz) in &out {
-                    self.place_final(name, &cfg.feature, rng, px, py, pz);
+                    placed_any |= self.place_final(name, &cfg.feature, rng, px, py, pz);
                 }
             }
         }
+        placed_any
     }
 
-    /// Runs the configured feature at one resolved position.
+    /// Runs the configured feature at one resolved position and reports
+    /// whether the feature placed.
     fn place_final(
         &mut self,
         name: &str,
@@ -1670,7 +1684,7 @@ impl<'a> Decorator<'a> {
         x: i32,
         y: i32,
         z: i32,
-    ) {
+    ) -> bool {
         #[cfg(test)]
         if let Some(log) = self.visits.as_mut() {
             if !name.is_empty() {
@@ -1687,11 +1701,12 @@ impl<'a> Decorator<'a> {
         if let Some(log) = self.scatter_log.as_mut() {
             log.push(format!("try {name} ({x},{y},{z}) start w{}", rng.words));
         }
-        features::run_feature(self, feature, rng, x, y, z);
+        let placed = features::run_feature(self, feature, rng, x, y, z);
         #[cfg(test)]
         if let Some(log) = self.scatter_log.as_mut() {
             log.push(format!("try {name} end w{}", rng.words));
         }
+        placed
     }
 
     /// Loads (and caches) a placed feature config; None marks a pin that
