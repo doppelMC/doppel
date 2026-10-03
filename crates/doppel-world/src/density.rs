@@ -1715,10 +1715,15 @@ pub struct NoiseTerrain {
     secondary_stack: Arc<StackNoise>,
     gradient_factories: HashMap<String, Positional>,
     ore_pos: Positional,
+    carvers: crate::caves::Carvers,
     stone: u32,
     water: u32,
     lava: u32,
     air: u32,
+    grass: u32,
+    mycelium: u32,
+    dirt: u32,
+    uncarvable: std::collections::HashSet<u32>,
     pub sea_level: i32,
     pub min_y: i32,
     pub height: i32,
@@ -1794,6 +1799,18 @@ impl NoiseTerrain {
                 .and_then(Value::as_str)
                 .context("default_fluid")?,
         )?;
+        let carvers = crate::caves::Carvers::load(pins, seed, min_y, height)?;
+        let mut uncarvable = std::collections::HashSet::new();
+        let tag: Value = serde_json::from_str(
+            &std::fs::read_to_string(pins.join("tags").join("block").join("uncarvable.json"))
+                .context("uncarvable tag")?,
+        )
+        .context("parsing uncarvable tag")?;
+        if let Some(values) = tag.get("values").and_then(Value::as_array) {
+            for name in values.iter().filter_map(Value::as_str) {
+                uncarvable.insert(resolve(name)?);
+            }
+        }
         Ok(NoiseTerrain {
             world,
             aquifer_pos: world_positional(seed)
@@ -1816,10 +1833,17 @@ impl NoiseTerrain {
             ore_pos: world_positional(seed)
                 .from_name("minecraft:ore")
                 .fork_positional(),
+            carvers,
             stone,
             water,
             lava: resolve("minecraft:lava")?,
             air: resolve("minecraft:air")?,
+            grass: registry
+                .state_id("minecraft:grass_block", "snowy=false")
+                .context("terrain block minecraft:grass_block")?,
+            mycelium: resolve("minecraft:mycelium")?,
+            dirt: resolve("minecraft:dirt")?,
+            uncarvable,
             sea_level,
             min_y,
             height,
@@ -1854,6 +1878,7 @@ impl NoiseTerrain {
             }
         }
         self.surface_pass(&mut ctx, &mut blocks);
+        self.carve_pass(&mut ctx, &mut aquifer, &mut blocks);
         blocks
     }
 
@@ -2054,6 +2079,13 @@ impl NoiseTerrain {
         if similarity12 <= 0.0 {
             return self.fluid_state(first, y);
         }
+        // Water sitting over the global lava floor flows instead of
+        // pressurizing.
+        if self.fluid_state(first, y) == self.water
+            && self.fluid_state(self.global_fluid(y - 1), y - 1) == self.lava
+        {
+            return self.water;
+        }
         let mut barrier_noise = f64::NAN;
         let second = self.status(ctx, aquifer, cells[1]);
         let barrier12 =
@@ -2097,9 +2129,9 @@ impl NoiseTerrain {
     ) -> f64 {
         let type_first = y < first.level;
         let type_second = y < second.level;
-        if type_first && !type_second && first.lava && !second.lava
-            || !type_first && type_second && !first.lava && second.lava
-        {
+        // Fluid cells of differing kind (water against lava) hold a solid
+        // barrier between them.
+        if type_first && type_second && first.lava != second.lava {
             return 2.0;
         }
         // Level arithmetic wraps like the reference int math when a level
@@ -2300,6 +2332,127 @@ impl NoiseTerrain {
             z.div_euclid(64),
         ));
         noise.abs() > 0.3
+    }
+
+    // -----------------------------------------------------------------
+    // Carve pass.
+    // -----------------------------------------------------------------
+
+    /// Sweeps the carver sources around the chunk, then rewrites each marked
+    /// cell with the aquifer's fluid decision at density zero. Grass-topped
+    /// columns regrow their surface block under the new opening.
+    fn carve_pass(&self, ctx: &mut ChunkCtx, aquifer: &mut AquiferState, blocks: &mut [u32]) {
+        let start_x = ctx.start_x;
+        let start_z = ctx.start_z;
+        let mut biome_of = |x: i32, z: i32| self.climate.biome(&self.graph, ctx, x, 0, z);
+        let mask = self.carvers.build_mask(
+            &mut biome_of,
+            start_x.div_euclid(EDGE),
+            start_z.div_euclid(EDGE),
+        );
+        if mask.is_empty() {
+            return;
+        }
+        let mut heights = [0i32; COLUMNS];
+        for column in 0..COLUMNS {
+            let mut top = self.min_y;
+            for y in (0..self.height).rev() {
+                if blocks[y as usize * COLUMNS + column] != self.air {
+                    top = self.min_y + y + 1;
+                    break;
+                }
+            }
+            heights[column] = top;
+        }
+        let mut job = SurfaceJob {
+            terrain: self,
+            depth: HashMap::new(),
+            secondary: HashMap::new(),
+            min_level: HashMap::new(),
+        };
+        mask.for_each_column(&mut |x: usize, z: usize, bottom: i32, top: i32| {
+            let column = z * EDGE as usize + x;
+            let world_x = start_x + x as i32;
+            let world_z = start_z + z as i32;
+            let mut has_grass = false;
+            for world_y in (bottom..=top).rev() {
+                let index = (world_y - self.min_y) as usize * COLUMNS + column;
+                let state = blocks[index];
+                if self.uncarvable.contains(&state) {
+                    continue;
+                }
+                if state == self.grass || state == self.mycelium {
+                    has_grass = true;
+                }
+                let carved = self.substance(ctx, aquifer, world_x, world_y, world_z, 0.0);
+                blocks[index] = carved;
+                self.update_height(blocks, &mut heights, column, world_y, carved != self.air);
+                if !has_grass || world_y - 1 < self.min_y {
+                    continue;
+                }
+                let below = index - COLUMNS;
+                if blocks[below] != self.dirt {
+                    continue;
+                }
+                let col_x_fwd = z * EDGE as usize + (x + 1).min(15);
+                let col_x_back = z * EDGE as usize + x.saturating_sub(1);
+                let col_z_fwd = (z + 1).min(15) * EDGE as usize + x;
+                let col_z_back = z.saturating_sub(1) * EDGE as usize + x;
+                let gradient_x = heights[col_x_fwd] - heights[col_x_back];
+                let gradient_z = heights[col_z_fwd] - heights[col_z_back];
+                let under_fluid = carved == self.water || carved == self.lava;
+                let walk = Walk {
+                    stone_above: 1,
+                    stone_below: 1,
+                    water_height: if under_fluid { world_y + 1 } else { i32::MIN },
+                    gradient_x,
+                    gradient_z,
+                };
+                if let Some(surface) = try_apply(
+                    &self.rule,
+                    &mut job,
+                    ctx,
+                    &walk,
+                    world_x,
+                    world_y - 1,
+                    world_z,
+                ) {
+                    blocks[below] = surface;
+                    self.update_height(
+                        blocks,
+                        &mut heights,
+                        column,
+                        world_y - 1,
+                        surface != self.air,
+                    );
+                }
+            }
+        });
+    }
+
+    /// First-free height maintenance as the carve rewrites cells.
+    fn update_height(
+        &self,
+        blocks: &[u32],
+        heights: &mut [i32; COLUMNS],
+        column: usize,
+        y: i32,
+        solid: bool,
+    ) {
+        let current = heights[column];
+        if solid {
+            if y >= current {
+                heights[column] = y + 1;
+            }
+        } else if current == y + 1 {
+            let mut scan = y;
+            while scan >= self.min_y
+                && blocks[(scan - self.min_y) as usize * COLUMNS + column] == self.air
+            {
+                scan -= 1;
+            }
+            heights[column] = scan + 1;
+        }
     }
 
     // -----------------------------------------------------------------
@@ -3292,5 +3445,177 @@ mod tests {
         );
         let repeat = terrain.fill_chunk(0, 0);
         assert_eq!(blocks, repeat, "same seed refills identically");
+    }
+
+    /// Carve agreement against the captured vanilla chunks: air-like,
+    /// water, and lava cells below y=50, full-column material deltas, and
+    /// the y bands where moss and clay land on each side. Requires the
+    /// worldgen capture a parity gate run leaves in target/vanilla.
+    #[test]
+    #[ignore = "needs the worldgen capture; run after a parity gate run"]
+    fn carve_diagnostic() {
+        use crate::anvil_to_wire::unpack;
+        use crate::chunk_codec::{Container, WireChunk};
+        let capture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/vanilla/worldgen-capture");
+        let Ok(entries) = std::fs::read_dir(&capture) else {
+            panic!("no worldgen capture under target/vanilla");
+        };
+        let reg = registry();
+        let terrain = NoiseTerrain::with_seed(42, &reg, &pins()).expect("engine build");
+        let name_of = |id: u32| -> &str { reg.state_of(id).map(|(name, _)| name).unwrap_or("?") };
+        let class_of = |name: &str| -> u8 {
+            match name {
+                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => 1,
+                "minecraft:water" => 2,
+                "minecraft:lava" => 3,
+                _ => 0,
+            }
+        };
+        let cells_of = |chunk: &WireChunk| -> Vec<Vec<u32>> {
+            chunk
+                .sections
+                .iter()
+                .map(|section| match &section.block_states {
+                    Container::Single(v) => vec![*v; 4096],
+                    Container::Palette {
+                        entries,
+                        longs,
+                        bits,
+                    } => unpack(longs, *bits as usize, 4096)
+                        .into_iter()
+                        .map(|i| entries[i as usize])
+                        .collect(),
+                    Container::Global { longs, bits } => unpack(longs, *bits as usize, 4096)
+                        .into_iter()
+                        .map(|i| i as u32)
+                        .collect(),
+                })
+                .collect()
+        };
+        let mut vanilla: HashMap<(i32, i32), WireChunk> = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let Ok(body) = std::fs::read(&path) else {
+                continue;
+            };
+            if body.len() < 64 || body.len() > 2_000_000 {
+                continue;
+            }
+            let x = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let z = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+            if x.abs() > 48 || z.abs() > 48 {
+                continue;
+            }
+            let Ok(chunk) = WireChunk::decode(&body) else {
+                continue;
+            };
+            if chunk.sections.len() != 24 {
+                continue;
+            }
+            vanilla.entry((chunk.x, chunk.z)).or_insert(chunk);
+        }
+        assert!(!vanilla.is_empty(), "capture held no chunk packets");
+
+        let mut class_totals = [(0u64, 0u64); 4];
+        let mut air_agree = 0u64;
+        let mut exact = 0u64;
+        let mut below = 0u64;
+        let mut probes = 0u64;
+        let mut per_chunk: Vec<((i32, i32), u64, u64)> = Vec::new();
+        let mut state_delta: HashMap<String, i64> = HashMap::new();
+        let mut moss_ours: [u64; 24] = [0; 24];
+        let mut moss_vanilla: [u64; 24] = [0; 24];
+        let mut keys: Vec<(i32, i32)> = vanilla.keys().copied().collect();
+        keys.sort_unstable();
+        for (cx, cz) in keys {
+            let theirs = cells_of(&vanilla[&(cx, cz)]);
+            let ours = terrain.fill_chunk(cx, cz);
+            let mut agree = 0u64;
+            let mut total = 0u64;
+            for y in terrain.min_y..50 {
+                let sy = ((y - terrain.min_y) / 16) as usize;
+                let ly = y.rem_euclid(16) as usize;
+                let cells = &theirs[sy];
+                for column in 0..256usize {
+                    let mine = ours[sy * 4096 + ly * 256 + column];
+                    let their = cells[ly * 256 + column];
+                    let mc = class_of(name_of(mine));
+                    let tc = class_of(name_of(their));
+                    class_totals[mc as usize].0 += 1;
+                    class_totals[tc as usize].1 += 1;
+                    if (mc == 1) == (tc == 1) {
+                        agree += 1;
+                    }
+                    if mc == tc {
+                        exact += 1;
+                    } else if probes < 12 {
+                        probes += 1;
+                        let wx = cx * 16 + (column % 16) as i32;
+                        let wz = cz * 16 + (column / 16) as i32;
+                        eprintln!(
+                            "[carve] ({wx},{y},{wz}) chunk ({cx},{cz}): ours {} vanilla {}",
+                            name_of(mine),
+                            name_of(their)
+                        );
+                    }
+                    total += 1;
+                }
+            }
+            below += total;
+            air_agree += agree;
+            per_chunk.push(((cx, cz), agree, total));
+            for (sy, cells) in theirs.iter().enumerate() {
+                for cell in 0..4096usize {
+                    let mine = name_of(ours[sy * 4096 + cell]);
+                    let their = name_of(cells[cell]);
+                    if mine != their {
+                        *state_delta.entry(their.to_string()).or_insert(0) += 1;
+                        *state_delta.entry(mine.to_string()).or_insert(0) -= 1;
+                    }
+                    let mossy = |n: &str| n == "minecraft:moss_block" || n == "minecraft:clay";
+                    if mossy(mine) {
+                        moss_ours[sy] += 1;
+                    }
+                    if mossy(their) {
+                        moss_vanilla[sy] += 1;
+                    }
+                }
+            }
+        }
+        let class_names = ["solid", "air", "water", "lava"];
+        for (class, (mine, theirs)) in class_totals.iter().enumerate() {
+            eprintln!(
+                "[carve] {:>6}: ours {mine:>7} vanilla {theirs:>7}",
+                class_names[class]
+            );
+        }
+        eprintln!(
+            "[carve] below y=50: air-mask agreement {:.3}% exact-class {:.3}% over {below} cells",
+            100.0 * air_agree as f64 / below as f64,
+            100.0 * exact as f64 / below as f64
+        );
+        let mut deltas: Vec<(i64, String)> = state_delta.into_iter().map(|(k, v)| (v, k)).collect();
+        deltas.sort_by_key(|&(d, _)| -d.abs());
+        for (delta, name) in deltas.iter().take(12) {
+            eprintln!("[carve] delta {delta:+7} {name}");
+        }
+        for sy in 0..24 {
+            if moss_ours[sy] > 0 || moss_vanilla[sy] > 0 {
+                eprintln!(
+                    "[carve] moss+clay y={:>4}: ours {:>6} vanilla {:>6}",
+                    -64 + sy as i32 * 16,
+                    moss_ours[sy],
+                    moss_vanilla[sy]
+                );
+            }
+        }
+        per_chunk.sort_by_key(|&(_, a, _)| a);
+        for &((cx, cz), a, t) in per_chunk.iter().take(8) {
+            eprintln!("[carve] worst ({cx},{cz}): {a}/{t}");
+        }
     }
 }

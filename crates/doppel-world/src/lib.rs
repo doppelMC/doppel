@@ -12,6 +12,7 @@ use std::path::Path;
 
 pub mod anvil_to_wire;
 pub mod biome;
+mod caves;
 pub mod chunk_codec;
 pub mod decoration;
 pub mod density;
