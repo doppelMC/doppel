@@ -438,6 +438,30 @@ impl Game {
     }
 
     /// One game tick (50ms): fire scheduled actions, then housekeeping.
+    /// One game tick, phases in order. The order is load-bearing: a
+    /// write lands in this tick's broadcast point (flush_dirty) or
+    /// defers to the next depending on which phase makes it.
+    ///
+    /// 1. tick counter advance
+    /// 2. tick_entities (entities.rs): item physics, merges, pickups
+    /// 3. advance_digs (dig.rs): the per-player dig clock, delayed
+    ///    destroys, stage overlays
+    /// 4. broadcast_pending_inventory (inventory.rs): non-click slot
+    ///    syncs, masked by an open container menu
+    /// 5. broadcast_time: set_time (0x73) every 20 ticks
+    /// 6. fire_torches: queued torch transitions (1gt input delay)
+    /// 7. run_scheduled_ticks: due redstone actions (neighbor and
+    ///    shape updates, observer/repeater/comparator toggles)
+    /// 8. random_ticks (entities.rs): the chunk tick's grass pass
+    /// 9. flush_dirty: the broadcast point (0x08/0x56); edits after
+    ///    this defer to the next tick
+    /// 10. run_block_events: piston world mutations (same tick as
+    ///     queued)
+    /// 11. tick_containers (containers.rs): chest lids, menu range
+    ///     checks, hoppers
+    /// 12. tick_moving_pistons: moving pistons advance and land
+    /// 13. flush_block_entities (containers.rs): block entity data
+    ///     syncs
     fn game_tick(&mut self) {
         self.tick += 1;
         // --- survival hooks (entities.rs) ---
@@ -451,54 +475,11 @@ impl Game {
         // The per-tick menu broadcast: non-click inventory changes sync
         // here unless a container menu masks them.
         self.broadcast_pending_inventory();
-        if self.tick.is_multiple_of(20) {
-            // set_time (0x73): gameTime i64 + day counter. Static world
-            // placeholder until time simulation lands.
-            let mut body = Vec::with_capacity(18);
-            body.extend_from_slice(&0i64.to_be_bytes());
-            body.extend_from_slice(&0i64.to_be_bytes());
-            body.push(0);
-            let conns: Vec<ConnId> = self.players.keys().copied().collect();
-            for c in conns {
-                self.send(c, 0x73, &body);
-            }
-        }
-        // Torch transitions fire 1gt after their input change; stale
-        // entries (block replaced) are skipped at fire time.
-        let due_torches: Vec<((i32, i32, i32), u32)> = self
-            .torch_queue
-            .iter()
-            .filter(|(_, _, t)| *t <= self.tick)
-            .map(|(pos, state, _)| (*pos, *state))
-            .collect();
-        self.torch_queue.retain(|(_, _, t)| *t > self.tick);
-        for ((x, y, z), state) in due_torches {
-            self.pending.remove(&((x, y, z), PendingKind::Torch));
-            if let Some((n, _)) = self.get_block(x, y, z) {
-                if n.contains("redstone_torch") {
-                    self.set_block(x, y, z, state, true);
-                }
-            }
-        }
-        // Fire scheduled redstone actions due this tick.
-        let due: Vec<((i32, i32, i32), TickAction)> = self
-            .scheduled
-            .iter()
-            .filter(|(t, _, _)| *t <= self.tick)
-            .map(|(_, pos, action)| (*pos, *action))
-            .collect();
-        self.scheduled.retain(|(t, _, _)| *t > self.tick);
-        for ((x, y, z), action) in due {
-            match action {
-                TickAction::NeighborUpdate => self.update_block(x, y, z),
-                TickAction::ShapeUpdate { dx, dy, dz } => {
-                    self.update_block_from(x, y, z, dx, dy, dz)
-                }
-                TickAction::ObserverToggle => self.observer_toggle(x, y, z),
-                TickAction::RepeaterToggle => self.repeater_toggle(x, y, z),
-                TickAction::ComparatorToggle => self.comparator_toggle(x, y, z),
-            }
-        }
+        self.broadcast_time();
+        self.fire_torches();
+
+        self.run_scheduled_ticks();
+
         // --- survival hooks (entities.rs) ---
         // Random ticks (the chunk tick's grass pass) land their writes in
         // this tick's flush.
@@ -520,6 +501,66 @@ impl Game {
         // --- containers hooks (containers.rs) ---
         // Changed block entities sync their data packet.
         self.flush_block_entities();
+    }
+
+    /// set_time (0x73): gameTime i64 + day counter, every 20 ticks.
+    /// Static world placeholder until time simulation lands.
+    fn broadcast_time(&mut self) {
+        if self.tick.is_multiple_of(20) {
+            // set_time (0x73): gameTime i64 + day counter. Static world
+            // placeholder until time simulation lands.
+            let mut body = Vec::with_capacity(18);
+            body.extend_from_slice(&0i64.to_be_bytes());
+            body.extend_from_slice(&0i64.to_be_bytes());
+            body.push(0);
+            let conns: Vec<ConnId> = self.players.keys().copied().collect();
+            for c in conns {
+                self.send(c, 0x73, &body);
+            }
+        }
+    }
+
+    /// Torch transitions fire 1gt after their input change; stale
+    /// entries (block replaced) are skipped at fire time.
+    fn fire_torches(&mut self) {
+        let due_torches: Vec<((i32, i32, i32), u32)> = self
+            .torch_queue
+            .iter()
+            .filter(|(_, _, t)| *t <= self.tick)
+            .map(|(pos, state, _)| (*pos, *state))
+            .collect();
+        self.torch_queue.retain(|(_, _, t)| *t > self.tick);
+        for ((x, y, z), state) in due_torches {
+            self.pending.remove(&((x, y, z), PendingKind::Torch));
+            if let Some((n, _)) = self.get_block(x, y, z) {
+                if n.contains("redstone_torch") {
+                    self.set_block(x, y, z, state, true);
+                }
+            }
+        }
+    }
+
+    /// The scheduled-tick phase: fire the redstone actions due this
+    /// tick.
+    fn run_scheduled_ticks(&mut self) {
+        let due: Vec<((i32, i32, i32), TickAction)> = self
+            .scheduled
+            .iter()
+            .filter(|(t, _, _)| *t <= self.tick)
+            .map(|(_, pos, action)| (*pos, *action))
+            .collect();
+        self.scheduled.retain(|(t, _, _)| *t > self.tick);
+        for ((x, y, z), action) in due {
+            match action {
+                TickAction::NeighborUpdate => self.update_block(x, y, z),
+                TickAction::ShapeUpdate { dx, dy, dz } => {
+                    self.update_block_from(x, y, z, dx, dy, dz)
+                }
+                TickAction::ObserverToggle => self.observer_toggle(x, y, z),
+                TickAction::RepeaterToggle => self.repeater_toggle(x, y, z),
+                TickAction::ComparatorToggle => self.comparator_toggle(x, y, z),
+            }
+        }
     }
 
     pub(crate) fn handle(&mut self, event: Inbound) {
