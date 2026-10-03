@@ -54,6 +54,24 @@ impl BlockRegistry {
             // The generator lists the default state first per block.
             reg.defaults.entry(name.to_string()).or_insert(id);
         }
+        // Pillar blocks override the first-listed state: their default
+        // is the vertical axis, not the enumeration's leading axis=x.
+        let pillars: Vec<String> = reg
+            .defaults
+            .iter()
+            .filter(|(name, &first)| {
+                reg.by_id
+                    .get(&first)
+                    .is_some_and(|(_, props)| props == "axis=x")
+                    && reg.by_key.contains_key(&format!("{name}|axis=y"))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in pillars {
+            if let Some(&vertical) = reg.by_key.get(&format!("{name}|axis=y")) {
+                reg.defaults.insert(name, vertical);
+            }
+        }
         Ok(reg)
     }
 
@@ -176,6 +194,25 @@ pub fn merge_props(base: &str, explicit: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pillar_defaults_stand_upright() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../pins/blocks.json");
+        let reg = BlockRegistry::load(&path).expect("block registry pins");
+        // The state list names axis=x first; the pillar default is vertical.
+        for name in [
+            "minecraft:deepslate",
+            "minecraft:oak_log",
+            "minecraft:basalt",
+        ] {
+            let id = reg.state_id(name, "").unwrap();
+            let props = reg.state_of(id).unwrap().1;
+            assert_eq!(props, "axis=y", "{name} default props");
+        }
+        // Blocks without an axis property keep the first-listed state.
+        let stone = reg.state_id("minecraft:stone", "").unwrap();
+        assert_eq!(reg.state_of(stone).unwrap().1, "");
+    }
 
     #[test]
     fn props_helpers() {

@@ -122,6 +122,21 @@ impl Xoroshiro {
         self.next_bits(53) as f64 / (1u64 << 53) as f64
     }
 
+    /// The float draw of the rotate-xor stream: high 24 bits scaled to
+    /// [0, 1).
+    pub fn next_f32(&mut self) -> f32 {
+        self.next_bits(24) as f32 * (1.0 / (1u64 << 24) as f32)
+    }
+
+    /// Re-seeds from a 64-bit value the way the decoration random does:
+    /// widen to 128 bits through the fixed mix.
+    pub fn set_seed_wide(&mut self, seed: i64) {
+        let (lo, hi) = upgrade_seed(seed);
+        let fixed = Xoroshiro::new(lo, hi);
+        self.lo = fixed.lo;
+        self.hi = fixed.hi;
+    }
+
     /// Derives the position-keyed factory: two draws become its halves.
     pub fn fork_positional(&mut self) -> Positional {
         Positional {

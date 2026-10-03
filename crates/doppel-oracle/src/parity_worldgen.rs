@@ -17,8 +17,8 @@ use anyhow::{bail, Context, Result};
 use doppel_protocol::load_pin;
 use doppel_world::anvil_to_wire::unpack;
 use doppel_world::chunk_codec::{Container, WireChunk};
+use doppel_world::decoration::Decorator;
 use doppel_world::registry::BlockRegistry;
-use doppel_world::structures::{generate_chunk, WellBlocks};
 use doppel_world::terrain::HeightmapGenerator;
 
 use crate::{bot, capture, vanilla};
@@ -116,43 +116,94 @@ pub fn run() -> Result<bool> {
     let registry = BlockRegistry::load(&root.join("pins").join("blocks.json"))
         .context("loading block registry pins")?;
     let terrain = HeightmapGenerator::with_seed(SEED, &registry)?;
-    let well = WellBlocks::from_registry(&registry)?;
 
-    compare(&chunks, &terrain, &well, &registry, &dump_dir)
+    compare(&chunks, &terrain, &registry, &dump_dir)
 }
 
 fn compare(
     captured: &[WireChunk],
     terrain: &HeightmapGenerator,
-    well: &WellBlocks,
     registry: &BlockRegistry,
     dump_dir: &Path,
 ) -> Result<bool> {
+    // Every captured chunk decorates before any of them is emitted, so the
+    // cross-chunk writes features make land before the comparison snapshot.
+    let mut decorator =
+        Decorator::new(terrain, registry, SEED).context("building the feature decorator")?;
+    for v in captured {
+        decorator.decorate(v.x, v.z);
+    }
+
     let mut heights = HeightCompare::default();
     let mut ours_hist: HashMap<String, u64> = HashMap::new();
     let mut vanilla_hist: HashMap<String, u64> = HashMap::new();
     let mut biomes: HashMap<u32, u64> = HashMap::new();
+    let mut ours_biomes: HashMap<u32, u64> = HashMap::new();
     let mut cells_total = 0u64;
     let mut cells_equal = 0u64;
+    // Per-chunk convergence probes: heightmap-1 outlier columns and the
+    // block-name deltas that mark a mis-placed feature.
+    let mut per_chunk: Vec<((i32, i32), u64, u64, u64, u64, u64)> = Vec::new();
+    let leaf_like = |name: &str| -> u64 {
+        u64::from(name.ends_with("_leaves") || name == "minecraft:leaf_litter")
+    };
+    let log_like = |name: &str| -> u64 { u64::from(name.ends_with("_log")) };
 
     for v in captured {
-        let mine = generate_chunk(terrain, well, SEED, v.x, v.z);
+        let mine = decorator.emit(v.x, v.z);
         heights.add_chunk(v, &mine);
         let ours_cells = chunk_cells(&mine, registry);
         let vanilla_cells = chunk_cells(v, registry);
-        for (name, count) in ours_cells.hist {
-            *ours_hist.entry(name).or_default() += count;
+        let mut outlier_columns = 0u64;
+        let mut mismatched = 0u64;
+        let mut leaf_gap = 0i64;
+        let mut log_gap = 0i64;
+        if let (Some((_, a)), Some((_, b))) = (
+            mine.heightmaps.iter().find(|(ty, _)| *ty == 1),
+            v.heightmaps.iter().find(|(ty, _)| *ty == 1),
+        ) {
+            let ours = unpack(a, 9, 256);
+            let theirs = unpack(b, 9, 256);
+            for i in 0..256 {
+                if (ours[i] as i32 - theirs[i] as i32).abs() > 4 {
+                    outlier_columns += 1;
+                }
+            }
         }
-        for (name, count) in vanilla_cells.hist {
-            *vanilla_hist.entry(name).or_default() += count;
+        for (name, count) in &ours_cells.hist {
+            *ours_hist.entry(name.clone()).or_default() += *count;
+            leaf_gap -= (*count as i64) * (leaf_like(name) as i64);
+            log_gap -= (*count as i64) * (log_like(name) as i64);
         }
-        for (id, count) in vanilla_cells.biomes {
-            *biomes.entry(id).or_default() += count;
+        for (name, count) in &vanilla_cells.hist {
+            *vanilla_hist.entry(name.clone()).or_default() += *count;
+            leaf_gap += (*count as i64) * (leaf_like(name) as i64);
+            log_gap += (*count as i64) * (log_like(name) as i64);
         }
         for (a, b) in ours_cells.cells.iter().zip(vanilla_cells.cells.iter()) {
             cells_total += 1;
+            mismatched += u64::from(a != b);
             cells_equal += u64::from(a == b);
         }
+        per_chunk.push((
+            (v.x, v.z),
+            outlier_columns,
+            mismatched,
+            leaf_gap.unsigned_abs(),
+            log_gap.unsigned_abs(),
+            leaf_gap.unsigned_abs() + log_gap.unsigned_abs(),
+        ));
+        for (id, count) in vanilla_cells.biomes {
+            *biomes.entry(id).or_default() += count;
+        }
+        for (id, count) in ours_cells.biomes {
+            *ours_biomes.entry(id).or_default() += count;
+        }
+    }
+    per_chunk.sort_by_key(|c| std::cmp::Reverse(c.5));
+    println!("[worldgen] worst chunks by leaf+log delta (chunk, hm outliers, cell mismatches, leaf delta, log delta):");
+    for (pos, out, mismatch, leaf, log, _) in per_chunk.iter().take(6) {
+        println!("[worldgen]   {pos:?}: {out}, {mismatch}, {leaf}, {log}");
     }
 
     println!("[worldgen] chunks compared: {}", captured.len());
@@ -270,12 +321,29 @@ fn compare(
         "[worldgen] vanilla biomes (id x cells): {}",
         shown.join(" ")
     );
+    let mut ours_list: Vec<(u64, u32)> = ours_biomes.into_iter().map(|(k, v)| (v, k)).collect();
+    ours_list.sort_unstable_by_key(|(count, _)| std::cmp::Reverse(*count));
+    let ours_shown: Vec<String> = ours_list
+        .iter()
+        .take(8)
+        .map(|(count, id)| format!("{id}x{count}"))
+        .collect();
     println!(
-        "[worldgen] our biomes: 41 everywhere ({} cells)",
-        biome_list.iter().map(|(c, _)| c).sum::<u64>()
+        "[worldgen] our biomes (id x cells): {}",
+        ours_shown.join(" ")
     );
-    let shared = biome_list.iter().any(|(_, id)| *id == 41);
-    println!("[worldgen] shared plains biome: {shared}");
+    let vanilla_ids: std::collections::HashSet<u32> =
+        biome_list.iter().map(|(_, id)| *id).collect();
+    let shared = ours_list
+        .iter()
+        .filter(|(_, id)| vanilla_ids.contains(id))
+        .count();
+    println!(
+        "[worldgen] shared biome ids: {shared}/{} ours, {}/{} vanilla",
+        ours_list.len(),
+        shared,
+        vanilla_ids.len()
+    );
 
     // Persist the raw pairs for offline calibration.
     let report = dump_dir.join("summary.txt");
