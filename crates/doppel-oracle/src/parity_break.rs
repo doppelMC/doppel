@@ -258,6 +258,73 @@ fn decode_overlays(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), i32)>
     out
 }
 
+/// Frames the order vote labels: one char per cross-type family. Types
+/// outside the table (keep-alives, teleports) carry tick-independent
+/// timing and stay unlabeled.
+fn order_label(id: i32) -> Option<char> {
+    Some(match id {
+        0x3c => 'A',        // open_screen
+        0x12 => 'C',        // container set_content
+        0x14 => 'S',        // container set_slot
+        0x08 | 0x56 => 'U', // block_update / section_blocks_update
+        0x07 => 'B',        // block_event
+        0x05 => 'O',        // block_destruction
+        0x73 => 'T',        // set_time
+        0x01 => 'E',        // add_entity
+        0x65 => 'D',        // set_entity_data
+        0x23 => 'M',        // entity_position_sync
+        0x7f => 'P',        // set_equipped_item (pickup)
+        0x4f => 'X',        // remove_entities
+        _ => return None,
+    })
+}
+
+/// The stream's cross-type order votes: `(label pair) -> [a-first, b-first]`
+/// counts, pair labels sorted. Frames split into bursts at >15ms gaps -
+/// one server tick's frames land inside a single burst on both servers -
+/// and each pair of labels present in a burst votes on which label first
+/// appeared in it. Packet identity differs per server; the relative order
+/// of same-tick types is the comparable.
+fn order_votes(
+    pkts: &[bot::CapturedPacket],
+    from: usize,
+) -> std::collections::BTreeMap<(char, char), [usize; 2]> {
+    let mut votes: std::collections::BTreeMap<(char, char), [usize; 2]> = Default::default();
+    let mut burst: Vec<(char, usize)> = Vec::new();
+    let mut last_ms = None;
+    let flush = |burst: &mut Vec<(char, usize)>,
+                 votes: &mut std::collections::BTreeMap<(char, char), [usize; 2]>| {
+        let first: std::collections::BTreeMap<char, usize> = burst.iter().copied().collect();
+        let labels: Vec<char> = first.keys().copied().collect();
+        for (i, &a) in labels.iter().enumerate() {
+            for &b in labels.iter().skip(i + 1) {
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                let flipped = first[&lo] > first[&hi];
+                let slot = votes.entry((lo, hi)).or_insert([0, 0]);
+                slot[flipped as usize] += 1;
+            }
+        }
+        burst.clear();
+    };
+    for p in pkts.iter().skip(from) {
+        if p.id < 0 {
+            continue;
+        }
+        let Some(label) = order_label(p.id) else {
+            continue;
+        };
+        if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
+            flush(&mut burst, &mut votes);
+        }
+        last_ms = Some(p.t_ms);
+        if !burst.iter().any(|(l, _)| *l == label) {
+            burst.push((label, burst.len()));
+        }
+    }
+    flush(&mut burst, &mut votes);
+    votes
+}
+
 /// One side's reduced observation: what the digger saw about itself and
 /// what the standing witness saw about the world.
 struct Side {
@@ -701,6 +768,51 @@ pub fn parity_break() -> Result<bool> {
             v.slots, d.slots
         ));
     }
+
+    // Cross-type same-tick order: every pair vanilla orders the same way
+    // in every shared burst must never draw an opposite vote from doppel
+    // (frame identity differs per server; the sequence does not). Pairs
+    // vanilla splits across bursts carry no evidence and stay unjudged;
+    // the positive-pair count keeps an empty capture from passing.
+    let mut compared_pairs = 0usize;
+    for (stream, vpk, dpk) in [
+        ("digger", &v_digger, &d_digger),
+        ("witness", &v_witness, &d_witness),
+    ] {
+        let vstart = match marker_of(vpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let dstart = match marker_of(dpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let vvotes = order_votes(vpk, vstart);
+        let dvotes = order_votes(dpk, dstart);
+        for ((lo, hi), [lo_first, hi_first]) in &vvotes {
+            let van_unanimous = (*lo_first == 0) != (*hi_first == 0);
+            if !van_unanimous {
+                continue;
+            }
+            let want_first = if *lo_first > 0 { *lo } else { *hi };
+            let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
+            let d_want = if *lo_first > 0 { dlo } else { dhi };
+            let d_other = if *lo_first > 0 { dhi } else { dlo };
+            if d_other > 0 {
+                failures.push(format!(
+                    "{stream}: same-tick order {want_first} first voted opposite \
+                     ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
+                ));
+            }
+            if d_want > 0 {
+                compared_pairs += 1;
+            }
+        }
+    }
+    if compared_pairs == 0 {
+        failures.push("no cross-type same-tick order pairs compared".into());
+    }
+    println!("[oracle] cross-type same-tick order: {compared_pairs} positively compared pair(s)");
 
     if failures.is_empty() {
         println!("PASS: breaking parity");
