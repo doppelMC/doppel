@@ -563,6 +563,9 @@ pub fn parity_walk() -> Result<bool> {
     }
     println!("[oracle] byte-compared {compared} shared walk chunks");
 
+    if compared == 0 {
+        anyhow::bail!("walk gate compared zero shared chunks");
+    }
     if failures.is_empty() {
         println!("PASS: walk streams match");
         Ok(true)
@@ -1142,6 +1145,9 @@ pub fn parity_redstone() -> Result<bool> {
                 pos
             ));
         }
+    }
+    if vmap.is_empty() {
+        anyhow::bail!("redstone gate compared nothing: vanilla captured zero circuit states");
     }
     if failures.is_empty() {
         println!("PASS: redstone circuits match");
