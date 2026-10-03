@@ -802,9 +802,46 @@ pub fn parity_break() -> Result<bool> {
             let d_other = if *lo_first > 0 { dhi } else { dlo };
             if d_other > 0 {
                 failures.push(format!(
-                    "{stream}: same-tick order {want_first} first voted opposite \
-                     ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
+                    "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
                 ));
+                // Name the offending bursts: which packets, what order,
+                // what times - a flush-merge artifact and a real reorder
+                // read differently here (different entity ids across a
+                // seam vs the same id inside one flush).
+                let mut shown = 0;
+                let mut burst: Vec<(char, i32, u128)> = Vec::new();
+                let mut last_ms: Option<u128> = None;
+                for p in dpk.iter().skip(dstart) {
+                    if p.id < 0 {
+                        continue;
+                    }
+                    let Some(l) = order_label(p.id) else {
+                        continue;
+                    };
+                    if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
+                        let firsts: std::collections::BTreeMap<char, u128> =
+                            burst.iter().map(|(l, _, t)| (*l, *t)).collect();
+                        if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
+                            if bt < at {
+                                println!(
+                                    "  {stream} opposite burst: {}",
+                                    burst
+                                        .iter()
+                                        .map(|(l, id, t)| format!("{l}=0x{id:02x}@{t}ms"))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                );
+                                shown += 1;
+                            }
+                        }
+                        if shown >= 3 {
+                            break;
+                        }
+                        burst.clear();
+                    }
+                    burst.push((l, p.id, p.t_ms));
+                    last_ms = Some(p.t_ms);
+                }
             }
             if d_want > 0 {
                 compared_pairs += 1;
