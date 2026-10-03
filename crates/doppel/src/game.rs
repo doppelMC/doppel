@@ -55,6 +55,15 @@ pub enum Inbound {
         y: f64,
         z: f64,
     },
+    /// `tp <name> x y z`: the issuer teleports the named player (the
+    /// survival gate stages its commandless witness this way).
+    TpNamed {
+        conn: ConnId,
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
     KeepAliveAnswer {
         conn: ConnId,
         id: i64,
@@ -643,34 +652,32 @@ impl Game {
                         p.pitch = pitch;
                     }
                 }
-                self.stream_if_moved(conn);
                 // --- tracker hooks (tracker.rs) ---
-                // A move re-checks every entity's pairing range.
+                // A move re-checks every entity's pairing range before
+                // the view swap (a section crossing pairs on the next
+                // move, as the reference's move handler orders it).
                 self.track_player_view(conn);
+                self.stream_if_moved(conn);
             }
             Inbound::Tp { conn, x, y, z } => {
-                let Some(p) = self.players.get_mut(&conn) else {
-                    return;
-                };
-                p.x = x;
-                p.y = y;
-                p.z = z;
-                let mut sync = Vec::with_capacity(64);
-                doppel_protocol::write_varint(&mut sync, p.teleport_id);
-                sync.extend_from_slice(&x.to_be_bytes());
-                sync.extend_from_slice(&y.to_be_bytes());
-                sync.extend_from_slice(&z.to_be_bytes());
-                sync.extend_from_slice(&0.0f64.to_be_bytes());
-                sync.extend_from_slice(&0.0f64.to_be_bytes());
-                sync.extend_from_slice(&0.0f64.to_be_bytes());
-                sync.extend_from_slice(&p.yaw.to_be_bytes());
-                sync.extend_from_slice(&p.pitch.to_be_bytes());
-                sync.extend_from_slice(&0i32.to_be_bytes());
-                p.teleport_id += 1;
-                self.send(conn, 0x49, &sync);
-                self.stream_if_moved(conn);
-                // --- tracker hooks (tracker.rs) ---
-                self.track_player_view(conn);
+                self.teleport_conn(conn, x, y, z);
+                self.send_command_feedback(conn);
+            }
+            Inbound::TpNamed {
+                conn,
+                name,
+                x,
+                y,
+                z,
+            } => {
+                let target = self
+                    .players
+                    .iter()
+                    .find(|(_, p)| p.name == name)
+                    .map(|(&c, _)| c);
+                if let Some(target) = target {
+                    self.teleport_conn(target, x, y, z);
+                }
                 self.send_command_feedback(conn);
             }
             Inbound::KeepAliveAnswer { conn, id } => {
@@ -899,6 +906,40 @@ impl Game {
     fn send_command_feedback(&mut self, conn: ConnId) {
         let body = [0x00u8, 0x00];
         self.send(conn, 0x7c, &body);
+    }
+
+    /// The teleport body shared by `tp @s` and the named form: the position
+    /// update, the 0x49 sync, the pairing re-check against the pre-teleport
+    /// view, then the chunk stream catch-up. The reference's move handler
+    /// re-checks pairing before it swaps the tracking view, so a teleport
+    /// out and back never re-pairs on its own: the drops stay unpaired
+    /// until the player's next move.
+    fn teleport_conn(&mut self, conn: ConnId, x: f64, y: f64, z: f64) {
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        p.x = x;
+        p.y = y;
+        p.z = z;
+        let mut sync = Vec::with_capacity(64);
+        doppel_protocol::write_varint(&mut sync, p.teleport_id);
+        sync.extend_from_slice(&x.to_be_bytes());
+        sync.extend_from_slice(&y.to_be_bytes());
+        sync.extend_from_slice(&z.to_be_bytes());
+        sync.extend_from_slice(&0.0f64.to_be_bytes());
+        sync.extend_from_slice(&0.0f64.to_be_bytes());
+        sync.extend_from_slice(&0.0f64.to_be_bytes());
+        sync.extend_from_slice(&p.yaw.to_be_bytes());
+        sync.extend_from_slice(&p.pitch.to_be_bytes());
+        sync.extend_from_slice(&0i32.to_be_bytes());
+        p.teleport_id += 1;
+        self.send(conn, 0x49, &sync);
+        // --- tracker hooks (tracker.rs) ---
+        // The pairing pass reads the old view: entities in the fresh
+        // surroundings wait for the player's next move, like the
+        // reference's move handler.
+        self.track_player_view(conn);
+        self.stream_if_moved(conn);
     }
 
     /// Logs a dropped world write, once per (chunk, reason).

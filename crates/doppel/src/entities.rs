@@ -829,6 +829,10 @@ impl Game {
         item.pickup_delay = delay;
         item.owner = owner;
         item.born_tick = self.tick;
+        // The stack accessor spawns dirty: the pairing carries its
+        // snapshot, and the first sync pass re-sends it (the flush the
+        // reference's data-dirty flag performs after every spawn).
+        item.stack_dirty = true;
         self.survival.items.push(item);
         self.track_entity_spawned(id);
     }
@@ -1817,6 +1821,70 @@ mod tests {
         let frames = drain(&rx);
         let adds = of(&frames, PACKET_ADD_ENTITY);
         assert_eq!(adds.len(), 1, "re-paired on return");
+        assert_eq!(adds[0][0], removes[0][1], "the same entity id");
+    }
+
+    #[test]
+    fn teleport_back_does_not_repair_until_the_next_move() {
+        let (mut g, rx) = harness();
+        let torch = item_id("minecraft:torch").unwrap();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        g.spawn_item(
+            5.0,
+            100.5,
+            5.0,
+            (0.0, 0.0, 0.0),
+            0.0,
+            ItemStack::new(torch, 1),
+            None,
+        );
+        assert_eq!(of(&drain(&rx), PACKET_ADD_ENTITY).len(), 1, "paired");
+        // Away, past the view ring (the harness keeps failed chunk loads
+        // out of `sent`, so the drop's chunk leaves the set here): the
+        // distance drops the pairing and the away view drops the chunk.
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: -100.5,
+        });
+        let away = drain(&rx);
+        let removes = of(&away, PACKET_REMOVE_ENTITIES);
+        assert_eq!(removes.len(), 1, "unpaired at the away teleport");
+        // Straight back: the pairing pass reads the away view, so the
+        // drop stays unpaired (the reference swaps its tracking view
+        // only after the pairing pass).
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        let back = drain(&rx);
+        assert!(
+            of(&back, PACKET_ADD_ENTITY).is_empty(),
+            "no re-pair at the return teleport"
+        );
+        // The next move re-checks against the restored view and pairs
+        // (the chunk grant stands in for the streaming the world-less
+        // harness cannot do).
+        g.grant_chunks_for_test(0, &[(0, 0)]);
+        g.handle(Inbound::Moved {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+            yaw: None,
+            pitch: None,
+        });
+        let moved = drain(&rx);
+        let adds = of(&moved, PACKET_ADD_ENTITY);
+        assert_eq!(adds.len(), 1, "re-paired at the move");
         assert_eq!(adds[0][0], removes[0][1], "the same entity id");
     }
 

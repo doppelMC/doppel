@@ -298,7 +298,7 @@ impl Game {
                 (s.x.div_euclid(16.0) as i32 - pcx).abs() <= VIEW_RADIUS
                     && (s.z.div_euclid(16.0) as i32 - pcz).abs() <= VIEW_RADIUS
             });
-            if !section_changed && !s.needs_sync && !in_ticking_range {
+            if !section_changed && !s.needs_sync && !s.stack_dirty && !in_ticking_range {
                 continue;
             }
             let gate = s.needs_sync || state.tick_count % SYNC_INTERVAL == 0 || s.stack_dirty;
