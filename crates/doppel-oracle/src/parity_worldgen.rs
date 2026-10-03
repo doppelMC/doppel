@@ -28,23 +28,22 @@ const PORT: u16 = 25571;
 const SEED: i64 = 42;
 /// Capture floor: below this the join burst failed, not the generator.
 const MIN_CHUNKS: usize = 20;
-/// Heightmap convergence targets (world layers). The residual median sits
-/// at canopy height: the density surface matches, vanilla adds trees.
-const MAX_MEDIAN_DELTA: f64 = 8.0;
-const MAX_P95_DELTA: f64 = 12.0;
+/// Heightmap convergence targets (world layers). The median column delta
+/// is zero; the tail sits at canopy edges where the tree stream desyncs.
+const MAX_MEDIAN_DELTA: f64 = 2.0;
+const MAX_P95_DELTA: f64 = 9.0;
 /// Shape alignment: Pearson correlation of the height fields.
-const MIN_CORRELATION: f64 = 0.72;
+const MIN_CORRELATION: f64 = 0.75;
 /// Material agreement: histogram overlap over block names.
-const MIN_OVERLAP: f64 = 0.95;
+const MIN_OVERLAP: f64 = 0.98;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
-/// breakage like wrong world height or offset sections). Ore blobs and
-/// surface disks sit at this margin; the remaining gap is caves,
-/// aquifers, and lush caves.
-const MIN_CELL_AGREEMENT: f64 = 0.95;
+/// breakage like wrong world height or offset sections). The carve and
+/// aquifer fields match; the remaining gap is lush-cave ground cover.
+const MIN_CELL_AGREEMENT: f64 = 0.97;
 /// Coastline agreement: the density surface matches vanilla block for
 /// block; the remaining disagreement columns carry vanilla ground cover
 /// (leaf litter, grass, tree canopies) the tree stream desync moves.
-const MIN_LANDMASK: f64 = 0.9;
+const MIN_LANDMASK: f64 = 0.94;
 
 pub fn run() -> Result<bool> {
     let pin = load_pin()?;
