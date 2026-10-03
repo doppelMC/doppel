@@ -259,10 +259,9 @@ impl StateProvider {
 /// Feature kinds the pins carry but the engine places nothing for yet.
 /// Plan validation accepts exactly these and the dispatch arms; any other
 /// kind fails the plan load instead of skipping silently.
-pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 39] = [
+pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 38] = [
     "minecraft:overlay",
     "minecraft:vegetation_patch",
-    "minecraft:spring_feature",
     "minecraft:block_pile",
     "minecraft:huge_fungus",
     "minecraft:sequence",
@@ -433,6 +432,9 @@ pub(crate) fn run_feature(
         "minecraft:multiface_growth" => run_multiface(d, v, rng, x, y, z),
         "minecraft:ore" => crate::ores::run_ore(d, v, rng, x, y, z),
         "minecraft:disk" => crate::ores::run_disk(d, v, rng, x, y, z),
+        "minecraft:spring_feature" => {
+            crate::lush::run_spring(d, v, rng, x, y, z);
+        }
         other => {
             debug_assert!(
                 UNPLACED_FEATURE_KINDS.contains(&other),

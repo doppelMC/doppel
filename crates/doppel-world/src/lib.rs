@@ -17,6 +17,7 @@ pub mod chunk_codec;
 pub mod decoration;
 pub mod density;
 mod features;
+mod lush;
 pub mod noise;
 mod ores;
 pub mod registry;

@@ -355,12 +355,14 @@ impl Anchor {
     }
 }
 
-/// The distribution a height range draws from: flat, or flat with a
-/// plateau that spreads the density over the range shoulders.
+/// The distribution a height range draws from: flat, flat with a
+/// plateau that spreads the density over the range shoulders, or the
+/// inner-band skew that hugs the range floor.
 #[derive(Clone)]
 enum RangeShape {
     Uniform,
     Trapezoid { plateau: i32 },
+    VeryBiased { inner: i32 },
 }
 
 /// A block predicate for placement filters and feature checks.
@@ -533,6 +535,9 @@ impl Modifier {
                     Some("minecraft:uniform") => RangeShape::Uniform,
                     Some("minecraft:trapezoid") => RangeShape::Trapezoid {
                         plateau: height.get("plateau").and_then(Value::as_i64).unwrap_or(0) as i32,
+                    },
+                    Some("minecraft:very_biased_to_bottom") => RangeShape::VeryBiased {
+                        inner: height.get("inner").and_then(Value::as_i64).unwrap_or(1) as i32,
                     },
                     _ => return Ok(Modifier::Unsupported),
                 };
@@ -1258,6 +1263,20 @@ impl<'a> Decorator<'a> {
                             bail!("disk config rejected by the parser")
                         }
                     }
+                    "minecraft:spring_feature" => {
+                        v.get("state")
+                            .and_then(|s| s.get("id"))
+                            .and_then(Value::as_str)
+                            .context("spring fluid")?;
+                        if !v
+                            .get("valid_blocks")
+                            .and_then(Value::as_array)
+                            .is_some_and(|l| !l.is_empty())
+                        {
+                            bail!("spring without valid blocks");
+                        }
+                        Ok(())
+                    }
                     other => bail!("unsupported feature kind {other}"),
                 }
             }
@@ -1497,6 +1516,19 @@ impl<'a> Decorator<'a> {
                                     let start = (range - plateau) / 2;
                                     let end = range - start;
                                     lo + rng.next_int(end + 1) + rng.next_int(start + 1)
+                                }
+                            }
+                            // A band narrower than the inner height holds
+                            // its floor; otherwise the upper draw firsts
+                            // narrows to the band, then two more draws
+                            // walk the result toward the bottom.
+                            RangeShape::VeryBiased { inner } => {
+                                if hi - lo - inner < 0 {
+                                    lo
+                                } else {
+                                    let upper = rng.next_int(hi - (lo + inner) + 1) + lo + inner;
+                                    let biased = rng.next_int(upper - lo) + lo;
+                                    rng.next_int(biased + inner - lo) + lo
                                 }
                             }
                         }
