@@ -799,6 +799,7 @@ impl Game {
 
     /// The shared spawn: allocate the id and uuid, then pair the entity
     /// with every in-range player.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_item(
         &mut self,
         x: f64,

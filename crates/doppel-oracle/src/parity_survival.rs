@@ -742,8 +742,9 @@ fn sim_pass(s: &mut SimDrop, out: &mut Vec<SimFrame>) {
             s.teleport_delay = 0;
             2
         } else if should_send_position {
+            let wire_short = -32768..=32767;
             let too_big =
-                xa < -32768 || xa > 32767 || ya < -32768 || ya > 32767 || za < -32768 || za > 32767;
+                !wire_short.contains(&xa) || !wire_short.contains(&ya) || !wire_short.contains(&za);
             let full_precision = (s.vertical_collision
                 && (xa != 0 && track_loss(s.x) != 0.0 || za != 0 && track_loss(s.z) != 0.0))
                 || (s.horizontal_collision

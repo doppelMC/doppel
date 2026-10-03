@@ -335,12 +335,10 @@ impl Game {
                     let xa = encode_component(s.x) - encode_component(bx);
                     let ya = encode_component(s.y) - encode_component(by);
                     let za = encode_component(s.z) - encode_component(bz);
-                    let too_big = xa < -32768
-                        || xa > 32767
-                        || ya < -32768
-                        || ya > 32767
-                        || za < -32768
-                        || za > 32767;
+                    let wire_short = -32768..=32767;
+                    let too_big = !wire_short.contains(&xa)
+                        || !wire_short.contains(&ya)
+                        || !wire_short.contains(&za);
                     // Collision turns strict, wire loss on a crossed axis
                     // forces the full packet (the vertical case pairs each
                     // axis with its own loss, the horizontal one crosses).
