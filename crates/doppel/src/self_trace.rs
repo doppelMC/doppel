@@ -269,7 +269,7 @@ fn record_session() -> Vec<String> {
     // 0.7 finish threshold (immediate break), then the spawned drop.
     // Dirt bare-handed: 1.0/0.5/30 = one tick of progress in 15.
     let dig = |action: i32| {
-        crate::placement::parse_player_action(&player_action_bytes(action, 6, 100, 6, 1, 2))
+        crate::dig::parse_player_action(&player_action_bytes(action, 6, 100, 6, 1, 2))
             .expect("player_action bytes parse")
     };
     t.step(

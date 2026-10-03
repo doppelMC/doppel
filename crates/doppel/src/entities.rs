@@ -542,7 +542,7 @@ impl Game {
     /// 10-tick pickup delay. Bare-hand breaks of tool-required blocks
     /// drop nothing.
     pub(crate) fn spawn_break_drop(&mut self, pos: (i32, i32, i32), name: &str) {
-        let (_, requires_tool) = crate::placement::hardness(name);
+        let (_, requires_tool) = crate::dig::hardness(name);
         if requires_tool {
             return;
         }
@@ -1264,7 +1264,7 @@ mod tests {
         // Tool-required stone drops nothing bare-handed (the gate lives
         // in spawn_break_drop).
         assert_eq!(
-            crate::placement::hardness("minecraft:stone"),
+            crate::dig::hardness("minecraft:stone"),
             (1.5, true),
             "stone stays in the tool-gated family"
         );
@@ -1370,8 +1370,8 @@ mod tests {
         // Insta-break: the drop spawns with the break.
         g.handle(Inbound::PlayerAction {
             conn: 0,
-            act: crate::placement::PlayerAction {
-                action: crate::placement::ACTION_START_DESTROY,
+            act: crate::dig::PlayerAction {
+                action: crate::dig::ACTION_START_DESTROY,
                 x: 5,
                 y: 100,
                 z: 5,
@@ -1432,8 +1432,8 @@ mod tests {
         });
         g.handle(Inbound::PlayerAction {
             conn: 0,
-            act: crate::placement::PlayerAction {
-                action: crate::placement::ACTION_START_DESTROY,
+            act: crate::dig::PlayerAction {
+                action: crate::dig::ACTION_START_DESTROY,
                 x: 5,
                 y: 100,
                 z: 5,
@@ -1448,8 +1448,8 @@ mod tests {
         }
         g.handle(Inbound::PlayerAction {
             conn: 0,
-            act: crate::placement::PlayerAction {
-                action: crate::placement::ACTION_STOP_DESTROY,
+            act: crate::dig::PlayerAction {
+                action: crate::dig::ACTION_STOP_DESTROY,
                 x: 5,
                 y: 100,
                 z: 5,
@@ -1486,8 +1486,8 @@ mod tests {
         });
         g.handle(Inbound::PlayerAction {
             conn: 0,
-            act: crate::placement::PlayerAction {
-                action: crate::placement::ACTION_DROP_ITEM,
+            act: crate::dig::PlayerAction {
+                action: crate::dig::ACTION_DROP_ITEM,
                 x: 0,
                 y: 0,
                 z: 0,

@@ -3,6 +3,7 @@
 //! captured from the vanilla oracle.
 
 pub mod blobs;
+pub mod dig;
 pub mod game;
 pub mod inventory;
 pub mod placement;
@@ -521,10 +522,10 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                 sequence: hit.sequence,
             })
         }
-        // --- breaking hooks (placement.rs) ---
+        // --- breaking hooks (dig.rs) ---
         // player_action: dig lifecycle, drops, offhand swap.
         0x29 => {
-            let act = match placement::parse_player_action(body) {
+            let act = match dig::parse_player_action(body) {
                 Ok(act) => act,
                 Err(e) => {
                     eprintln!("[doppel] player_action: {e:#}");
