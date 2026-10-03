@@ -355,13 +355,22 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
             // walk-parity bot can drive Doppel exactly like vanilla.
             let cmd = r.read_string(1024).ok()?;
             let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if parts.len() == 5 && parts[0] == "tp" && parts[1] == "@s" {
+            if parts.len() == 5 && parts[0] == "tp" {
                 if let (Ok(x), Ok(y), Ok(z)) = (
                     parts[2].parse::<f64>(),
                     parts[3].parse::<f64>(),
                     parts[4].parse::<f64>(),
                 ) {
-                    return Some(game::Inbound::Tp { conn, x, y, z });
+                    if parts[1] == "@s" {
+                        return Some(game::Inbound::Tp { conn, x, y, z });
+                    }
+                    return Some(game::Inbound::TpNamed {
+                        conn,
+                        name: parts[1].to_string(),
+                        x,
+                        y,
+                        z,
+                    });
                 }
             }
             if parts.len() == 5 && parts[0] == "setblock" {

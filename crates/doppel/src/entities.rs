@@ -23,9 +23,9 @@ use crate::inventory::{encode_item_stack, item_id, ItemStack};
 pub const PACKET_ADD_ENTITY: i32 = 0x01;
 /// `entity_position_sync`: registration order 36.
 pub const PACKET_ENTITY_POSITION_SYNC: i32 = 0x23;
-/// `move_entity_pos` / `move_entity_pos_rot`: orders 55/56. This build
-/// sends full position syncs for drops; the ids stay pinned.
-#[allow(dead_code)]
+/// `move_entity_pos` / `move_entity_pos_rot`: orders 55/56. Drops send
+/// the pos form (they never rotate after spawn); the pos+rot id stays
+/// pinned for the shared shape.
 pub const PACKET_MOVE_ENTITY_POS: i32 = 0x36;
 #[allow(dead_code)]
 pub const PACKET_MOVE_ENTITY_POS_ROT: i32 = 0x37;
@@ -33,12 +33,15 @@ pub const PACKET_MOVE_ENTITY_POS_ROT: i32 = 0x37;
 pub const PACKET_REMOVE_ENTITIES: i32 = 0x4e;
 /// `set_entity_data`: registration order 102.
 pub const PACKET_SET_ENTITY_DATA: i32 = 0x65;
-/// `set_entity_motion`: registration order 104. Drop velocities ride the
-/// add/position-sync packets; the id stays pinned.
-#[allow(dead_code)]
+/// `set_entity_motion`: registration order 104.
 pub const PACKET_SET_ENTITY_MOTION: i32 = 0x67;
 /// `take_item_entity`: registration order 128.
 pub const PACKET_TAKE_ITEM_ENTITY: i32 = 0x7f;
+/// `teleport_entity`: registration order 129. The reference's item
+/// full-sync path rides entity_position_sync instead; the id stays pinned
+/// against the registration order.
+#[allow(dead_code)]
+pub const PACKET_TELEPORT_ENTITY: i32 = 0x80;
 
 /// `minecraft:item` in the entity-type registry (registration order 73,
 /// 0-based).
@@ -58,9 +61,17 @@ const DATA_ITEM: u8 = 8;
 const GRAVITY: f64 = 0.04;
 /// Drag applied to every axis after a move.
 const AIR_DRAG: f64 = 0.98;
-/// Ground friction of the blocks drops land on; horizontal axes multiply
-/// by drag * friction while grounded.
-const GROUND_FRICTION: f64 = 0.6;
+/// Ground friction of the block families the flat world offers.
+const FRICTION_DEFAULT: f64 = 0.6;
+const FRICTION_ICE: f64 = 0.98;
+const FRICTION_SLIME: f64 = 0.8;
+/// Water drag on the horizontal axes while submerged.
+const WATER_DRAG: f64 = 0.99;
+/// Lava drag.
+const LAVA_DRAG: f64 = 0.95;
+/// Buoyancy added while the vertical motion stays under this speed.
+const BUOYANCY: f64 = 5.0e-4;
+const BUOYANCY_MAX_VY: f64 = 0.06;
 /// Pickup delay for block drops.
 const PICKUP_DELAY_BREAK: i32 = 10;
 /// Pickup delay for player-thrown drops.
@@ -76,8 +87,6 @@ const HEIGHT: f64 = 0.25;
 const PICKUP_INFLATE_XZ: f64 = 1.425;
 const PICKUP_DOWN: f64 = 0.5;
 const PICKUP_UP: f64 = 1.8 + 0.5;
-/// Entity tracking range: clientTrackingRange 6 chunks.
-const TRACK_RANGE: f64 = 96.0;
 /// The default stack cap merges honor.
 const MAX_MERGE: i32 = 64;
 /// Random ticks per randomly-ticking section per tick (the
@@ -120,9 +129,10 @@ pub fn encode_lp_movement(buf: &mut Vec<u8>, x: f64, y: f64, z: f64) {
     }
 }
 
-/// Degrees packed to the wire byte: `deg * 256 / 360`.
+/// Degrees packed to the wire byte: `deg * 256 / 360`, truncated and
+/// wrapped through the low 8 bits (180 degrees lands on 128, not 127).
 fn pack_degrees(deg: f32) -> u8 {
-    (deg * 256.0 / 360.0) as i8 as u8
+    ((deg * 256.0 / 360.0) as i64 & 0xff) as u8
 }
 
 /// `add_entity`: id, uuid, type, position, movement, rotations, data.
@@ -186,6 +196,26 @@ pub fn encode_take_item(item_id: i32, player_id: i32, amount: i32) -> Vec<u8> {
     body
 }
 
+/// `move_entity_pos`: id, the properties varint (on-ground bit, step
+/// count 0), then the linear delta in 1/4096-block units.
+pub fn encode_move_pos(entity_id: i32, xa: i16, ya: i16, za: i16, on_ground: bool) -> Vec<u8> {
+    let mut body = Vec::with_capacity(10);
+    write_varint(&mut body, entity_id);
+    write_varint(&mut body, i32::from(on_ground));
+    body.extend_from_slice(&xa.to_be_bytes());
+    body.extend_from_slice(&ya.to_be_bytes());
+    body.extend_from_slice(&za.to_be_bytes());
+    body
+}
+
+/// `set_entity_motion`: id plus the packed movement vector.
+pub fn encode_set_motion(entity_id: i32, vx: f64, vy: f64, vz: f64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(9);
+    write_varint(&mut body, entity_id);
+    encode_lp_movement(&mut body, vx, vy, vz);
+    body
+}
+
 /// `entity_position_sync` with a linear path: id, path kind 0, position,
 /// rotations, on-ground flag.
 pub fn encode_position_sync(
@@ -215,36 +245,47 @@ pub fn encode_position_sync(
 
 /// One drop on the ground.
 pub struct ItemEntity {
-    id: i32,
-    uuid: [u8; 16],
+    pub(crate) id: i32,
+    pub(crate) uuid: [u8; 16],
     /// Feet position (the hitbox's bottom center).
-    x: f64,
-    y: f64,
-    z: f64,
-    vx: f64,
-    vy: f64,
-    vz: f64,
-    stack: ItemStack,
-    /// Ticks since spawn; despawns at 6000.
-    age: i32,
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) z: f64,
+    pub(crate) vx: f64,
+    pub(crate) vy: f64,
+    pub(crate) vz: f64,
+    /// The random facing the spawn draws (the item sprite's rotation).
+    pub(crate) yaw: f32,
+    pub(crate) stack: ItemStack,
+    /// Ticks lived; despawns at 6000.
+    pub(crate) age: i32,
     /// Ticks before a player can vacuum it.
-    pickup_delay: i32,
+    pub(crate) pickup_delay: i32,
     /// The thrower, for drop attribution.
     #[allow(dead_code)]
     owner: Option<ConnId>,
-    on_ground: bool,
-    /// Last position broadcast to trackers.
-    sent_x: f64,
-    sent_y: f64,
-    sent_z: f64,
-    sent_ground: bool,
+    pub(crate) on_ground: bool,
+    /// Ticks of this entity's own pass (the entity tick counter, one
+    /// behind at spawn: the first pass sees 1).
+    pub(crate) tick_count: i32,
+    /// The game tick the drop spawned in; a pass over the same tick
+    /// skips it (entities added mid-tick do not tick that tick).
+    pub(crate) born_tick: u64,
+    /// Whether the last move clipped vertically / horizontally.
+    pub(crate) vertical_collision: bool,
+    pub(crate) horizontal_collision: bool,
+    /// Whether the next tracker flush must consider this entity.
+    pub(crate) needs_sync: bool,
     /// Whether the stack changed since its last entity-data sync.
-    stack_dirty: bool,
-    /// The block cell the last move crossed (merge cadence).
-    last_cell: (i32, i32, i32),
+    pub(crate) stack_dirty: bool,
 }
 
 impl ItemEntity {
+    /// The merge gate: alive, under the lifetime cap, stack below the max.
+    fn mergable(&self) -> bool {
+        self.age < LIFETIME && self.stack.count() < MAX_MERGE
+    }
+
     fn new(id: i32, uuid: [u8; 16], x: f64, y: f64, z: f64, stack: ItemStack) -> ItemEntity {
         ItemEntity {
             id,
@@ -255,52 +296,26 @@ impl ItemEntity {
             vx: 0.0,
             vy: 0.0,
             vz: 0.0,
+            yaw: 0.0,
             stack,
             age: 0,
             pickup_delay: PICKUP_DELAY_BREAK,
             owner: None,
             on_ground: false,
-            sent_x: x,
-            sent_y: y,
-            sent_z: z,
-            sent_ground: false,
+            tick_count: 0,
+            born_tick: 0,
+            vertical_collision: false,
+            horizontal_collision: false,
+            needs_sync: false,
             stack_dirty: false,
-            last_cell: (x.floor() as i32, y.floor() as i32, z.floor() as i32),
         }
-    }
-
-    /// The spawn pairing: add_entity (carrying the spawn velocity as the
-    /// movement vector) followed by the stack's entity data.
-    fn pairing_frames(&self) -> Vec<(i32, Vec<u8>)> {
-        vec![
-            (
-                PACKET_ADD_ENTITY,
-                encode_add_entity(
-                    self.id,
-                    &self.uuid,
-                    ENTITY_TYPE_ITEM,
-                    self.x,
-                    self.y,
-                    self.z,
-                    (self.vx, self.vy, self.vz),
-                    0.0,
-                    0.0,
-                    0.0,
-                    0,
-                ),
-            ),
-            (
-                PACKET_SET_ENTITY_DATA,
-                encode_item_stack_data(self.id, Some(&self.stack)),
-            ),
-        ]
     }
 }
 
 /// Survival state the game thread owns: live drops plus the random-tick
 /// bookkeeping.
 pub(crate) struct SurvivalState {
-    items: Vec<ItemEntity>,
+    pub(crate) items: Vec<ItemEntity>,
     /// Seed for the drop uuid splitmix stream.
     uuid_seed: u64,
     /// Seed for the spread-target picks.
@@ -343,6 +358,17 @@ impl SurvivalState {
         (Self::splitmix(&mut self.spread_seed) >> 11) as f64 / (1u64 << 53) as f64
     }
 
+    /// A random f32 in [0, 1) with the 24-bit mantissa of a float draw.
+    fn next_f32(&mut self) -> f32 {
+        (Self::splitmix(&mut self.spread_seed) >> 40) as f32 / (1u32 << 24) as f32
+    }
+
+    /// The float draw against an externally held seed (the physics pass
+    /// borrows the game immutably).
+    fn draw_f32(seed: &mut u64) -> f32 {
+        (Self::splitmix(seed) >> 40) as f32 / (1u32 << 24) as f32
+    }
+
     /// A random f64 in [lo, hi).
     fn next_range(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.next_unit()
@@ -370,6 +396,8 @@ fn passable(name: &str) -> bool {
     matches!(
         name,
         "minecraft:air"
+            | "minecraft:water"
+            | "minecraft:lava"
             | "minecraft:torch"
             | "minecraft:wall_torch"
             | "minecraft:redstone_torch"
@@ -388,6 +416,7 @@ fn passable(name: &str) -> bool {
 
 /// Blocks that fully dampen light: the grass-killer test. Glass and the
 /// attachable decoration pass light; the solid families block it.
+/// Fluids pass (the light engine is future work).
 fn light_impermeable(name: &str) -> bool {
     !passable(name) && name != "minecraft:glass"
 }
@@ -397,6 +426,15 @@ fn block_solid(g: &Game, x: i32, y: i32, z: i32) -> bool {
     match g.get_block(x, y, z) {
         None => true,
         Some((n, _)) => !passable(&n),
+    }
+}
+
+/// The ground friction of the block a drop rests on.
+fn block_friction(name: &str) -> f64 {
+    match name {
+        "minecraft:ice" | "minecraft:packed_ice" | "minecraft:blue_ice" => FRICTION_ICE,
+        "minecraft:slime_block" => FRICTION_SLIME,
+        _ => FRICTION_DEFAULT,
     }
 }
 
@@ -433,73 +471,267 @@ struct Motion {
     vy: f64,
     vz: f64,
     on_ground: bool,
+    vertical_collision: bool,
+    horizontal_collision: bool,
+    needs_sync: bool,
 }
 
-/// One gravity-and-collision step: horizontal axes cancel into walls,
-/// the vertical axis lands on block tops and bumps heads.
-fn step_motion(g: &Game, m: &mut Motion) {
-    m.vy -= GRAVITY;
-    for axis in 0..2 {
-        let v = if axis == 0 { m.vx } else { m.vz };
-        if v == 0.0 {
-            continue;
-        }
-        let (nx, nz) = if axis == 0 {
-            (m.x + v, m.z)
-        } else {
-            (m.x, m.z + v)
-        };
-        let mid = m.y + HEIGHT / 2.0;
-        let blocked = [
-            (nx - HALF_WIDTH, nz - HALF_WIDTH),
-            (nx + HALF_WIDTH, nz - HALF_WIDTH),
-            (nx - HALF_WIDTH, nz + HALF_WIDTH),
-            (nx + HALF_WIDTH, nz + HALF_WIDTH),
-        ]
-        .iter()
-        .any(|&(cx, cz)| block_solid(g, cx.floor() as i32, mid.floor() as i32, cz.floor() as i32));
-        if blocked {
-            if axis == 0 {
-                m.vx = 0.0;
-            } else {
-                m.vz = 0.0;
-            }
-        } else {
-            m.x = nx;
-            m.z = nz;
+/// An axis-aligned box: min/max corners.
+#[derive(Clone, Copy)]
+struct Box3 {
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+impl Box3 {
+    fn of(x: f64, y: f64, z: f64) -> Box3 {
+        Box3 {
+            min: [x - HALF_WIDTH, y, z - HALF_WIDTH],
+            max: [x + HALF_WIDTH, y + HEIGHT, z + HALF_WIDTH],
         }
     }
-    let ny = m.y + m.vy;
-    if m.vy < 0.0 {
-        let landed = [
-            (m.x - HALF_WIDTH, m.z - HALF_WIDTH),
-            (m.x + HALF_WIDTH, m.z - HALF_WIDTH),
-            (m.x - HALF_WIDTH, m.z + HALF_WIDTH),
-            (m.x + HALF_WIDTH, m.z + HALF_WIDTH),
-        ]
-        .iter()
-        .any(|&(cx, cz)| block_solid(g, cx.floor() as i32, ny.floor() as i32, cz.floor() as i32));
-        if landed {
-            m.y = ny.floor() + 1.0;
-            m.on_ground = true;
-        } else {
-            m.y = ny;
-            m.on_ground = false;
+
+    fn shift(&mut self, axis: usize, d: f64) {
+        self.min[axis] += d;
+        self.max[axis] += d;
+    }
+
+    /// Whether any solid cell overlaps the box shrunk by epsilon.
+    fn intersects_solid(&self, g: &Game) -> bool {
+        let cells = |axis: usize| {
+            let lo = (self.min[axis] + 1.0e-7).floor() as i32;
+            let hi = (self.max[axis] - 1.0e-7).floor() as i32;
+            lo..=hi
+        };
+        for x in cells(0) {
+            for y in cells(1) {
+                for z in cells(2) {
+                    if block_solid(g, x, y, z) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// The per-axis clip against full-cube cells: the movement distance after
+/// the first blocking cell along the axis (scanning from the box face),
+/// clamped to the requested distance. Mirrors the sweep's epsilon pair
+/// (1e-7 shrink on the cross axes, 1e-7 slack on the blocking face).
+fn clip_axis(g: &Game, b: &Box3, axis: usize, distance: f64) -> f64 {
+    if distance.abs() < 1.0e-7 {
+        return 0.0;
+    }
+    let (b1, b2) = ((axis + 1) % 3, (axis + 2) % 3);
+    let cross = |lo: f64, hi: f64| ((lo + 1.0e-7).floor() as i32)..=(hi - 1.0e-7).floor() as i32;
+    let c1 = cross(b.min[b1], b.max[b1]);
+    let c2 = cross(b.min[b2], b.max[b2]);
+    let solid = |a: i32, c1: i32, c2: i32| -> bool {
+        let (x, y, z) = match axis {
+            0 => (a, c1, c2),
+            1 => (c1, a, c2),
+            _ => (c1, c2, a),
+        };
+        block_solid(g, x, y, z)
+    };
+    let mut distance = distance;
+    if distance > 0.0 {
+        let face_max = b.max[axis];
+        let mut a = (face_max - 1.0e-7).floor() as i32 + 1;
+        loop {
+            let new_distance = a as f64 - face_max;
+            if new_distance > distance {
+                return distance;
+            }
+            let hit = c1.clone().any(|c1| c2.clone().any(|c2| solid(a, c1, c2)));
+            if hit {
+                if new_distance >= -1.0e-7 {
+                    distance = distance.min(new_distance);
+                }
+                return distance;
+            }
+            a += 1;
+        }
+    }
+    let face_min = b.min[axis];
+    let mut a = (face_min + 1.0e-7).floor() as i32 - 1;
+    loop {
+        let new_distance = (a + 1) as f64 - face_min;
+        if new_distance < distance {
+            return distance;
+        }
+        let hit = c1.clone().any(|c1| c2.clone().any(|c2| solid(a, c1, c2)));
+        if hit {
+            if new_distance <= 1.0e-7 {
+                distance = distance.max(new_distance);
+            }
+            return distance;
+        }
+        a -= 1;
+    }
+}
+
+/// The axis-ordered sweep: vertical first, then the dominant horizontal
+/// axis. Returns the clipped delta.
+fn collide_move(g: &Game, m: &Motion) -> (f64, f64, f64) {
+    let mut b = Box3::of(m.x, m.y, m.z);
+    let dy = clip_axis(g, &b, 1, m.vy);
+    b.shift(1, dy);
+    // |x| < |z| resolves z first (ties resolve x first).
+    if m.vx.abs() < m.vz.abs() {
+        let dz = clip_axis(g, &b, 2, m.vz);
+        b.shift(2, dz);
+        let dx = clip_axis(g, &b, 0, m.vx);
+        (dx, dy, dz)
+    } else {
+        let dx = clip_axis(g, &b, 0, m.vx);
+        b.shift(0, dx);
+        let dz = clip_axis(g, &b, 2, m.vz);
+        (dx, dy, dz)
+    }
+}
+
+/// Whether the drop's box overlaps a fluid cell (source depth stands in
+/// for the fluid height).
+fn submerged(g: &Game, m: &Motion, fluid: &str) -> bool {
+    let b = Box3::of(m.x, m.y, m.z);
+    let cells = |axis: usize| b.min[axis].floor() as i32..=b.max[axis].floor() as i32;
+    for x in cells(0) {
+        for y in cells(1) {
+            for z in cells(2) {
+                if let Some((n, _)) = g.get_block(x, y, z) {
+                    if n == fluid {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A drop stuck inside a solid cell gets a nudge toward the nearest open
+/// neighbor (north, south, west, east, up) with a random speed.
+fn move_towards_closest_space(g: &Game, m: &mut Motion, next_f32: &mut dyn FnMut() -> f32) {
+    let y_mid = m.y + HEIGHT / 2.0;
+    let (bx, by, bz) = (m.x.floor() as i32, y_mid.floor() as i32, m.z.floor() as i32);
+    let frac = (m.x - bx as f64, y_mid - by as f64, m.z - bz as f64);
+    // (dx, dy, dz, axis, positive direction)
+    const PROBES: [(i32, i32, i32, usize, bool); 5] = [
+        (0, 0, -1, 2, false), // north
+        (0, 0, 1, 2, true),   // south
+        (-1, 0, 0, 0, false), // west
+        (1, 0, 0, 0, true),   // east
+        (0, 1, 0, 1, true),   // up
+    ];
+    let mut best_axis = 1usize;
+    let mut best_positive = true;
+    let mut best = f64::MAX;
+    for (dx, dy, dz, axis, positive) in PROBES {
+        if block_solid(g, bx + dx, by + dy, bz + dz) {
+            continue;
+        }
+        let d = match axis {
+            0 => frac.0,
+            1 => frac.1,
+            _ => frac.2,
+        };
+        let oriented = if positive { 1.0 - d } else { d };
+        if oriented < best {
+            best = oriented;
+            best_axis = axis;
+            best_positive = positive;
+        }
+    }
+    let speed = next_f32() * 0.2 + 0.1;
+    m.vx *= 0.75;
+    m.vy *= 0.75;
+    m.vz *= 0.75;
+    let step = if best_positive {
+        speed as f64
+    } else {
+        -(speed as f64)
+    };
+    match best_axis {
+        0 => m.vx = step,
+        1 => m.vy = step,
+        _ => m.vz = step,
+    }
+}
+
+/// One tick of the drop's own integration: fluid or gravity, the
+/// stuck-in-solid nudge, the rest-gated move with collision zeroing,
+/// and the post-move drags.
+fn step_motion(
+    g: &Game,
+    m: &mut Motion,
+    tick_count: i32,
+    entity_id: i32,
+    next_f32: &mut dyn FnMut() -> f32,
+) {
+    let old = (m.vx, m.vy, m.vz);
+    if submerged(g, m, "minecraft:water") {
+        m.vx *= WATER_DRAG;
+        m.vz *= WATER_DRAG;
+        if m.vy < BUOYANCY_MAX_VY {
+            m.vy += BUOYANCY;
+        }
+    } else if submerged(g, m, "minecraft:lava") {
+        m.vx *= LAVA_DRAG;
+        m.vz *= LAVA_DRAG;
+        if m.vy < BUOYANCY_MAX_VY {
+            m.vy += BUOYANCY;
         }
     } else {
-        let top = m.y + HEIGHT + m.vy;
-        let bumped = block_solid(
-            g,
-            m.x.floor() as i32,
-            top.floor() as i32,
-            m.z.floor() as i32,
-        );
-        if bumped {
-            m.vy = 0.0;
-        } else {
-            m.y = ny;
-            m.on_ground = false;
+        m.vy -= GRAVITY;
+    }
+    if Box3::of(m.x, m.y, m.z).intersects_solid(g) {
+        move_towards_closest_space(g, m, next_f32);
+    }
+    // The rest gate: a grounded, nearly still drop moves only every
+    // fourth tick. Skipped ticks skip the drags too; gravity accrues.
+    let horizontal = m.vx * m.vx + m.vz * m.vz;
+    if !m.on_ground || horizontal > 1.0e-5 || (tick_count + entity_id).rem_euclid(4) == 0 {
+        let (dx, dy, dz) = collide_move(g, m);
+        m.x += dx;
+        m.y += dy;
+        m.z += dz;
+        let x_collision = (dx - m.vx).abs() >= 1.0e-7;
+        let z_collision = (dz - m.vz).abs() >= 1.0e-7;
+        m.horizontal_collision = x_collision || z_collision;
+        m.vertical_collision = dy != m.vy;
+        m.on_ground = m.vertical_collision && m.vy < 0.0;
+        // Restitution is zero for drops: collided components stop dead.
+        if m.horizontal_collision || (m.vertical_collision && m.vy != 0.0) {
+            if x_collision {
+                m.vx = 0.0;
+            }
+            if z_collision {
+                m.vz = 0.0;
+            }
+            if m.vertical_collision {
+                m.vy = 0.0;
+            }
         }
+        let ground_friction = if m.on_ground {
+            let below_y = (m.y - 0.999999).floor() as i32;
+            let friction = g
+                .get_block(m.x.floor() as i32, below_y, m.z.floor() as i32)
+                .map(|(n, _)| block_friction(&n))
+                .unwrap_or(FRICTION_DEFAULT);
+            AIR_DRAG * friction
+        } else {
+            AIR_DRAG
+        };
+        m.vx *= ground_friction;
+        m.vz *= ground_friction;
+        m.vy *= AIR_DRAG;
+    }
+    let (dvx, dvy, dvz) = (m.vx - old.0, m.vy - old.1, m.vz - old.2);
+    if dvx * dvx + dvy * dvy + dvz * dvz > 0.01 {
+        m.needs_sync = true;
     }
 }
 
@@ -507,39 +739,13 @@ fn step_motion(g: &Game, m: &mut Motion) {
 // Game hooks
 // ---------------------------------------------------------------------
 
-/// One queued broadcast: a frame keyed on the drop position (the tracker
-/// filter runs at drain time).
-struct OutFrame {
-    x: f64,
-    y: f64,
-    z: f64,
-    id: i32,
-    body: Vec<u8>,
-}
-
 impl Game {
-    /// Sends one frame to every player within tracking range of the
-    /// position.
-    fn send_tracking(&mut self, x: f64, y: f64, z: f64, id: i32, body: &[u8]) {
-        let targets: Vec<ConnId> = self
-            .players
-            .iter()
-            .filter(|(_, p)| {
-                let (dx, dy, dz) = (p.x - x, p.y - y, p.z - z);
-                dx * dx + dy * dy + dz * dz < TRACK_RANGE * TRACK_RANGE
-            })
-            .map(|(&conn, _)| conn)
-            .collect();
-        for conn in targets {
-            self.send(conn, id, body);
-        }
-    }
-
     // --- survival hooks (entities.rs) ---
 
-    /// Spawns a dropped item from a broken block: inside the block's
-    /// cell, with the reference's scatter and pop velocity, on the
-    /// 10-tick pickup delay. Bare-hand breaks of tool-required blocks
+    /// Spawns a dropped item from a broken block: the centered pop - the
+    /// level random draws the in-cell position (x, y, z), the entity
+    /// random draws the bob phase, the facing, and the pop velocity - on
+    /// the 10-tick pickup delay. Bare-hand breaks of tool-required blocks
     /// drop nothing.
     pub(crate) fn spawn_break_drop(&mut self, pos: (i32, i32, i32), name: &str) {
         let (_, requires_tool) = crate::dig::hardness(name);
@@ -549,44 +755,58 @@ impl Game {
         let Some(item) = block_drop_item(name) else {
             return;
         };
-        let x = pos.0 as f64 + self.survival.next_range(0.25, 0.75);
+        let x = pos.0 as f64 + 0.5 + self.survival.next_range(-0.25, 0.25);
         let y = pos.1 as f64 + 0.5 + self.survival.next_range(-0.25, 0.25) - HEIGHT / 2.0;
-        let z = pos.2 as f64 + self.survival.next_range(0.25, 0.75);
-        let vx = self.survival.next_range(-0.1, 0.1);
-        let vz = self.survival.next_range(-0.1, 0.1);
-        self.spawn_item(x, y, z, (vx, 0.2, vz), ItemStack::new(item, 1), None);
+        let z = pos.2 as f64 + 0.5 + self.survival.next_range(-0.25, 0.25);
+        // The constructor draws: the bob phase (client cosmetic), the
+        // facing, then the pop velocity's two draws.
+        let _bob = self.survival.next_f32();
+        let yaw = self.survival.next_f32() * 360.0;
+        let vx = self.survival.next_unit() * 0.2 - 0.1;
+        let vz = self.survival.next_unit() * 0.2 - 0.1;
+        self.spawn_item(x, y, z, (vx, 0.2, vz), yaw, ItemStack::new(item, 1), None);
     }
 
     /// Spawns a player-thrown drop: at eye height minus 0.3, on the
-    /// 40-tick delay, flying along the look direction with the
-    /// reference's scatter.
+    /// 40-tick delay, flying along the look direction. The scatter
+    /// arithmetic runs in f32 (the reference's float pipeline), the
+    /// look products widen to f64 exactly where the reference widens.
     pub(crate) fn spawn_thrown_drop(&mut self, conn: ConnId, stack: ItemStack) {
         let Some(p) = self.players.get(&conn) else {
             return;
         };
-        let (yaw, pitch) = (p.yaw as f64, p.pitch as f64);
+        let (yaw, pitch) = (p.yaw, p.pitch);
         let (x, y, z) = (p.x, p.y + 1.62 - 0.3, p.z);
-        let (sx, cx, sy, cy) = (
-            pitch.to_radians().sin(),
-            pitch.to_radians().cos(),
-            yaw.to_radians().sin(),
-            yaw.to_radians().cos(),
-        );
-        let dir = self.survival.next_range(0.0, std::f64::consts::TAU);
-        let pow = 0.02 * self.survival.next_unit();
-        let vx = -sy * cx * 0.3 + dir.cos() * pow;
-        let vy = -sx * 0.3 + 0.1 + (self.survival.next_unit() - self.survival.next_unit()) * 0.1;
-        let vz = cy * cx * 0.3 + dir.sin() * pow;
-        self.spawn_item(x, y, z, (vx, vy, vz), stack, Some(conn));
+        let deg = std::f32::consts::PI / 180.0;
+        let sin_x = (pitch * deg).sin();
+        let cos_x = (pitch * deg).cos();
+        let sin_y = (yaw * deg).sin();
+        let cos_y = (yaw * deg).cos();
+        // The constructor draws first (bob, facing, a pop velocity the
+        // throw replaces), then the throw's scatter draws.
+        let _bob = self.survival.next_f32();
+        let facing = self.survival.next_f32() * 360.0;
+        let _pop_x = self.survival.next_unit();
+        let _pop_z = self.survival.next_unit();
+        let dir = self.survival.next_f32() * std::f32::consts::TAU;
+        let pow = 0.02f32 * self.survival.next_f32();
+        let (f1, f2) = (self.survival.next_f32(), self.survival.next_f32());
+        let vx = (-sin_y * cos_x * 0.3f32) as f64 + (dir as f64).cos() * pow as f64;
+        let vy = (-sin_x * 0.3f32 + 0.1f32 + (f1 - f2) * 0.1f32) as f64;
+        let vz = (cos_y * cos_x * 0.3f32) as f64 + (dir as f64).sin() * pow as f64;
+        self.spawn_item(x, y, z, (vx, vy, vz), facing, stack, Some(conn));
     }
 
-    /// The shared spawn: allocate the id and uuid, broadcast the pairing.
+    /// The shared spawn: allocate the id and uuid, then pair the entity
+    /// with every in-range player.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_item(
         &mut self,
         x: f64,
         y: f64,
         z: f64,
         velocity: (f64, f64, f64),
+        yaw: f32,
         stack: ItemStack,
         owner: Option<ConnId>,
     ) {
@@ -602,233 +822,201 @@ impl Game {
         item.vx = velocity.0;
         item.vy = velocity.1;
         item.vz = velocity.2;
+        item.yaw = yaw;
         item.pickup_delay = delay;
         item.owner = owner;
-        let frames = item.pairing_frames();
+        item.born_tick = self.tick;
+        // The stack accessor spawns dirty: the pairing carries its
+        // snapshot, and the first sync pass re-sends it (the flush the
+        // reference's data-dirty flag performs after every spawn).
+        item.stack_dirty = true;
         self.survival.items.push(item);
-        for frame in frames {
-            self.send_tracking(x, y, z, frame.0, &frame.1);
-        }
+        self.track_entity_spawned(id);
     }
 
-    /// The per-tick entity pass: physics, merging, pickup, despawn. It
-    /// runs after the block-event phase and ahead of the dig pass, so a
-    /// drop spawned by this tick's breaks first moves on the following
-    /// tick, like an entity added mid-tick.
+    /// The entity pass, after the block-event phase: the pickup vacuum
+    /// first (players tick ahead of items), then each drop's physics,
+    /// merge, and lifetime.
     pub(crate) fn tick_entities(&mut self) {
-        self.entity_physics();
-        self.entity_merge();
         self.entity_pickup();
-        self.entity_despawn();
+        self.entity_item_pass();
     }
 
-    /// Gravity, collision, friction, and the movement syncs.
-    fn entity_physics(&mut self) {
-        let mut frames: Vec<OutFrame> = Vec::new();
-        for i in 0..self.survival.items.len() {
-            let (id, age, mut motion) = {
-                let item = &mut self.survival.items[i];
-                item.age += 1;
-                if item.pickup_delay > 0 {
-                    item.pickup_delay -= 1;
-                }
-                (
-                    item.id,
-                    item.age,
-                    Motion {
-                        x: item.x,
-                        y: item.y,
-                        z: item.z,
-                        vx: item.vx,
-                        vy: item.vy,
-                        vz: item.vz,
-                        on_ground: item.on_ground,
-                    },
-                )
-            };
-            // The rest gate: grounded and nearly still drops skip the move
-            // every tick but the fourth.
-            let still = motion.on_ground
-                && motion.vx * motion.vx + motion.vz * motion.vz <= 1.0e-5
-                && (age + id).rem_euclid(4) != 0;
-            if !still {
-                step_motion(self, &mut motion);
+    /// One pass over the drops: physics, the merge cadence, aging, and
+    /// the age-out discard, interleaved per entity (the reference merges
+    /// inside each entity's own tick). Entities spawned during this same
+    /// game tick wait for the next one.
+    fn entity_item_pass(&mut self) {
+        let tick = self.tick;
+        let mut gone: Vec<i32> = Vec::new();
+        let mut dead: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        while i < self.survival.items.len() {
+            if dead.contains(&i) {
+                i += 1;
+                continue;
             }
-            let horizontal = if motion.on_ground {
-                AIR_DRAG * GROUND_FRICTION
-            } else {
-                AIR_DRAG
-            };
-            motion.vx *= horizontal;
-            motion.vz *= horizontal;
-            motion.vy *= AIR_DRAG;
-            if motion.on_ground && motion.vy < 0.0 {
-                motion.vy = -motion.vy * 0.5;
+            let fresh = self.survival.items[i].born_tick == tick;
+            // An empty stack discards without ticking.
+            if !fresh && self.survival.items[i].stack.is_empty() {
+                gone.push(self.survival.items[i].id);
+                dead.push(i);
+                i += 1;
+                continue;
             }
-            let item = &mut self.survival.items[i];
-            item.x = motion.x;
-            item.y = motion.y;
-            item.z = motion.z;
-            item.vx = motion.vx;
-            item.vy = motion.vy;
-            item.vz = motion.vz;
-            item.on_ground = motion.on_ground;
-            let (dx, dy, dz) = (
-                item.x - item.sent_x,
-                item.y - item.sent_y,
-                item.z - item.sent_z,
-            );
-            let moved = dx * dx + dy * dy + dz * dz >= 7.6293945e-6;
-            if item.on_ground != item.sent_ground || (age % 20 == 0 && moved) {
-                frames.push(OutFrame {
-                    x: item.x,
-                    y: item.y,
-                    z: item.z,
-                    id: PACKET_ENTITY_POSITION_SYNC,
-                    body: encode_position_sync(
+            if !fresh {
+                let (id, mut motion, xo, yo, zo, tick_count) = {
+                    let item = &mut self.survival.items[i];
+                    item.tick_count += 1;
+                    if item.pickup_delay > 0 {
+                        item.pickup_delay -= 1;
+                    }
+                    (
                         item.id,
+                        Motion {
+                            x: item.x,
+                            y: item.y,
+                            z: item.z,
+                            vx: item.vx,
+                            vy: item.vy,
+                            vz: item.vz,
+                            on_ground: item.on_ground,
+                            vertical_collision: item.vertical_collision,
+                            horizontal_collision: item.horizontal_collision,
+                            needs_sync: item.needs_sync,
+                        },
                         item.x,
                         item.y,
                         item.z,
-                        0.0,
-                        0.0,
-                        item.on_ground,
-                    ),
-                });
-                item.sent_x = item.x;
-                item.sent_y = item.y;
-                item.sent_z = item.z;
-                item.sent_ground = item.on_ground;
-            }
-            if item.stack_dirty {
-                frames.push(OutFrame {
-                    x: item.x,
-                    y: item.y,
-                    z: item.z,
-                    id: PACKET_SET_ENTITY_DATA,
-                    body: encode_item_stack_data(item.id, Some(&item.stack)),
-                });
-                item.stack_dirty = false;
-            }
-        }
-        for frame in frames {
-            self.send_tracking(frame.x, frame.y, frame.z, frame.id, &frame.body);
-        }
-    }
-
-    /// Merges same-stack drops that overlap the 0.5-inflated box, on the
-    /// reference's cadence (every 2 ticks while crossing cells, else
-    /// every 40).
-    fn entity_merge(&mut self) {
-        let mut frames: Vec<OutFrame> = Vec::new();
-        let mut absorbed: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i < self.survival.items.len() {
-            if absorbed.contains(&i) {
-                i += 1;
-                continue;
-            }
-            let (x, y, z, age, count, last_cell) = {
-                let item = &self.survival.items[i];
-                (
-                    item.x,
-                    item.y,
-                    item.z,
-                    item.age,
-                    item.stack.count(),
-                    item.last_cell,
-                )
-            };
-            let cell_now = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-            let moved = cell_now != last_cell;
-            if moved {
-                self.survival.items[i].last_cell = cell_now;
-            }
-            let rate = if moved { 2 } else { 40 };
-            if age % rate != 0 || count >= MAX_MERGE {
-                i += 1;
-                continue;
-            }
-            let mut j = i + 1;
-            while j < self.survival.items.len() {
-                if absorbed.contains(&j) {
-                    j += 1;
-                    continue;
-                }
-                let (ox, oy, oz, ocount) = {
-                    let other = &self.survival.items[j];
-                    (other.x, other.y, other.z, other.stack.count())
+                        item.tick_count,
+                    )
                 };
-                let same = ItemStack::same_item_same_components(
-                    &self.survival.items[j].stack,
-                    &self.survival.items[i].stack,
-                );
-                let near =
-                    (ox - x).abs() < 0.75 && (oy - y).abs() < HEIGHT && (oz - z).abs() < 0.75;
-                if !same || !near || ocount >= MAX_MERGE || count + ocount > MAX_MERGE {
-                    j += 1;
-                    continue;
-                }
-                // The larger stack absorbs; ties go to the later entity.
-                let (victim, keeper) = if count > ocount { (j, i) } else { (i, j) };
-                let (vid, vx, vy, vz, vcount, vage, vdelay) = {
-                    let v = &self.survival.items[victim];
-                    (v.id, v.x, v.y, v.z, v.stack.count(), v.age, v.pickup_delay)
-                };
+                let mut rng_seed = self.survival.spread_seed;
+                let mut draw = || SurvivalState::draw_f32(&mut rng_seed);
+                step_motion(self, &mut motion, tick_count, id, &mut draw);
+                self.survival.spread_seed = rng_seed;
                 {
-                    let keeper = &mut self.survival.items[keeper];
-                    keeper.stack.set_count(keeper.stack.count() + vcount);
-                    keeper.age = keeper.age.min(vage);
-                    keeper.pickup_delay = keeper.pickup_delay.max(vdelay);
-                    keeper.stack_dirty = true;
+                    let item = &mut self.survival.items[i];
+                    item.x = motion.x;
+                    item.y = motion.y;
+                    item.z = motion.z;
+                    item.vx = motion.vx;
+                    item.vy = motion.vy;
+                    item.vz = motion.vz;
+                    item.on_ground = motion.on_ground;
+                    item.vertical_collision = motion.vertical_collision;
+                    item.horizontal_collision = motion.horizontal_collision;
+                    item.needs_sync |= motion.needs_sync;
                 }
-                absorbed.push(victim);
-                frames.push(OutFrame {
-                    x: vx,
-                    y: vy,
-                    z: vz,
-                    id: PACKET_REMOVE_ENTITIES,
-                    body: encode_remove_entities(&[vid]),
-                });
-                if victim == i {
-                    break;
+                // The merge cadence: every 2 ticks while crossing cells,
+                // else every 40.
+                let moved = (
+                    motion.x.floor() as i32,
+                    motion.y.floor() as i32,
+                    motion.z.floor() as i32,
+                ) != (xo.floor() as i32, yo.floor() as i32, zo.floor() as i32);
+                let rate = if moved { 2 } else { 40 };
+                if tick_count % rate == 0 && self.survival.items[i].mergable() {
+                    let absorbed_here = self.merge_from(i, &mut dead);
+                    if absorbed_here {
+                        gone.push(id);
+                        dead.push(i);
+                        // The absorbed entity finishes its tick: age only.
+                        self.survival.items[i].age += 1;
+                        i += 1;
+                        continue;
+                    }
                 }
-                j += 1;
+                self.survival.items[i].age += 1;
+                if self.survival.items[i].age >= LIFETIME {
+                    gone.push(id);
+                    dead.push(i);
+                }
             }
             i += 1;
         }
-        if !absorbed.is_empty() {
+        if !dead.is_empty() {
             let mut kept: Vec<ItemEntity> = Vec::new();
             let drained = std::mem::take(&mut self.survival.items);
             for (idx, item) in drained.into_iter().enumerate() {
-                if !absorbed.contains(&idx) {
+                if !dead.contains(&idx) {
                     kept.push(item);
                 }
             }
             self.survival.items = kept;
         }
-        for frame in frames {
-            self.send_tracking(frame.x, frame.y, frame.z, frame.id, &frame.body);
+        for id in gone {
+            self.track_entity_removed(id);
         }
     }
 
-    /// The vacuum: overlapping players absorb drops whose pickup delay
-    /// expired. Full takes discard the entity and broadcast the take
-    /// animation (the reference sends it with the pre-pickup count); a
-    /// full inventory leaves the drop alone.
-    fn entity_pickup(&mut self) {
-        struct Event {
-            x: f64,
-            y: f64,
-            z: f64,
-            id: i32,
-            body: Vec<u8>,
+    /// The merge attempt of item `i` against the live others: the 0.5
+    /// box inflation, the larger stack absorbing (ties go to the other).
+    /// Returns true when `i` itself was absorbed.
+    fn merge_from(&mut self, i: usize, dead: &mut Vec<usize>) -> bool {
+        let (x, y, z) = {
+            let item = &self.survival.items[i];
+            (item.x, item.y, item.z)
+        };
+        let mut j = 0usize;
+        while j < self.survival.items.len() {
+            if j == i || dead.contains(&j) {
+                j += 1;
+                continue;
+            }
+            let near = {
+                let other = &self.survival.items[j];
+                (other.x - x).abs() < 0.75
+                    && (other.y - y).abs() < 0.25
+                    && (other.z - z).abs() < 0.75
+                    && other.mergable()
+                    && ItemStack::same_item_same_components(
+                        &other.stack,
+                        &self.survival.items[i].stack,
+                    )
+                    && other.stack.count() + self.survival.items[i].stack.count() <= MAX_MERGE
+            };
+            if !near {
+                j += 1;
+                continue;
+            }
+            // The strictly smaller stack folds; ties fold this one.
+            let (victim, keeper) =
+                if self.survival.items[i].stack.count() > self.survival.items[j].stack.count() {
+                    (j, i)
+                } else {
+                    (i, j)
+                };
+            let (vcount, vage, vdelay) = {
+                let v = &self.survival.items[victim];
+                (v.stack.count(), v.age, v.pickup_delay)
+            };
+            {
+                let keeper = &mut self.survival.items[keeper];
+                keeper.stack.set_count(keeper.stack.count() + vcount);
+                keeper.age = keeper.age.min(vage);
+                keeper.pickup_delay = keeper.pickup_delay.max(vdelay);
+                keeper.stack_dirty = true;
+            }
+            dead.push(victim);
+            if victim == i {
+                return true;
+            }
+            j += 1;
         }
-        let mut events = Vec::new();
+        false
+    }
+
+    /// The vacuum, from the player pass: overlapping players absorb drops
+    /// whose pickup delay expired. Full takes discard the entity and
+    /// broadcast the take animation (the reference sends it with the
+    /// pre-pickup count); a full inventory leaves the drop alone.
+    fn entity_pickup(&mut self) {
+        let tick = self.tick;
         let mut taken: Vec<usize> = Vec::new();
-        let mut i = 0;
+        let mut i = 0usize;
         while i < self.survival.items.len() {
-            if taken.contains(&i) {
+            if taken.contains(&i) || self.survival.items[i].born_tick == tick {
                 i += 1;
                 continue;
             }
@@ -876,13 +1064,8 @@ impl Game {
                 if moved_in <= 0 {
                     continue;
                 }
-                events.push(Event {
-                    x,
-                    y,
-                    z,
-                    id: PACKET_TAKE_ITEM_ENTITY,
-                    body: encode_take_item(item_entity_id, player_id, original_count),
-                });
+                let take = encode_take_item(item_entity_id, player_id, original_count);
+                self.entity_broadcast(item_entity_id, PACKET_TAKE_ITEM_ENTITY, &take);
                 // The changed slots ride this tick's menu broadcast.
                 if let Some(p) = self.players.get_mut(&conn) {
                     for (slot, was) in before.iter().enumerate() {
@@ -893,17 +1076,7 @@ impl Game {
                 }
                 match leftover {
                     None => {
-                        let (ex, ey, ez, eid) = {
-                            let item = &self.survival.items[i];
-                            (item.x, item.y, item.z, item.id)
-                        };
-                        events.push(Event {
-                            x: ex,
-                            y: ey,
-                            z: ez,
-                            id: PACKET_REMOVE_ENTITIES,
-                            body: encode_remove_entities(&[eid]),
-                        });
+                        self.track_entity_removed(item_entity_id);
                         taken.push(i);
                         break;
                     }
@@ -925,47 +1098,6 @@ impl Game {
                 }
             }
             self.survival.items = kept;
-        }
-        for event in events {
-            self.send_tracking(event.x, event.y, event.z, event.id, &event.body);
-        }
-    }
-
-    /// Age-out despawn: the 6000-tick lifetime (and the empty-stack
-    /// discard).
-    fn entity_despawn(&mut self) {
-        let dead: Vec<usize> = self
-            .survival
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.age >= LIFETIME || item.stack.is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        if dead.is_empty() {
-            return;
-        }
-        let mut frames = Vec::new();
-        for &i in &dead {
-            let item = &self.survival.items[i];
-            frames.push(OutFrame {
-                x: item.x,
-                y: item.y,
-                z: item.z,
-                id: PACKET_REMOVE_ENTITIES,
-                body: encode_remove_entities(&[item.id]),
-            });
-        }
-        let mut kept: Vec<ItemEntity> = Vec::new();
-        let drained = std::mem::take(&mut self.survival.items);
-        for (idx, item) in drained.into_iter().enumerate() {
-            if !dead.contains(&idx) {
-                kept.push(item);
-            }
-        }
-        self.survival.items = kept;
-        for frame in frames {
-            self.send_tracking(frame.x, frame.y, frame.z, frame.id, &frame.body);
         }
     }
 
@@ -1248,6 +1380,21 @@ mod tests {
         assert_eq!(body, expect);
     }
 
+    #[test]
+    fn move_pos_and_motion_goldens() {
+        // id, properties (on-ground bit), then 3 big-endian shorts.
+        assert_eq!(
+            encode_move_pos(2, -1, 0, 4096, true),
+            vec![0x02, 0x01, 0xff, 0xff, 0x00, 0x00, 0x10, 0x00]
+        );
+        assert_eq!(
+            encode_move_pos(2, 0, 0, 0, false),
+            vec![0x02, 0x00, 0, 0, 0, 0, 0, 0]
+        );
+        // The packed movement's zero vector is one zero byte.
+        assert_eq!(encode_set_motion(2, 0.0, 0.0, 0.0), vec![0x02, 0x00]);
+    }
+
     // -- tables --------------------------------------------------------
 
     #[test]
@@ -1524,6 +1671,7 @@ mod tests {
             100.3,
             5.0,
             (0.0, 0.0, 0.0),
+            0.0,
             ItemStack::new(torch, 1),
             None,
         );
@@ -1532,12 +1680,13 @@ mod tests {
             100.3,
             5.5,
             (0.0, 0.0, 0.0),
+            0.0,
             ItemStack::new(torch, 1),
             None,
         );
         // Land (a few ticks), then the 40-tick rest cadence merges them.
         for _ in 0..45 {
-            g.tick_entities();
+            g.tick_once_for_test();
         }
         assert_eq!(g.survival.items.len(), 1, "merged into one entity");
         assert_eq!(g.survival.items[0].stack.count(), 2);
@@ -1552,13 +1701,199 @@ mod tests {
             100.3,
             5.0,
             (0.0, 0.0, 0.0),
+            0.0,
             ItemStack::new(torch, 1),
             None,
         );
         for _ in 0..LIFETIME {
-            g.tick_entities();
+            g.tick_once_for_test();
         }
         assert!(g.survival.items.is_empty(), "aged out at 6000");
+    }
+
+    #[test]
+    fn landing_stops_the_drop_without_bouncing() {
+        let (mut g, _rx) = harness();
+        let torch = item_id("minecraft:torch").unwrap();
+        g.spawn_item(
+            5.0,
+            101.0,
+            5.0,
+            (0.0, 0.0, 0.0),
+            0.0,
+            ItemStack::new(torch, 1),
+            None,
+        );
+        // Restitution is zero: after first ground contact the drop never
+        // rises again (gravity accrues between the gated moves; the moves
+        // zero the collided component).
+        let mut landed = false;
+        for _ in 0..16 {
+            g.tick_once_for_test();
+            let item = &g.survival.items[0];
+            if item.on_ground {
+                assert!(
+                    (item.y - 100.0).abs() < 1e-9,
+                    "rests at the floor top, not {}",
+                    item.y
+                );
+                landed = true;
+            } else {
+                assert!(!landed, "the drop rose after landing");
+            }
+        }
+        assert!(landed, "the drop landed");
+        assert!(g.survival.items[0].vy <= 0.0, "no upward motion");
+    }
+
+    #[test]
+    fn resting_drop_sends_one_frame_per_full_sync_cadence() {
+        let (mut g, rx) = harness();
+        let torch = item_id("minecraft:torch").unwrap();
+        g.spawn_item(
+            5.0,
+            101.0,
+            5.0,
+            (0.0, 0.0, 0.0),
+            0.0,
+            ItemStack::new(torch, 1),
+            None,
+        );
+        // Fall, land, settle past the landing sync.
+        for _ in 0..12 {
+            g.tick_once_for_test();
+        }
+        drain(&rx);
+        // A resting drop sends no position frames except the
+        // full-position cadence: one per 60 tracker ticks. (Motion frames
+        // keep flowing: gravity accrues between the gated moves.)
+        for _ in 0..60 {
+            g.tick_once_for_test();
+        }
+        let frames = drain(&rx);
+        let movement = of(&frames, PACKET_MOVE_ENTITY_POS).len()
+            + of(&frames, PACKET_ENTITY_POSITION_SYNC).len();
+        assert_eq!(movement, 1, "only the cadence frame in 60 ticks");
+    }
+
+    #[test]
+    fn tracker_pairs_unpairs_and_repairs_the_same_id() {
+        let (mut g, rx) = harness();
+        let torch = item_id("minecraft:torch").unwrap();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        g.spawn_item(
+            5.0,
+            100.5,
+            5.0,
+            (0.0, 0.0, 0.0),
+            0.0,
+            ItemStack::new(torch, 1),
+            None,
+        );
+        g.flush_connections();
+        assert_eq!(of(&drain(&rx), PACKET_ADD_ENTITY).len(), 1, "paired");
+        // Out past the 64-block pairing range.
+        g.handle(Inbound::Moved {
+            conn: 0,
+            x: 70.5,
+            y: 100.0,
+            z: 5.5,
+            yaw: None,
+            pitch: None,
+        });
+        g.flush_connections();
+        let frames = drain(&rx);
+        let removes = of(&frames, PACKET_REMOVE_ENTITIES);
+        assert_eq!(removes.len(), 1, "unpaired");
+        // Back in range (the chunk grant stands in for the streaming the
+        // world-less harness cannot do).
+        g.grant_chunks_for_test(0, &[(0, 0)]);
+        g.handle(Inbound::Moved {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+            yaw: None,
+            pitch: None,
+        });
+        g.flush_connections();
+        let frames = drain(&rx);
+        let adds = of(&frames, PACKET_ADD_ENTITY);
+        assert_eq!(adds.len(), 1, "re-paired on return");
+        assert_eq!(adds[0][0], removes[0][1], "the same entity id");
+    }
+
+    #[test]
+    fn teleport_back_does_not_repair_until_the_next_move() {
+        let (mut g, rx) = harness();
+        let torch = item_id("minecraft:torch").unwrap();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        g.spawn_item(
+            5.0,
+            100.5,
+            5.0,
+            (0.0, 0.0, 0.0),
+            0.0,
+            ItemStack::new(torch, 1),
+            None,
+        );
+        g.flush_connections();
+        assert_eq!(of(&drain(&rx), PACKET_ADD_ENTITY).len(), 1, "paired");
+        // Away, past the view ring (the harness keeps failed chunk loads
+        // out of `sent`, so the drop's chunk leaves the set here): the
+        // distance drops the pairing and the away view drops the chunk.
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: -100.5,
+        });
+        g.flush_connections();
+        let away = drain(&rx);
+        let removes = of(&away, PACKET_REMOVE_ENTITIES);
+        assert_eq!(removes.len(), 1, "unpaired at the away teleport");
+        // Straight back: the pairing pass reads the away view, so the
+        // drop stays unpaired (the reference swaps its tracking view
+        // only after the pairing pass).
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        g.flush_connections();
+        let back = drain(&rx);
+        assert!(
+            of(&back, PACKET_ADD_ENTITY).is_empty(),
+            "no re-pair at the return teleport"
+        );
+        // The next move re-checks against the restored view and pairs
+        // (the chunk grant stands in for the streaming the world-less
+        // harness cannot do).
+        g.grant_chunks_for_test(0, &[(0, 0)]);
+        g.handle(Inbound::Moved {
+            conn: 0,
+            x: 5.5,
+            y: 100.0,
+            z: 5.5,
+            yaw: None,
+            pitch: None,
+        });
+        g.flush_connections();
+        let moved = drain(&rx);
+        let adds = of(&moved, PACKET_ADD_ENTITY);
+        assert_eq!(adds.len(), 1, "re-paired at the move");
+        assert_eq!(adds[0][0], removes[0][1], "the same entity id");
     }
 
     // -- random ticks --------------------------------------------------
