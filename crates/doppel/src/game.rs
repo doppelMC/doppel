@@ -268,6 +268,9 @@ pub struct Game {
     // --- survival hooks (entities.rs) ---
     /// Live item entities and the random-tick bookkeeping.
     survival: entities::SurvivalState,
+    // --- tracker hooks (tracker.rs) ---
+    /// Per-entity sync state and per-player pairing.
+    tracking: tracker::EntityTrackers,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -348,7 +351,11 @@ pub(crate) mod containers;
 #[path = "entities.rs"]
 pub(crate) mod entities;
 
-const VIEW_RADIUS: i32 = 4;
+// --- tracker hooks (tracker.rs) ---
+#[path = "tracker.rs"]
+pub(crate) mod tracker;
+
+pub(crate) const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 impl Game {
@@ -389,6 +396,7 @@ impl Game {
             containers: Default::default(),
             next_entity_id: 1,
             survival: Default::default(),
+            tracking: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -443,31 +451,30 @@ impl Game {
     /// defers to the next depending on which phase makes it.
     ///
     /// 1. tick counter advance
-    /// 2. tick_entities (entities.rs): item physics, merges, pickups
-    /// 3. advance_digs (dig.rs): the per-player dig clock, delayed
+    /// 2. advance_digs (dig.rs): the per-player dig clock, delayed
     ///    destroys, stage overlays
-    /// 4. broadcast_pending_inventory (inventory.rs): non-click slot
+    /// 3. broadcast_pending_inventory (inventory.rs): non-click slot
     ///    syncs, masked by an open container menu
-    /// 5. broadcast_time: set_time (0x73) every 20 ticks
-    /// 6. fire_torches: queued torch transitions (1gt input delay)
-    /// 7. run_scheduled_ticks: due redstone actions (neighbor and
+    /// 4. broadcast_time: set_time (0x73) every 20 ticks
+    /// 5. fire_torches: queued torch transitions (1gt input delay)
+    /// 6. run_scheduled_ticks: due redstone actions (neighbor and
     ///    shape updates, observer/repeater/comparator toggles)
-    /// 8. random_ticks (entities.rs): the chunk tick's grass pass
-    /// 9. flush_dirty: the broadcast point (0x08/0x56); edits after
+    /// 7. random_ticks (entities.rs): the chunk tick's grass pass
+    /// 8. flush_dirty: the broadcast point (0x08/0x56); edits after
     ///    this defer to the next tick
+    /// 9. track_entities (tracker.rs): the entity sync flush (short
+    ///    deltas, motion, full packets on cadence)
     /// 10. run_block_events: piston world mutations (same tick as
     ///     queued)
-    /// 11. tick_containers (containers.rs): chest lids, menu range
+    /// 11. tick_entities (entities.rs): the pickup vacuum, then item
+    ///     physics, merges, and lifetimes
+    /// 12. tick_containers (containers.rs): chest lids, menu range
     ///     checks, hoppers
-    /// 12. tick_moving_pistons: moving pistons advance and land
-    /// 13. flush_block_entities (containers.rs): block entity data
+    /// 13. tick_moving_pistons: moving pistons advance and land
+    /// 14. flush_block_entities (containers.rs): block entity data
     ///     syncs
     fn game_tick(&mut self) {
         self.tick += 1;
-        // --- survival hooks (entities.rs) ---
-        // The entity pass runs first: a drop spawned last tick moves
-        // before this tick's breaks land.
-        self.tick_entities();
         // Dig progress advances with the tick counter (the reference's
         // per-player game mode tick); breaks land in this tick's flush.
         self.advance_digs();
@@ -490,9 +497,19 @@ impl Game {
         // therefore broadcast one tick later, batched with that tick's
         // scheduled-phase edits.
         self.flush_dirty();
+        // --- tracker hooks (tracker.rs) ---
+        // The entity sync flush rides inside the same chunk-source tick,
+        // after the block broadcast: a drop spawned this tick (whose
+        // entity pass runs below) first syncs next tick, matching the
+        // reference's phase order.
+        self.track_entities();
         // Block events (vanilla `runBlockEvents`): piston world mutations
         // happen here, in the same tick they were queued.
         self.run_block_events();
+        // --- survival hooks (entities.rs) ---
+        // The entity pass: the pickup vacuum first (players tick ahead
+        // of items), then each drop's physics, merge, and lifetime.
+        self.tick_entities();
         // --- containers hooks (containers.rs) ---
         // Block-entity phase: chest lids, menu range checks, hoppers.
         self.tick_containers();
@@ -603,6 +620,9 @@ impl Game {
                         dig: Default::default(),
                     },
                 );
+                // --- tracker hooks (tracker.rs) ---
+                // The newcomer pairs with every entity already in range.
+                self.track_player_view(conn);
             }
             Inbound::Moved {
                 conn,
@@ -624,6 +644,9 @@ impl Game {
                     }
                 }
                 self.stream_if_moved(conn);
+                // --- tracker hooks (tracker.rs) ---
+                // A move re-checks every entity's pairing range.
+                self.track_player_view(conn);
             }
             Inbound::Tp { conn, x, y, z } => {
                 let Some(p) = self.players.get_mut(&conn) else {
@@ -646,6 +669,8 @@ impl Game {
                 p.teleport_id += 1;
                 self.send(conn, 0x49, &sync);
                 self.stream_if_moved(conn);
+                // --- tracker hooks (tracker.rs) ---
+                self.track_player_view(conn);
                 self.send_command_feedback(conn);
             }
             Inbound::KeepAliveAnswer { conn, id } => {
@@ -725,6 +750,8 @@ impl Game {
                 // --- containers hooks (containers.rs) ---
                 // The carried stack of an open menu drops with the player.
                 self.close_menu(conn, false, true);
+                // --- tracker hooks (tracker.rs) ---
+                self.track_player_left(conn);
                 let Some(p) = self.players.remove(&conn) else {
                     return;
                 };
@@ -2191,6 +2218,17 @@ impl Game {
     /// leftover dirty sections (kept for call-shape parity with run()).
     pub(crate) fn tick_once_for_test(&mut self) {
         self.game_tick();
+    }
+
+    /// Puts chunks in the player's streamed set without the streaming
+    /// machinery (the tracker's re-pairing tests; the harness runs
+    /// without a world store, so streaming cannot re-enter on its own).
+    pub(crate) fn grant_chunks_for_test(&mut self, conn: ConnId, chunks: &[(i32, i32)]) {
+        if let Some(p) = self.players.get_mut(&conn) {
+            for c in chunks {
+                p.sent.insert(*c);
+            }
+        }
     }
 
     pub(crate) fn state_label_for_test(&self, state: u32) -> String {
