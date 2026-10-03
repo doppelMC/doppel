@@ -35,11 +35,12 @@ const MAX_P95_DELTA: f64 = 12.0;
 /// Shape alignment: Pearson correlation of the height fields.
 const MIN_CORRELATION: f64 = 0.72;
 /// Material agreement: histogram overlap over block names.
-const MIN_OVERLAP: f64 = 0.5;
+const MIN_OVERLAP: f64 = 0.95;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
-/// breakage like wrong world height or offset sections). Ores and disks
-/// sit below this margin until the underground features land.
-const MIN_CELL_AGREEMENT: f64 = 0.8;
+/// breakage like wrong world height or offset sections). Ore blobs and
+/// surface disks sit at this margin; the remaining gap is caves,
+/// aquifers, and lush caves.
+const MIN_CELL_AGREEMENT: f64 = 0.95;
 /// Coastline agreement: the density surface matches vanilla block for
 /// block; the remaining disagreement columns carry vanilla ground cover
 /// (leaf litter, grass, tree canopies) the tree stream desync moves.

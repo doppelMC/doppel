@@ -157,7 +157,7 @@ fn props_text(v: Option<&Value>) -> String {
 }
 
 /// A plain state (bare name or id-plus-properties object) as a state id.
-fn plain_state(d: &Decorator, v: &Value) -> Option<u32> {
+pub(crate) fn plain_state(d: &Decorator, v: &Value) -> Option<u32> {
     match v {
         Value::String(name) => d.state_id_of(name, ""),
         Value::Object(_) => {
@@ -259,12 +259,10 @@ impl StateProvider {
 /// Feature kinds the pins carry but the engine places nothing for yet.
 /// Plan validation accepts exactly these and the dispatch arms; any other
 /// kind fails the plan load instead of skipping silently.
-pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 41] = [
-    "minecraft:ore",
+pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 39] = [
     "minecraft:overlay",
     "minecraft:vegetation_patch",
     "minecraft:spring_feature",
-    "minecraft:disk",
     "minecraft:block_pile",
     "minecraft:huge_fungus",
     "minecraft:sequence",
@@ -433,6 +431,8 @@ pub(crate) fn run_feature(
         }
         "minecraft:block_column" => run_block_column(d, v, rng, x, y, z),
         "minecraft:multiface_growth" => run_multiface(d, v, rng, x, y, z),
+        "minecraft:ore" => crate::ores::run_ore(d, v, rng, x, y, z),
+        "minecraft:disk" => crate::ores::run_disk(d, v, rng, x, y, z),
         other => {
             debug_assert!(
                 UNPLACED_FEATURE_KINDS.contains(&other),
@@ -511,6 +511,17 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
         Predicate::Replaceable => {
             let name = d.block_name(d.block(x, y, z)).to_string();
             d.tag_contains("replaceable", &name)
+        }
+        Predicate::Solid { offset } => {
+            let name = d.block_name(d.block(x + offset[0], y + offset[1], z + offset[2]));
+            !matches!(
+                name,
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:void_air"
+                    | "minecraft:water"
+                    | "minecraft:lava"
+            )
         }
         Predicate::AllOf(list) => list.iter().all(|p| test_predicate(d, p, x, y, z)),
         Predicate::AnyOf(list) => list.iter().any(|p| test_predicate(d, p, x, y, z)),

@@ -17,6 +17,7 @@ pub mod decoration;
 pub mod density;
 mod features;
 pub mod noise;
+mod ores;
 pub mod registry;
 pub mod structures;
 pub mod terrain;

@@ -23,6 +23,7 @@ use crate::biome::BiomeTable;
 use crate::chunk_codec::WireChunk;
 use crate::features;
 use crate::noise::Xoroshiro;
+use crate::ores;
 use crate::registry::BlockRegistry;
 use crate::structures::{well_volumes_near, write_volume, WellBlocks};
 use crate::terrain::{HeightmapGenerator, SectionBiomes};
@@ -97,6 +98,14 @@ impl DecorRng {
 
     pub fn next_f32(&mut self) -> f32 {
         self.next(24) as f32 * (1.0 / (1u64 << 24) as f32)
+    }
+
+    /// The double draw: two stream steps, a 26-bit high half and a 27-bit
+    /// low half packed into 53 fraction bits.
+    pub fn next_double(&mut self) -> f64 {
+        let high = self.next(26) as i64;
+        let low = self.next(27) as i64;
+        ((high << 27) + low) as f64 * (1.0 / (1u64 << 53) as f64)
     }
 
     /// The boolean draw: the high bit of one stream step.
@@ -346,6 +355,14 @@ impl Anchor {
     }
 }
 
+/// The distribution a height range draws from: flat, or flat with a
+/// plateau that spreads the density over the range shoulders.
+#[derive(Clone)]
+enum RangeShape {
+    Uniform,
+    Trapezoid { plateau: i32 },
+}
+
 /// A block predicate for placement filters and feature checks.
 #[derive(Clone)]
 pub(crate) enum Predicate {
@@ -366,6 +383,11 @@ pub(crate) enum Predicate {
         name: String,
     },
     Replaceable,
+    /// The block at the offset has a full collision shape: the legacy
+    /// solid test the surface disks read one cell above their writes.
+    Solid {
+        offset: [i32; 3],
+    },
     AllOf(Vec<Predicate>),
     AnyOf(Vec<Predicate>),
     Not(Box<Predicate>),
@@ -430,6 +452,9 @@ impl Predicate {
                 })
             }
             "minecraft:replaceable" => Ok(Predicate::Replaceable),
+            "minecraft:solid" => Ok(Predicate::Solid {
+                offset: predicate_offset(v),
+            }),
             "minecraft:all_of" | "minecraft:any_of" => {
                 let inner: Vec<Predicate> = v
                     .get("predicates")
@@ -448,9 +473,7 @@ impl Predicate {
                 v.get("predicate").context("not predicate")?,
             )?))),
             "minecraft:true" => Ok(Predicate::True),
-            "minecraft:has_sturdy_face" | "minecraft:solid" | "minecraft:volume_match" => {
-                Ok(Predicate::Unsupported)
-            }
+            "minecraft:has_sturdy_face" | "minecraft:volume_match" => Ok(Predicate::Unsupported),
             other => bail!("unsupported predicate {other}"),
         }
     }
@@ -467,6 +490,7 @@ enum Modifier {
     HeightRange {
         min: Anchor,
         max: Anchor,
+        shape: RangeShape,
     },
     Offset(IntDraw, IntDraw, IntDraw),
     WaterDepth(i32),
@@ -505,13 +529,17 @@ impl Modifier {
             "minecraft:biome" => Ok(Modifier::Biome),
             "minecraft:height_range" => {
                 let height = v.get("height").context("height range")?;
-                let shape = height.get("type").and_then(Value::as_str);
-                if shape != Some("minecraft:uniform") {
-                    return Ok(Modifier::Unsupported);
-                }
+                let shape = match height.get("type").and_then(Value::as_str) {
+                    Some("minecraft:uniform") => RangeShape::Uniform,
+                    Some("minecraft:trapezoid") => RangeShape::Trapezoid {
+                        plateau: height.get("plateau").and_then(Value::as_i64).unwrap_or(0) as i32,
+                    },
+                    _ => return Ok(Modifier::Unsupported),
+                };
                 Ok(Modifier::HeightRange {
                     min: Anchor::parse(height.get("min_inclusive").context("range min")?)?,
                     max: Anchor::parse(height.get("max_inclusive").context("range max")?)?,
+                    shape,
                 })
             }
             "minecraft:offset" => {
@@ -1216,6 +1244,20 @@ impl<'a> Decorator<'a> {
                         }
                         Ok(())
                     }
+                    "minecraft:ore" => {
+                        if ores::OreCfg::parse(self, v).is_some() {
+                            Ok(())
+                        } else {
+                            bail!("ore config rejected by the parser")
+                        }
+                    }
+                    "minecraft:disk" => {
+                        if ores::DiskCfg::parse(self, v).is_some() {
+                            Ok(())
+                        } else {
+                            bail!("disk config rejected by the parser")
+                        }
+                    }
                     other => bail!("unsupported feature kind {other}"),
                 }
             }
@@ -1438,11 +1480,29 @@ impl<'a> Decorator<'a> {
                         out.push((x, y, z));
                     }
                 }
-                Modifier::HeightRange { min, max } => {
+                Modifier::HeightRange { min, max, shape } => {
                     let lo = min.resolve(MIN_Y, span);
                     let hi = max.resolve(MIN_Y, span);
+                    // An empty range holds its floor and draws nothing.
+                    let y = if lo > hi {
+                        lo
+                    } else {
+                        match shape {
+                            RangeShape::Uniform => rng.next_int(hi - lo + 1) + lo,
+                            RangeShape::Trapezoid { plateau } => {
+                                let range = hi - lo;
+                                if *plateau >= range {
+                                    rng.next_int(range + 1) + lo
+                                } else {
+                                    let start = (range - plateau) / 2;
+                                    let end = range - start;
+                                    lo + rng.next_int(end + 1) + rng.next_int(start + 1)
+                                }
+                            }
+                        }
+                    };
                     // The drawn height replaces the y axis outright.
-                    out.push((x, rng.next_int(hi - lo + 1) + lo, z));
+                    out.push((x, y, z));
                 }
                 Modifier::Offset(dx, dy, dz) => {
                     out.push((x + dx.sample(rng), y + dy.sample(rng), z + dz.sample(rng)));
@@ -4036,6 +4096,29 @@ mod tests {
         );
     }
 
+    /// The double draw packs two stream steps into 53 fraction bits: a
+    /// 26-bit high half shifted over a 27-bit low half.
+    #[test]
+    fn double_draw_shape() {
+        let mut a = seeded();
+        let before = a.words;
+        let value = a.next_double();
+        assert_eq!(a.words - before, 2, "two stream steps per double");
+        let mut b = seeded();
+        let high = b.next(26) as i64;
+        let low = b.next(27) as i64;
+        assert_eq!(
+            value,
+            ((high << 27) + low) as f64 * (1.0 / (1u64 << 53) as f64)
+        );
+        assert!((0.0..1.0).contains(&value));
+        // Different seeds move the value; the low half fills the gap the
+        // 26-bit high half leaves.
+        let mut c = seeded();
+        c.set_feature_seed(7, 0, 0);
+        assert!(c.next_double() != value || c.next_double() != a.next_double());
+    }
+
     /// Every draw shape consumes the stream exactly the way the reference
     /// provider does: constants draw nothing, a pinned uniform still draws,
     /// the symmetric trapezoid draws twice, and weighted picks follow the
@@ -4255,8 +4338,12 @@ mod tests {
                     (bx - 16..bx + 32).contains(x) && (bz - 16..bz + 32).contains(z),
                     "{name} landed at ({x},{z})"
                 );
+                // Height ranges name anchors past the build band on both
+                // ends; the feature walk then refuses those cells, so the
+                // deepest below-bottom and tallest absolute anchors bound
+                // every visit.
                 assert!(
-                    *y >= MIN_Y && *y < MIN_Y + LAYERS as i32,
+                    *y >= MIN_Y - 96 && *y <= MIN_Y + LAYERS as i32 + 160,
                     "{name} height {y}"
                 );
                 // The biome gate runs mid-stack, so an offset can carry a
