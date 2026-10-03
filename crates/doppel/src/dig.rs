@@ -422,7 +422,11 @@ impl Game {
 
     /// Per-tick dig advance: delayed destroys finish, active digs deepen
     /// their overlay. The two are exclusive per player (a pending delayed
-    /// destroy starves the active dig). Breaks land in this tick's flush.
+    /// destroy starves the active dig). The dig clock rides the player
+    /// entity tick, after the broadcast point: its breaks land in the
+    /// NEXT tick's flush (event-time breaks - stop-past-threshold,
+    /// creative, insta-break - still write at packet time and flush the
+    /// same tick).
     pub(crate) fn advance_digs(&mut self) {
         enum Step {
             ClearDelayed,

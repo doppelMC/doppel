@@ -611,9 +611,10 @@ impl Game {
         }
     }
 
-    /// The per-tick entity pass: physics, merging, pickup, despawn.
-    /// Runs ahead of the dig pass so a break's drop ticks from the
-    /// following tick, like an entity added mid-tick.
+    /// The per-tick entity pass: physics, merging, pickup, despawn. It
+    /// runs after the block-event phase and ahead of the dig pass, so a
+    /// drop spawned by this tick's breaks first moves on the following
+    /// tick, like an entity added mid-tick.
     pub(crate) fn tick_entities(&mut self) {
         self.entity_physics();
         self.entity_merge();

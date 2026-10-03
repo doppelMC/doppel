@@ -674,19 +674,28 @@ mod tests {
     /// `localhex=name[props]` strings.
     fn tick(g: &mut Game, rx: &std::sync::mpsc::Receiver<Outbound>) -> Vec<String> {
         g.tick_once_for_test();
-        let mut out = Vec::new();
+        let mut raw = Vec::new();
         while let Ok(frame) = rx.try_recv() {
-            let Outbound::Frame { id, body } = frame else {
-                continue;
-            };
-            if id != 0x56 && id != 0x08 {
+            if let Outbound::Frame { id, body } = frame {
+                raw.push((id, body));
+            }
+        }
+        decode_block_frames(g, &raw)
+    }
+
+    /// Decodes the block-update frames (0x08/0x56) of a drained batch to
+    /// `localhex=name[props]` strings, one per entry.
+    fn decode_block_frames(g: &Game, raw: &[(i32, Vec<u8>)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, body) in raw {
+            if *id != 0x56 && *id != 0x08 {
                 continue;
             }
             let mut o = 8usize;
             let mut count = 1usize;
             let mut single_local = 0u64;
-            if id == 0x56 {
-                count = read_varlong(&body, &mut o) as usize;
+            if *id == 0x56 {
+                count = read_varlong(body, &mut o) as usize;
             } else {
                 let x = i64::from_be_bytes(body[0..8].try_into().unwrap());
                 single_local = (((x >> 38) as u64 & 0xf) << 8)
@@ -694,16 +703,27 @@ mod tests {
                     | (x as u64 & 0xf);
             }
             for _ in 0..count {
-                let (local, state) = if id == 0x56 {
-                    let v = read_varlong(&body, &mut o);
+                let (local, state) = if *id == 0x56 {
+                    let v = read_varlong(body, &mut o);
                     (v & 0xfff, (v >> 12) as u32)
                 } else {
-                    (single_local, read_varlong(&body, &mut o) as u32)
+                    (single_local, read_varlong(body, &mut o) as u32)
                 };
                 out.push(format!("{:x}={}", local, g.state_label_for_test(state)));
             }
         }
         out
+    }
+
+    /// Drains everything queued without ticking: (id, body) pairs in order.
+    fn drain(rx: &std::sync::mpsc::Receiver<Outbound>) -> Vec<(i32, Vec<u8>)> {
+        let mut raw = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let Outbound::Frame { id, body } = frame {
+                raw.push((id, body));
+            }
+        }
+        raw
     }
 
     fn read_varlong(body: &[u8], o: &mut usize) -> u64 {
@@ -735,15 +755,19 @@ mod tests {
                 if id != PACKET_CONTAINER_SET_SLOT {
                     continue;
                 }
-                let mut r = Reader::new(&body);
-                let container_id = r.read_varint().ok()?;
-                let state_id = r.read_varint().ok()?;
-                let slot = r.read_u16().ok()? as i16;
-                let stack = crate::inventory::decode_item_stack(&mut r).ok()?;
-                return Some((container_id, state_id, slot, stack));
+                return parse_set_slot_body(&body);
             }
         }
         None
+    }
+
+    fn parse_set_slot_body(body: &[u8]) -> Option<(i32, i32, i16, Option<ItemStack>)> {
+        let mut r = Reader::new(body);
+        let container_id = r.read_varint().ok()?;
+        let state_id = r.read_varint().ok()?;
+        let slot = r.read_u16().ok()? as i16;
+        let stack = crate::inventory::decode_item_stack(&mut r).ok()?;
+        Some((container_id, state_id, slot, stack))
     }
 
     // -- parse ---------------------------------------------------------
@@ -848,11 +872,22 @@ mod tests {
         use_on(&mut g, 5, 100, 5, DIR_DOWN, 0);
         assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
         // Five placements consumed five items; the refused click did not.
-        // The spent stack syncs on the next tick's menu broadcast, which
-        // runs ahead of that tick's world flush; the one frame carries
-        // the final count.
+        // The tick's world flush broadcasts the five placements first; the
+        // spent stack syncs on the menu broadcast behind the flush point.
         g.tick_once_for_test();
-        let (container_id, _, slot, stack) = next_set_slot(&rx).expect("slot sync queued");
+        let queued = drain(&rx);
+        let frames = decode_block_frames(&g, &queued);
+        assert_eq!(frames.len(), 5, "{frames:?}");
+        let sync = queued
+            .iter()
+            .position(|(id, _)| *id == PACKET_CONTAINER_SET_SLOT)
+            .expect("slot sync queued");
+        let last_flush = queued
+            .iter()
+            .rposition(|(id, _)| matches!(id, 0x08 | 0x56))
+            .expect("placement broadcasts queued");
+        assert!(sync > last_flush, "the slot sync lands behind the flush");
+        let (container_id, _, slot, stack) = parse_set_slot_body(&queued[sync].1).unwrap();
         assert_eq!(container_id, 0);
         assert_eq!(slot, 36, "hotbar 0 presents as menu slot 36");
         let stack = stack.expect("59 left after five placements");
@@ -860,10 +895,6 @@ mod tests {
             (stack.count(), stack.item()),
             (59, item_id("minecraft:stone").unwrap())
         );
-        // The flush queued the five placement broadcasts behind the slot
-        // sync; the drain helper's own tick adds nothing.
-        let frames = tick(&mut g, &rx);
-        assert_eq!(frames.len(), 5, "{frames:?}");
     }
 
     #[test]
@@ -1071,15 +1102,20 @@ mod tests {
             at(&g, 6, 101, 5),
             "minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=none]"
         );
-        // The spent dust syncs and the pop fires in the same tick: the
-        // menu broadcast runs ahead of the world flush.
+        // The spent dust syncs and the pop fire in the same tick; the pop
+        // rides the world flush, the sync the menu broadcast behind it.
         g.tick_once_for_test();
-        let (_, _, _, stack) = next_set_slot(&rx).unwrap();
-        assert_eq!(stack, None, "the dust was consumed");
-        let frames = tick(&mut g, &rx);
+        let queued = drain(&rx);
+        let frames = decode_block_frames(&g, &queued);
         // The pop overrides the placement in the same per-tick dedup.
         assert_eq!(frames, vec!["655=minecraft:air[]"]);
         assert_eq!(at(&g, 6, 101, 5), "minecraft:air[]");
+        let sync = queued
+            .iter()
+            .position(|(id, _)| *id == PACKET_CONTAINER_SET_SLOT)
+            .expect("slot sync queued");
+        let (_, _, _, stack) = parse_set_slot_body(&queued[sync].1).unwrap();
+        assert_eq!(stack, None, "the dust was consumed");
     }
 
     #[test]

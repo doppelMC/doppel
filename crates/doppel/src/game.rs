@@ -423,11 +423,10 @@ impl Game {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
             if std::time::Instant::now() >= next_tick {
-                // The flush happens inside game_tick at vanilla's
-                // broadcast point; edits from the block-event/BE phases
-                // below it deliberately stay pending until the next
-                // tick's flush. A frozen clock only advances through
-                // explicit `tick step`s.
+                // The flush happens inside game_tick at the broadcast
+                // point; edits from the phases below it deliberately stay
+                // pending until the next tick's flush. A frozen clock only
+                // advances through explicit `tick step`s.
                 if !self.frozen {
                     self.game_tick();
                 }
@@ -437,62 +436,80 @@ impl Game {
         }
     }
 
-    /// One game tick (50ms): fire scheduled actions, then housekeeping.
-    /// One game tick, phases in order. The order is load-bearing: a
-    /// write lands in this tick's broadcast point (flush_dirty) or
-    /// defers to the next depending on which phase makes it.
+    /// One game tick (50ms), phases in the reference loop's order. The
+    /// order is load-bearing: a write lands in this tick's broadcast
+    /// point (flush_dirty) or defers to the next depending on which
+    /// phase makes it.
     ///
     /// 1. tick counter advance
-    /// 2. tick_entities (entities.rs): item physics, merges, pickups
-    /// 3. advance_digs (dig.rs): the per-player dig clock, delayed
-    ///    destroys, stage overlays
-    /// 4. broadcast_pending_inventory (inventory.rs): non-click slot
-    ///    syncs, masked by an open container menu
-    /// 5. broadcast_time: set_time (0x73) every 20 ticks
-    /// 6. fire_torches: queued torch transitions (1gt input delay)
-    /// 7. run_scheduled_ticks: due redstone actions (neighbor and
+    /// 2. broadcast_time: set_time (0x73) every 20 ticks; a server
+    ///    level sync that precedes the world tick
+    /// 3. fire_torches: queued torch transitions (1gt input delay);
+    ///    with 4 this is the scheduled-tick phase
+    /// 4. run_scheduled_ticks: due redstone actions (neighbor and
     ///    shape updates, observer/repeater/comparator toggles)
-    /// 8. random_ticks (entities.rs): the chunk tick's grass pass
-    /// 9. flush_dirty: the broadcast point (0x08/0x56); edits after
+    /// 5. random_ticks (entities.rs): the chunk tick's grass pass,
+    ///    inside the chunk phase, before the broadcast point
+    /// 6. flush_dirty: the broadcast point (0x08/0x56); edits after
     ///    this defer to the next tick
-    /// 10. run_block_events: piston world mutations (same tick as
-    ///     queued)
+    /// 7. run_block_events: piston world mutations, in the same tick
+    ///    they were queued
+    /// 8. tick_entities (entities.rs): item physics, merges, pickups,
+    ///    despawns; the entity phase
+    /// 9. advance_digs (dig.rs): the per-player dig clock, delayed
+    ///    destroys, stage overlays; rides the player entity tick, so
+    ///    its breaks land in the NEXT tick's flush
+    /// 10. broadcast_pending_inventory (inventory.rs): non-click slot
+    ///     syncs, masked by an open container menu; rides the player
+    ///     entity tick after the dig clock
     /// 11. tick_containers (containers.rs): chest lids, menu range
-    ///     checks, hoppers
-    /// 12. tick_moving_pistons: moving pistons advance and land
+    ///     checks, hoppers; the block-entity phase
+    /// 12. tick_moving_pistons: moving pistons advance +0.5 and land;
+    ///     same block-entity phase (block entities interleave by
+    ///     insertion order there, not by kind)
     /// 13. flush_block_entities (containers.rs): block entity data
     ///     syncs
+    ///
+    /// Reference loop slots with no implementation yet, in order: the
+    /// world border tick; weather advance; the sleep wake check; game
+    /// time advance with scheduled function events; fluid scheduled
+    /// ticks (after the block ones); raids; natural mob spawning,
+    /// thunder, and ice/snow precipitation (inside the chunk phase
+    /// before random ticks); the entity tracking sync point (its own
+    /// broadcast inside the chunk phase, before block events; entity
+    /// frames here ride the entity phase instead); entity storage
+    /// management; and the per-connection flush after the world tick
+    /// (keep-alives sit there; run() sends them right after game_tick).
     fn game_tick(&mut self) {
         self.tick += 1;
+        self.broadcast_time();
+        // Scheduled-tick phase: torch transitions, then the rest of the
+        // due redstone actions.
+        self.fire_torches();
+        self.run_scheduled_ticks();
         // --- survival hooks (entities.rs) ---
-        // The entity pass runs first: a drop spawned last tick moves
-        // before this tick's breaks land.
+        // Random ticks (the chunk tick's grass pass) land their writes in
+        // this tick's flush.
+        self.random_ticks();
+        // The broadcast point sits after the chunk phase and before block
+        // events: world edits made by the phases below broadcast one tick
+        // later, batched with that tick's scheduled-phase edits.
+        self.flush_dirty();
+        // Block events: piston world mutations happen here, in the same
+        // tick they were queued.
+        self.run_block_events();
+        // --- survival hooks (entities.rs) ---
+        // The entity phase: a drop spawned by this tick's breaks first
+        // moves on the next tick.
         self.tick_entities();
-        // Dig progress advances with the tick counter (the reference's
-        // per-player game mode tick); breaks land in this tick's flush.
+        // Dig progress advances with the tick counter (the player entity
+        // tick's game mode pass); its breaks land in the next tick's
+        // flush, like every post-broadcast write.
         self.advance_digs();
         // --- inventory hooks (inventory.rs) ---
         // The per-tick menu broadcast: non-click inventory changes sync
         // here unless a container menu masks them.
         self.broadcast_pending_inventory();
-        self.broadcast_time();
-        self.fire_torches();
-
-        self.run_scheduled_ticks();
-
-        // --- survival hooks (entities.rs) ---
-        // Random ticks (the chunk tick's grass pass) land their writes in
-        // this tick's flush.
-        self.random_ticks();
-        // Vanilla's broadcast point (`ServerChunkCache.tick` inside
-        // `ServerLevel.tick`) sits AFTER the scheduled-tick phase but
-        // BEFORE block events: world edits made by pistons below
-        // therefore broadcast one tick later, batched with that tick's
-        // scheduled-phase edits.
-        self.flush_dirty();
-        // Block events (vanilla `runBlockEvents`): piston world mutations
-        // happen here, in the same tick they were queued.
-        self.run_block_events();
         // --- containers hooks (containers.rs) ---
         // Block-entity phase: chest lids, menu range checks, hoppers.
         self.tick_containers();
@@ -2191,6 +2208,12 @@ impl Game {
     /// leftover dirty sections (kept for call-shape parity with run()).
     pub(crate) fn tick_once_for_test(&mut self) {
         self.game_tick();
+    }
+
+    /// The internal tick counter (stepped `tick step` batches advance it
+    /// past the harness's own tick count).
+    pub(crate) fn tick_counter_for_test(&self) -> u64 {
+        self.tick
     }
 
     pub(crate) fn state_label_for_test(&self, state: u32) -> String {

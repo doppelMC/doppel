@@ -392,6 +392,174 @@ fn record_session() -> Vec<String> {
     t.step("tick step 8", Inbound::TickStep { conn: 0, steps: 8 });
     t.ticks(1);
 
+    // A hopper fed by a chest through the menu: the fill syncs and the
+    // 8gt transfer cadence pin the block-entity phase.
+    t.step(
+        "tp actor to the hopper station",
+        Inbound::Tp {
+            conn: 0,
+            x: 10.5,
+            y: 101.0,
+            z: 6.5,
+        },
+    );
+    t.step(
+        "setblock chest above hopper",
+        setblock(
+            0,
+            12,
+            101,
+            6,
+            "minecraft:chest[facing=north,type=single,waterlogged=false]",
+        ),
+    );
+    t.step(
+        "setblock hopper",
+        setblock(0, 12, 100, 6, "minecraft:hopper[enabled=true,facing=down]"),
+    );
+    t.tick();
+    t.step(
+        "give 16 stone (chest fill)",
+        Inbound::Give {
+            conn: 0,
+            item: "minecraft:stone".to_string(),
+            count: 16,
+        },
+    );
+    t.step(
+        "opencontainer chest above hopper",
+        Inbound::OpenContainer {
+            conn: 0,
+            x: 12,
+            y: 101,
+            z: 6,
+        },
+    );
+    t.tick();
+    t.step(
+        "quick_move stone into the chest above hopper",
+        click(2, 1, 54, 0, ClickKind::QuickMove),
+    );
+    t.tick();
+    t.step(
+        "container_close (chest above hopper)",
+        Inbound::ContainerClose {
+            conn: 0,
+            container_id: 2,
+        },
+    );
+    t.ticks(20);
+
+    // A lever-driven piston: extension and retraction pin the block-event
+    // phase and the moving-piston landing.
+    t.step(
+        "setblock piston",
+        setblock(
+            0,
+            12,
+            100,
+            8,
+            "minecraft:piston[extended=false,facing=west]",
+        ),
+    );
+    t.step(
+        "setblock piston lever",
+        setblock(
+            0,
+            13,
+            100,
+            8,
+            "minecraft:lever[face=floor,facing=north,powered=false]",
+        ),
+    );
+    t.tick();
+    t.step(
+        "piston lever ON",
+        setblock(
+            0,
+            13,
+            100,
+            8,
+            "minecraft:lever[face=floor,facing=north,powered=true]",
+        ),
+    );
+    t.ticks(3);
+    t.step(
+        "piston lever OFF",
+        setblock(
+            0,
+            13,
+            100,
+            8,
+            "minecraft:lever[face=floor,facing=north,powered=false]",
+        ),
+    );
+    t.ticks(3);
+
+    // The entangled window: pad so the window's tick sits on a 20-tick
+    // boundary (it then also carries the periodic time sync), hover the
+    // actor just under the floor so a downward-thrown drop lands on its
+    // first entity pass (the landing flip is what syncs a fresh drop),
+    // and prime the cascade lever two ticks ahead so the repeater's
+    // scheduled toggle lands exactly on the window's tick.
+    while t.game.tick_counter_for_test() % 20 != 17 {
+        t.tick();
+    }
+    t.step(
+        "prime: hover the actor under the window",
+        Inbound::Tp {
+            conn: 0,
+            x: 10.5,
+            y: 98.8,
+            z: 6.5,
+        },
+    );
+    t.step(
+        "prime: cascade lever ON",
+        setblock(
+            0,
+            5,
+            100,
+            8,
+            "minecraft:lever[face=floor,facing=north,powered=true]",
+        ),
+    );
+    t.step(
+        "prime: give 4 stone",
+        Inbound::Give {
+            conn: 0,
+            item: "minecraft:stone".to_string(),
+            count: 4,
+        },
+    );
+    t.tick();
+    t.tick();
+    t.step(
+        "entangled: look straight down",
+        Inbound::Rotated {
+            conn: 0,
+            yaw: 0.0,
+            pitch: 90.0,
+        },
+    );
+    t.step(
+        "entangled: setblock dirt",
+        setblock(0, 14, 100, 4, "minecraft:dirt"),
+    );
+    t.step(
+        "entangled: drop one stone (lands inside the window)",
+        Inbound::PlayerAction {
+            conn: 0,
+            act: dig(5),
+        },
+    );
+    // The entangled tick: the periodic time sync (phase 2), the repeater's
+    // scheduled toggle and the dirt write's flush (phase 6), the thrown
+    // drop's landing sync (phase 8), and the spent stack's slot sync
+    // (phase 10) share one tick; any phase reorder shifts these bytes.
+    t.tick();
+    t.ticks(6);
+
     t.lines
 }
 
