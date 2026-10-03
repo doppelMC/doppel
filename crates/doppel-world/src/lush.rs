@@ -388,6 +388,54 @@ fn distribute_vegetation(
     }
 }
 
+/// Places a single vine cell against the first sturdy neighbour above
+/// or beside it; the draw stream stands still and the placed state
+/// carries exactly the winning face.
+pub(crate) fn run_vines(
+    d: &mut Decorator,
+    _v: &Value,
+    _rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    if !is_air_name(d.block_name(d.block(x, y, z))) {
+        return false;
+    }
+    // The reference walks its direction enum without down: up first,
+    // then the horizontal plane in north, east, south, west order.
+    for (prop, (nx, ny, nz)) in [
+        ("up", (x, y + 1, z)),
+        ("north", (x, y, z - 1)),
+        ("east", (x + 1, y, z)),
+        ("south", (x, y, z + 1)),
+        ("west", (x - 1, y, z)),
+    ] {
+        let name = d.block_name(d.block(nx, ny, nz)).to_string();
+        if !d.tag_contains("blocks_motion_no_leaves", &name) {
+            continue;
+        }
+        let faces = [
+            ("east", prop == "east"),
+            ("north", prop == "north"),
+            ("south", prop == "south"),
+            ("up", prop == "up"),
+            ("west", prop == "west"),
+        ];
+        let props = faces
+            .iter()
+            .map(|(face, on)| format!("{face}={on}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(state) = d.state_id_of("minecraft:vine", &props) {
+            d.set_block(x, y, z, state);
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
 /// Sets the waterlogged property on a cell the flooded patch just grew
 /// vegetation into.
 fn waterlog_cell(d: &mut Decorator, x: i32, y: i32, z: i32) {

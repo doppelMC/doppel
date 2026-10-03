@@ -1017,6 +1017,7 @@ pub struct Decorator<'a> {
     features: HashMap<usize, Option<PlacedFeatureCfg>>,
     named: HashMap<String, Option<PlacedFeatureCfg>>,
     feature_configs: HashMap<String, Option<Value>>,
+    state_providers: HashMap<String, Option<Value>>,
     chunks: HashMap<(i32, i32), ChunkState>,
     traits: StateTraits,
     tags: TagResolver,
@@ -1063,6 +1064,7 @@ impl<'a> Decorator<'a> {
             features: HashMap::new(),
             named: HashMap::new(),
             feature_configs: HashMap::new(),
+            state_providers: HashMap::new(),
             chunks: HashMap::new(),
             traits: StateTraits::default(),
             #[cfg(test)]
@@ -1343,6 +1345,20 @@ impl<'a> Decorator<'a> {
                             .context("patch without a vegetation feature")?;
                         let mut seen = std::collections::BTreeSet::new();
                         self.validate_placed_ref(vegetation, &mut seen)
+                    }
+                    "minecraft:vines" => Ok(()),
+                    "minecraft:random_boolean_selector" => {
+                        let mut seen = std::collections::BTreeSet::new();
+                        self.validate_placed_ref(
+                            v.get("feature_true")
+                                .context("boolean selector without a true branch")?,
+                            &mut seen,
+                        )?;
+                        self.validate_placed_ref(
+                            v.get("feature_false")
+                                .context("boolean selector without a false branch")?,
+                            &mut seen,
+                        )
                     }
                     other => bail!("unsupported feature kind {other}"),
                 }
@@ -1739,6 +1755,23 @@ impl<'a> Decorator<'a> {
             self.feature_configs.insert(id.to_string(), cfg);
         }
         self.feature_configs.get(id).cloned().flatten()
+    }
+
+    /// Loads (and caches) a block state provider config by id; None
+    /// marks an unregistered name (the caller falls back to a plain
+    /// block state).
+    pub(crate) fn load_state_provider(&mut self, id: &str) -> Option<Value> {
+        if !self.state_providers.contains_key(id) {
+            let cfg = std::fs::read_to_string(
+                self.pins
+                    .join("block_state_provider")
+                    .join(format!("{id}.json")),
+            )
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            self.state_providers.insert(id.to_string(), cfg);
+        }
+        self.state_providers.get(id).cloned().flatten()
     }
 
     /// The climate biome at a block position, from the stored section

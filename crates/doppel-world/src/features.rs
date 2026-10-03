@@ -128,13 +128,19 @@ impl Face {
 // ---------------------------------------------------------------------------
 
 /// A block state source. Weighted providers draw once per sample; the
-/// soil provider looks at the position block.
+/// soil provider looks at the position block; the int overlay draws
+/// its source first and then the property value.
 #[derive(Clone)]
 enum StateProvider {
     Fixed(u32),
     Weighted {
         total: i32,
-        entries: Vec<(i32, u32)>,
+        entries: Vec<(i32, StateProvider)>,
+    },
+    RandomizedInt {
+        property: String,
+        values: IntDraw,
+        source: Box<StateProvider>,
     },
     /// Dirt unless the position block vetoes replacement.
     Soil,
@@ -182,9 +188,18 @@ fn state_with_prop(d: &Decorator, name: &str, prop: &str, value: &str) -> Option
 }
 
 impl StateProvider {
-    fn parse(d: &Decorator, v: &Value) -> StateProvider {
+    fn parse(d: &mut Decorator, v: &Value) -> StateProvider {
         match v {
             Value::String(name) if name == "minecraft:soil_beneath_tree" => StateProvider::Soil,
+            // A bare name resolves through the provider registry first,
+            // then falls back to a plain block state.
+            Value::String(name) => {
+                let key = name.strip_prefix("minecraft:").unwrap_or(name);
+                match d.load_state_provider(key) {
+                    Some(inner) => StateProvider::parse(d, &inner),
+                    None => plain_state(d, v).map_or(StateProvider::None, StateProvider::Fixed),
+                }
+            }
             Value::Object(_) => match v.get("type").and_then(Value::as_str) {
                 Some("minecraft:weighted") => {
                     let mut entries = Vec::new();
@@ -200,10 +215,11 @@ impl StateProvider {
                         let Some(data) = entry.get("data") else {
                             return StateProvider::None;
                         };
-                        match plain_state(d, data) {
-                            Some(state) => entries.push((weight as i32, state)),
-                            None => return StateProvider::None,
+                        let provider = StateProvider::parse(d, data);
+                        if matches!(provider, StateProvider::None) {
+                            return StateProvider::None;
                         }
+                        entries.push((weight as i32, provider));
                     }
                     let total: i64 = entries.iter().map(|(w, _)| *w as i64).sum();
                     if total <= 0 || total > i32::MAX as i64 {
@@ -212,6 +228,26 @@ impl StateProvider {
                     StateProvider::Weighted {
                         total: total as i32,
                         entries,
+                    }
+                }
+                Some("minecraft:randomized_int") => {
+                    let Some(source) = v.get("source") else {
+                        return StateProvider::None;
+                    };
+                    let source = StateProvider::parse(d, source);
+                    if matches!(source, StateProvider::None) {
+                        return StateProvider::None;
+                    }
+                    let Some(property) = v.get("property").and_then(Value::as_str) else {
+                        return StateProvider::None;
+                    };
+                    let Ok(values) = IntDraw::parse(v.get("values").unwrap_or(&Value::Null)) else {
+                        return StateProvider::None;
+                    };
+                    StateProvider::RandomizedInt {
+                        property: property.to_string(),
+                        values,
+                        source: Box::new(source),
                     }
                 }
                 Some("minecraft:soil_beneath_tree") => StateProvider::Soil,
@@ -233,13 +269,29 @@ impl StateProvider {
             StateProvider::Fixed(state) => Some(*state),
             StateProvider::Weighted { total, entries } => {
                 let mut pick = rng.next_int(*total);
-                for (weight, state) in entries {
+                for (weight, provider) in entries {
                     if pick < *weight {
-                        return Some(*state);
+                        return provider.sample(d, rng, x, y, z);
                     }
                     pick -= weight;
                 }
-                entries.last().map(|(_, state)| *state)
+                entries.last()?.1.sample(d, rng, x, y, z)
+            }
+            // The source draws first; a state without the property keeps
+            // the source's value and draws nothing.
+            StateProvider::RandomizedInt {
+                property,
+                values,
+                source,
+            } => {
+                let base = source.sample(d, rng, x, y, z)?;
+                let (name, props) = d.registry().state_of(base)?;
+                if !props.split(',').any(|pair| pair.starts_with(property)) {
+                    return Some(base);
+                }
+                let value = values.sample(rng);
+                let props = BlockRegistry::with_prop(props, property, &value.to_string());
+                d.state_id_of(name, &props)
             }
             StateProvider::Soil => {
                 let here = d.block_name(d.block(x, y, z)).to_string();
@@ -261,7 +313,7 @@ impl StateProvider {
 /// Feature kinds the pins carry but the engine places nothing for yet.
 /// Plan validation accepts exactly these and the dispatch arms; any other
 /// kind fails the plan load instead of skipping silently.
-pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 36] = [
+pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 34] = [
     "minecraft:overlay",
     "minecraft:block_pile",
     "minecraft:huge_fungus",
@@ -277,7 +329,6 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 36] = [
     "minecraft:end_podium",
     "minecraft:fossil",
     "minecraft:iceberg",
-    "minecraft:random_boolean_selector",
     "minecraft:scattered_ore",
     "minecraft:root_system",
     "minecraft:geode",
@@ -296,7 +347,6 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 36] = [
     "minecraft:large_dripstone",
     "minecraft:monster_room",
     "minecraft:underwater_magma",
-    "minecraft:vines",
     "minecraft:void_start_platform",
 ];
 
@@ -448,6 +498,17 @@ pub(crate) fn run_feature(
         "minecraft:spring_feature" => crate::lush::run_spring(d, v, rng, x, y, z),
         "minecraft:vegetation_patch" | "minecraft:waterlogged_vegetation_patch" => {
             crate::lush::run_patch(d, v, rng, x, y, z)
+        }
+        "minecraft:vines" => crate::lush::run_vines(d, v, rng, x, y, z),
+        // One boolean draw picks the branch; the chosen placed feature
+        // runs with the same stream.
+        "minecraft:random_boolean_selector" => {
+            let chosen = if rng.next_bool() {
+                v.get("feature_true")
+            } else {
+                v.get("feature_false")
+            };
+            run_placed_value(d, chosen, rng, x, y, z)
         }
         other => {
             debug_assert!(
@@ -863,7 +924,7 @@ fn draw_field(v: &Value, key: &str) -> Option<IntDraw> {
 }
 
 /// Parses a tree config; None marks a shape this engine does not run.
-pub(crate) fn parse_tree(d: &Decorator, v: &Value) -> Option<TreeCfg> {
+pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
     let trunk_placer = v.get("trunk_placer")?;
     let trunk_kind = match trunk_placer.get("type").and_then(Value::as_str)? {
         "minecraft:straight_trunk_placer" => TrunkKind::Straight,
@@ -1915,13 +1976,13 @@ pub(crate) struct FallenCfg {
     log_decorators: Vec<FallenDecorator>,
 }
 
-pub(crate) fn parse_fallen(d: &Decorator, v: &Value) -> Option<FallenCfg> {
+pub(crate) fn parse_fallen(d: &mut Decorator, v: &Value) -> Option<FallenCfg> {
     let trunk = StateProvider::parse(d, v.get("trunk_provider")?);
     if matches!(trunk, StateProvider::None) {
         return None;
     }
     let log_length = draw_field(v, "log_length")?;
-    let parse_list = |key: &str| -> Option<Vec<FallenDecorator>> {
+    let mut parse_list = |key: &str| -> Option<Vec<FallenDecorator>> {
         let mut out = Vec::new();
         for deco in v.get(key).and_then(Value::as_array).into_iter().flatten() {
             match deco.get("type").and_then(Value::as_str) {
@@ -2112,7 +2173,7 @@ pub(crate) struct MushroomCfg {
     red: bool,
 }
 
-pub(crate) fn parse_mushroom(d: &Decorator, v: &Value, red: bool) -> Option<MushroomCfg> {
+pub(crate) fn parse_mushroom(d: &mut Decorator, v: &Value, red: bool) -> Option<MushroomCfg> {
     let cap = StateProvider::parse(d, v.get("cap_provider")?);
     let stem = StateProvider::parse(d, v.get("stem_provider")?);
     if matches!(cap, StateProvider::None) || matches!(stem, StateProvider::None) {
@@ -2730,13 +2791,46 @@ mod tests {
         assert_eq!(name_at(&d, 10, top + 4, 10), "minecraft:dirt");
     }
 
+    /// A cave vine hangs from the ceiling: body cells from the provider
+    /// registry reference, the berry-tipped head at the tip.
+    #[test]
+    fn cave_vine_hangs_from_ceiling() {
+        let mut d = region();
+        let top = surface(&mut d, 8, 8);
+        let floor = top - 12;
+        let air = d.state_id_of("minecraft:air", "").expect("air");
+        for dy in 0..5 {
+            d.set_block(8, floor + dy, 8, air);
+        }
+        let cfg = feature_value("cave_vine");
+        run_feature(&mut d, &cfg, &mut test_rng(), 8, floor + 4, 8);
+        let mut cells: Vec<(i32, String)> = Vec::new();
+        for dy in 0..6 {
+            let name = name_at(&d, 8, floor + dy, 8);
+            if name.starts_with("minecraft:cave_vines") {
+                cells.push((floor + dy, name));
+            }
+        }
+        assert!(!cells.is_empty(), "the vine column placed");
+        let head_y = cells[0].0;
+        assert_eq!(
+            name_at(&d, 8, head_y, 8),
+            "minecraft:cave_vines",
+            "the tip is a head"
+        );
+        let head = d.block(8, head_y, 8);
+        let (_, props) = d.registry().state_of(head).unwrap();
+        let age = BlockRegistry::prop_int(props, "age").expect("head age");
+        assert!((23..=25).contains(&age), "head age {age}");
+    }
+
     /// The weighted state provider draws once and lands inside its
     /// weights.
     #[test]
     fn weighted_provider_draws_once() {
         let mut d = region();
         let cfg = feature_value("leaf_litter");
-        let provider = StateProvider::parse(&d, cfg.get("to_place").unwrap());
+        let provider = StateProvider::parse(&mut d, cfg.get("to_place").unwrap());
         let StateProvider::Weighted { total, ref entries } = provider else {
             panic!("leaf litter is a weighted provider");
         };
