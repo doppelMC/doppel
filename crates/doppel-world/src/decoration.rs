@@ -1874,8 +1874,13 @@ impl<'a> Decorator<'a> {
         }
     }
 
-    /// Reads a block from the region.
+    /// Reads a block from the region; cells outside the vertical build
+    /// range read as void air, the reference's answer for every
+    /// out-of-bounds query.
     pub fn block(&self, x: i32, y: i32, z: i32) -> u32 {
+        if y < MIN_Y || y >= MIN_Y + LAYERS as i32 {
+            return self.state_id_of("minecraft:void_air", "").unwrap_or(0);
+        }
         let cx = x.div_euclid(EDGE);
         let cz = z.div_euclid(EDGE);
         let column = (z.rem_euclid(EDGE) * EDGE + x.rem_euclid(EDGE)) as usize;
