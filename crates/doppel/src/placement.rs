@@ -1,7 +1,7 @@
 //! Right-click block placement (`use_item_on`): the serverbound parse,
 //! the block-item table, and the geometry helpers that turn a clicked face
 //! plus the placer's view direction into a block-state spec. The game-side
-//! handler lives in game.rs under the placement hooks banner.
+//! handler (`place_from_hand`) lives here, invoked from game.rs's dispatch.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use anyhow::{bail, Context, Result};
 use doppel_protocol::Reader;
 
-use crate::game::{DIR_DOWN, DIR_EAST, DIR_NORTH, DIR_SOUTH, DIR_UP, DIR_WEST};
+use crate::game::{ConnId, Game, DIR_DOWN, DIR_EAST, DIR_NORTH, DIR_SOUTH, DIR_UP, DIR_WEST};
 
 /// Serverbound `use_item_on`, play state: registration order 66 in the
 /// pinned 26.3 template (26.2's 0x41 + the insertions before it).
@@ -453,6 +453,112 @@ pub fn block_item_form(item: i32) -> Option<(&'static str, Form)> {
         })
         .get(&item)
         .copied()
+}
+
+impl Game {
+    /// Serverbound use_item_on: resolve the held block item against the
+    /// clicked face, place it, and spend one item (survival). The parse
+    /// and the per-family geometry live in placement.rs.
+    pub(crate) fn place_from_hand(
+        &mut self,
+        conn: ConnId,
+        x: i32,
+        y: i32,
+        z: i32,
+        face: u8,
+        hand: u8,
+    ) {
+        // The clicked block's use runs first (the reference's
+        // block-before-item rule): a container right-click opens the menu
+        // and consumes the click whether or not the menu actually opens
+        // (a blocked chest answers success without opening). The held
+        // item neither places nor spends.
+        if matches!(
+            self.get_block(x, y, z),
+            Some((ref n, _)) if matches!(n.as_str(), "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:hopper")
+        ) {
+            self.open_container(conn, x, y, z);
+            return;
+        }
+        // NOTE(breaking): the other menu-providing blocks (barrel,
+        // furnace, dispenser, dropper, ender chest, shulker box,
+        // crafting table) also consume the click in the reference; their
+        // menus are future work and placement still wins here.
+        let (slot, block, form, yaw, pitch, creative) = {
+            let Some(p) = self.players.get(&conn) else {
+                return;
+            };
+            let selected = p.inv.inventory.selected() as usize;
+            let slot = if hand == 0 {
+                selected
+            } else {
+                // The offhand places only while the main hand holds no
+                // block item (the main hand always resolves first).
+                let main_holds_block = p
+                    .inv
+                    .inventory
+                    .get(selected)
+                    .is_some_and(|s| crate::placement::block_item_form(s.item()).is_some());
+                if main_holds_block {
+                    return;
+                }
+                crate::inventory::SLOT_OFFHAND
+            };
+            let Some((block, form)) = p
+                .inv
+                .inventory
+                .get(slot)
+                .as_ref()
+                .and_then(|s| crate::placement::block_item_form(s.item()))
+            else {
+                eprintln!(
+                    "[game] use_item_on at ({x},{y},{z}) face {face}: no block item in slot {slot}"
+                );
+                return;
+            };
+            (slot, block, form, p.yaw, p.pitch, p.inv.creative)
+        };
+        let Some(spec) = form.spec(block, face, yaw, pitch) else {
+            eprintln!("[game] use_item_on: no form for {block} face {face}");
+            return;
+        };
+        let (dx, dy, dz) = crate::placement::face_step(face);
+        let (tx, ty, tz) = (x + dx, y + dy, z + dz);
+        // Only air accepts a placement; replaceable blocks (water, grass
+        // paths) arrive with the block-data pin.
+        if !matches!(self.get_block(tx, ty, tz), Some((n, _)) if n == "minecraft:air") {
+            eprintln!(
+                "[game] use_item_on: target ({tx},{ty},{tz}) is not air: {:?}",
+                self.get_block(tx, ty, tz)
+            );
+            return;
+        }
+        let Some(state) = self.resolve_state(&spec) else {
+            eprintln!("[game] placement: unknown state {spec}");
+            return;
+        };
+        // NOTE(placement): chest-family placements would create their
+        // block entity here; that lands with containers.rs, which owns
+        // block entities. Placement only sets the state.
+        self.set_block(tx, ty, tz, state, true);
+        if creative {
+            return;
+        }
+        // The spent stack queues for the per-tick menu broadcast: a
+        // container menu open by broadcast time masks the sync (its open
+        // snapshot already carries the new count).
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        let remaining = p
+            .inv
+            .inventory
+            .get(slot)
+            .map(|s| s.with_count(s.count() - 1))
+            .filter(|s| !s.is_empty());
+        p.inv.inventory.set(slot, remaining);
+        p.inv.pending_sync.insert(slot);
+    }
 }
 
 // --- breaking hooks ---

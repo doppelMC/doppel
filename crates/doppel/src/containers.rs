@@ -776,7 +776,7 @@ impl Game {
 
     /// `opencontainer x y z` (harness driver): opens the container menu
     /// at a block position for one player.
-    pub(super) fn open_container(&mut self, conn: ConnId, x: i32, y: i32, z: i32) {
+    pub(crate) fn open_container(&mut self, conn: ConnId, x: i32, y: i32, z: i32) {
         let Some((name, _)) = self.get_block(x, y, z) else {
             return;
         };
