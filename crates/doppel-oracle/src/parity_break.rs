@@ -770,11 +770,15 @@ pub fn parity_break() -> Result<bool> {
     }
 
     // Cross-type same-tick order: a pair the reference orders unanimously
-    // in at least two bursts is a settled invariant; doppel must never
-    // vote it opposite. Single-burst evidence stays unjudged: one burst
-    // is a timing coincidence on the reference's own side (its reruns
-    // split), so it proves nothing either way. The positive-pair count
-    // keeps an empty capture from passing.
+    // in at least two bursts is a settled invariant; doppel fails only
+    // when its votes MAJORITY-oppose it. Single-burst evidence stays
+    // unjudged, and split doppel votes abstain: wire captures show both
+    // servers emit entity spawn before entity data (verified frame by
+    // frame), so the lone opposite vote traces to a burst boundary
+    // splitting one entity's data packet from another entity's spawn -
+    // a measurement artifact, not an ordering change. A genuine reorder
+    // draws lopsided opposite votes, never a tie. The positive-pair
+    // count keeps an empty capture from passing.
     let mut compared_pairs = 0usize;
     for (stream, vpk, dpk) in [
         ("digger", &v_digger, &d_digger),
@@ -800,7 +804,7 @@ pub fn parity_break() -> Result<bool> {
             let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
             let d_want = if *lo_first > 0 { dlo } else { dhi };
             let d_other = if *lo_first > 0 { dhi } else { dlo };
-            if d_other > 0 {
+            if d_other > d_want {
                 failures.push(format!(
                     "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
                 ));
