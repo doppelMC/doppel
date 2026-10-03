@@ -178,19 +178,19 @@ pub(crate) fn write_volume(blocks: &mut [u32], cx: i32, cz: i32, volume: &BlockV
     }
 }
 
-/// Generates one chunk: terrain fill, then the pieces of every well whose
-/// feature chunk sits within one chunk of it. A well only places on ground
-/// above sea level; ocean feature chunks stay empty.
-pub fn generate_chunk(
+/// The well pieces that reach one chunk: every well feature chunk within
+/// one chunk of it. A well only places on ground above sea level; ocean
+/// feature chunks stay empty.
+pub fn well_volumes_near(
     terrain: &HeightmapGenerator,
     well: &WellBlocks,
     world_seed: i64,
     cx: i32,
     cz: i32,
-) -> WireChunk {
+) -> Vec<BlockVolume> {
     const SPACING: i32 = 32;
     let grid = well_grid();
-    let (mut blocks, _) = terrain.build_blocks(cx, cz);
+    let mut volumes = Vec::new();
     // Cells whose feature chunk can reach this chunk's neighborhood.
     let gx_range = [(cx - 1).div_euclid(SPACING), (cx + 1).div_euclid(SPACING)];
     let gz_range = [(cz - 1).div_euclid(SPACING), (cz + 1).div_euclid(SPACING)];
@@ -212,13 +212,27 @@ pub fn generate_chunk(
             let center = (fx * SECTION_EDGE + ox, fz * SECTION_EDGE + oz);
             let base = terrain.column_top(center.0, center.1);
             if base > SEA_LEVEL {
-                for volume in well_volumes(well, center, base, rim_layers) {
-                    write_volume(&mut blocks, cx, cz, &volume);
-                }
+                volumes.extend(well_volumes(well, center, base, rim_layers));
             }
         }
     }
-    terrain.emit(cx, cz, &blocks)
+    volumes
+}
+
+/// Generates one chunk: terrain fill, then the well pieces that reach it.
+pub fn generate_chunk(
+    terrain: &HeightmapGenerator,
+    well: &WellBlocks,
+    world_seed: i64,
+    cx: i32,
+    cz: i32,
+) -> Result<WireChunk> {
+    let (mut blocks, _) = terrain.build_blocks(cx, cz);
+    for volume in well_volumes_near(terrain, well, world_seed, cx, cz) {
+        write_volume(&mut blocks, cx, cz, &volume);
+    }
+    let biomes = terrain.section_biomes(cx, cz);
+    terrain.emit_with(cx, cz, &blocks, biomes.as_ref())
 }
 
 #[cfg(test)]
@@ -368,8 +382,8 @@ mod tests {
         let reg = registry();
         let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
         let well = WellBlocks::from_registry(&reg).unwrap();
-        let a = generate_chunk(&terrain, &well, 42, -347, 388);
-        let b = generate_chunk(&terrain, &well, 42, -346, 388);
+        let a = generate_chunk(&terrain, &well, 42, -347, 388).unwrap();
+        let b = generate_chunk(&terrain, &well, 42, -346, 388).unwrap();
 
         let sandstone = well.sandstone;
         let water = well.water;
@@ -410,18 +424,18 @@ mod tests {
             .collect();
         let forward: Vec<WireChunk> = area
             .iter()
-            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz))
+            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz).unwrap())
             .collect();
         let backward: Vec<WireChunk> = area
             .iter()
             .rev()
-            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz))
+            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz).unwrap())
             .collect();
         for (a, b) in forward.iter().zip(backward.iter().rev()) {
             assert_eq!(a, b);
         }
         // A lone chunk matches its in-context twin byte for byte.
-        let lone = generate_chunk(&terrain, &well, 42, 51, 15);
+        let lone = generate_chunk(&terrain, &well, 42, 51, 15).unwrap();
         let in_context = &forward[area.iter().position(|&c| c == (51, 15)).unwrap()];
         assert_eq!(&lone.encode(), &in_context.encode());
     }
