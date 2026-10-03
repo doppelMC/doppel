@@ -34,9 +34,13 @@ impl Lcg48 {
     }
 
     /// The modulo method with rejection for bias: draws 31 bits until the
-    /// leftover bucket range fits.
+    /// leftover bucket range fits. Power-of-two bounds take the high bits
+    /// of a wide multiply instead.
     pub fn next_int(&mut self, bound: i32) -> i32 {
         debug_assert!(bound > 0);
+        if bound & (bound - 1) == 0 {
+            return ((bound as i64 * self.next_bits(31) as i64) >> 31) as i32;
+        }
         let b = bound as i64;
         loop {
             let bits = self.next_bits(31) as i64;
@@ -698,7 +702,12 @@ mod tests {
         let mut rng = Lcg48::new(12345);
         assert_eq!(
             (0..5).map(|_| rng.next_int(16)).collect::<Vec<_>>(),
-            [11, 8, 1, 12, 7]
+            [5, 8, 14, 14, 13]
+        );
+        let mut rng = Lcg48::new(12345);
+        assert_eq!(
+            (0..6).map(|_| rng.next_int(2)).collect::<Vec<_>>(),
+            [0, 1, 1, 1, 1, 0]
         );
         let mut rng = Lcg48::new(12345);
         assert_eq!(

@@ -178,6 +178,33 @@ pub(crate) fn write_volume(blocks: &mut [u32], cx: i32, cz: i32, volume: &BlockV
     }
 }
 
+/// One well piece: the basin center, its rim height, and the ground layer
+/// the floor sits on. Ocean wells still resolve; callers skip them.
+pub struct WellPiece {
+    pub center: (i32, i32),
+    pub rim_layers: i32,
+    pub base: i32,
+}
+
+fn well_piece(terrain: &HeightmapGenerator, world_seed: i64, fx: i32, fz: i32) -> WellPiece {
+    let seed = (fx as i64)
+        .wrapping_mul(CELL_X_MIX)
+        .wrapping_add((fz as i64).wrapping_mul(CELL_Z_MIX))
+        .wrapping_add(world_seed)
+        .wrapping_add(PIECE_SALT);
+    let mut rng = Lcg48::new(seed);
+    let ox = rng.next_int(SECTION_EDGE);
+    let oz = rng.next_int(SECTION_EDGE);
+    let rim_layers = 1 + rng.next_int(2);
+    let center = (fx * SECTION_EDGE + ox, fz * SECTION_EDGE + oz);
+    let base = terrain.column_top(center.0, center.1);
+    WellPiece {
+        center,
+        rim_layers,
+        base,
+    }
+}
+
 /// The well pieces that reach one chunk: every well feature chunk within
 /// one chunk of it. A well only places on ground above sea level; ocean
 /// feature chunks stay empty.
@@ -200,19 +227,14 @@ pub fn well_volumes_near(
             if (fx - cx).abs() > 1 || (fz - cz).abs() > 1 {
                 continue;
             }
-            let seed = (fx as i64)
-                .wrapping_mul(CELL_X_MIX)
-                .wrapping_add((fz as i64).wrapping_mul(CELL_Z_MIX))
-                .wrapping_add(world_seed)
-                .wrapping_add(PIECE_SALT);
-            let mut rng = Lcg48::new(seed);
-            let ox = rng.next_int(SECTION_EDGE);
-            let oz = rng.next_int(SECTION_EDGE);
-            let rim_layers = 1 + rng.next_int(2);
-            let center = (fx * SECTION_EDGE + ox, fz * SECTION_EDGE + oz);
-            let base = terrain.column_top(center.0, center.1);
-            if base > SEA_LEVEL {
-                volumes.extend(well_volumes(well, center, base, rim_layers));
+            let piece = well_piece(terrain, world_seed, fx, fz);
+            if piece.base > SEA_LEVEL {
+                volumes.extend(well_volumes(
+                    well,
+                    piece.center,
+                    piece.base,
+                    piece.rim_layers,
+                ));
             }
         }
     }
@@ -374,44 +396,60 @@ mod tests {
         cells[ly * 256 + lz * 16 + lx]
     }
 
-    /// Feature chunk (-347, 388) at seed 42 lands its well on high ground
-    /// with the center column at x=-5537 (local 15), so the rim crosses
-    /// into chunk (-346, 388).
+    /// A well whose center column sits at its chunk's east edge (local x 15)
+    /// spills floor and rim into the eastern neighbor; the scan pins one at
+    /// this seed.
     #[test]
     fn well_places_and_clips_across_the_chunk_border() {
         let reg = registry();
         let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
         let well = WellBlocks::from_registry(&reg).unwrap();
-        let a = generate_chunk(&terrain, &well, 42, -347, 388).unwrap();
-        let b = generate_chunk(&terrain, &well, 42, -346, 388).unwrap();
+        let grid = well_grid();
+        // Find a well on land whose center sits at a chunk's east edge.
+        let mut found = None;
+        'cells: for gx in -40..=40 {
+            for gz in -40..=40 {
+                let (fx, fz) = grid.feature_chunk(42, gx, gz);
+                let piece = well_piece(&terrain, 42, fx, fz);
+                if piece.base > SEA_LEVEL
+                    && piece.center.0.rem_euclid(16) == 15
+                    && piece.rim_layers == 1
+                {
+                    found = Some((fx, fz, piece));
+                    break 'cells;
+                }
+            }
+        }
+        let Some((fx, fz, piece)) = found else {
+            panic!("no east-edge well on land in the scan window");
+        };
+        let (cx, cz) = (piece.center.0, piece.center.1);
+        let base = piece.base;
+        let a = generate_chunk(&terrain, &well, 42, fx, fz).unwrap();
+        let b = generate_chunk(&terrain, &well, 42, fx + 1, fz).unwrap();
 
         let sandstone = well.sandstone;
         let water = well.water;
-        // The basin center at (-5537, 6213), base = column top there; this
-        // piece draws one rim layer and the floor crosses x=-5536 into
-        // chunk -346.
-        let base = terrain.column_top(-5537, 6213);
-        assert!(base > SEA_LEVEL, "test target is on land");
-        assert_eq!(block_at(&a, -5537, base, 6213), water, "basin center");
-        assert_eq!(block_at(&a, -5538, base, 6213), water, "basin interior");
-        assert_eq!(block_at(&a, -5539, base, 6213), sandstone, "floor ring");
-        assert_eq!(block_at(&a, -5539, base + 1, 6213), sandstone, "rim layer");
+        assert_eq!(block_at(&a, cx, base, cz), water, "basin center");
+        assert_eq!(block_at(&a, cx - 1, base, cz), water, "basin interior");
+        assert_eq!(block_at(&a, cx - 2, base, cz), sandstone, "floor ring");
+        assert_eq!(block_at(&a, cx - 2, base + 1, cz), sandstone, "rim layer");
         assert_ne!(
-            block_at(&a, -5539, base + 2, 6213),
+            block_at(&a, cx - 2, base + 2, cz),
             sandstone,
-            "single rim layer"
+            "rim respects the drawn layer count"
         );
         assert_eq!(
-            block_at(&b, -5535, base, 6213),
+            block_at(&b, cx + 2, base, cz),
             sandstone,
             "floor spills over"
         );
-        assert_eq!(block_at(&b, -5535, base + 1, 6213), sandstone, "east rim");
+        assert_eq!(block_at(&b, cx + 2, base + 1, cz), sandstone, "east rim");
         // The far side of the neighbor is untouched terrain: the clipped
         // volume wrote nothing beyond the well edge.
-        assert_ne!(block_at(&b, -5534, base + 1, 6213), sandstone);
+        assert_ne!(block_at(&b, cx + 3, base + 1, cz), sandstone);
         // The basin interior opens to the sky above the water.
-        assert_eq!(block_at(&a, -5537, base + 1, 6213), 0);
+        assert_eq!(block_at(&a, cx, base + 1, cz), 0);
     }
 
     #[test]
