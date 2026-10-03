@@ -36,7 +36,7 @@ const EDGE: i32 = 16;
 /// Columns per chunk.
 const COLUMNS: usize = 256;
 /// World layers (384).
-const LAYERS: usize = SECTION_SPAN * 16;
+pub(crate) const LAYERS: usize = SECTION_SPAN * 16;
 
 // ---------------------------------------------------------------------------
 // The decoration random.
@@ -384,6 +384,16 @@ pub(crate) enum Predicate {
     Survive {
         name: String,
     },
+    /// The block at the offset presents a full face vertically (both
+    /// directions collapse onto the motion tag).
+    SturdyFace {
+        offset: [i32; 3],
+    },
+    /// The offset cell sits inside the build height (the vertical axis
+    /// is the only one bounded).
+    InsideBounds {
+        offset: [i32; 3],
+    },
     Replaceable,
     /// The block at the offset has a full collision shape: the legacy
     /// solid test the surface disks read one cell above their writes.
@@ -454,6 +464,22 @@ impl Predicate {
                 })
             }
             "minecraft:replaceable" => Ok(Predicate::Replaceable),
+            "minecraft:inside_world_bounds" => Ok(Predicate::InsideBounds {
+                offset: predicate_offset(v),
+            }),
+            "minecraft:has_sturdy_face" => {
+                match v
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .context("sturdy face direction")?
+                {
+                    "up" | "down" => {}
+                    _ => return Ok(Predicate::Unsupported),
+                }
+                Ok(Predicate::SturdyFace {
+                    offset: predicate_offset(v),
+                })
+            }
             "minecraft:solid" => Ok(Predicate::Solid {
                 offset: predicate_offset(v),
             }),
@@ -475,7 +501,7 @@ impl Predicate {
                 v.get("predicate").context("not predicate")?,
             )?))),
             "minecraft:true" => Ok(Predicate::True),
-            "minecraft:has_sturdy_face" | "minecraft:volume_match" => Ok(Predicate::Unsupported),
+            "minecraft:volume_match" => Ok(Predicate::Unsupported),
             other => bail!("unsupported predicate {other}"),
         }
     }
@@ -502,6 +528,14 @@ enum Modifier {
         max: i32,
     },
     Filter(Predicate),
+    /// Walks vertically from the position through allowed cells to the
+    /// first that matches the target.
+    EnvironmentScan {
+        down: bool,
+        target: Predicate,
+        allowed: Predicate,
+        max_steps: i32,
+    },
     /// Recognized but not evaluated: features carrying one are skipped.
     Unsupported,
 }
@@ -582,8 +616,30 @@ impl Modifier {
             "minecraft:block_predicate_filter" => Ok(Modifier::Filter(Predicate::parse(
                 v.get("predicate").context("filter predicate")?,
             )?)),
-            "minecraft:environment_scan"
-            | "minecraft:count_on_every_layer"
+            "minecraft:environment_scan" => {
+                let down = match v
+                    .get("direction_of_search")
+                    .and_then(Value::as_str)
+                    .context("scan direction")?
+                {
+                    "down" => true,
+                    "up" => false,
+                    other => bail!("unsupported scan direction {other}"),
+                };
+                Ok(Modifier::EnvironmentScan {
+                    down,
+                    target: Predicate::parse(v.get("target_condition").context("scan target")?)?,
+                    allowed: match v.get("allowed_search_condition") {
+                        Some(a) => Predicate::parse(a)?,
+                        None => Predicate::True,
+                    },
+                    max_steps: v
+                        .get("max_steps")
+                        .and_then(Value::as_i64)
+                        .context("scan steps")? as i32,
+                })
+            }
+            "minecraft:count_on_every_layer"
             | "minecraft:noise_based_count"
             | "minecraft:noise_threshold_count"
             | "minecraft:random_chance"
@@ -1555,6 +1611,39 @@ impl<'a> Decorator<'a> {
                 Modifier::Filter(p) => {
                     if features::test_predicate(self, p, x, y, z) {
                         out.push((x, y, z));
+                    }
+                }
+                Modifier::EnvironmentScan {
+                    down,
+                    target,
+                    allowed,
+                    max_steps,
+                } => {
+                    // The allowed check gates the origin; the walk tests
+                    // the target, steps, and stops at the build limit or
+                    // the first disallowed cell, with one final target
+                    // test after the walk ends on its own.
+                    if features::test_predicate(self, allowed, x, y, z) {
+                        let step = if *down { -1 } else { 1 };
+                        let (mut sy, mut stopped) = (y, false);
+                        for _ in 0..*max_steps {
+                            if features::test_predicate(self, target, x, sy, z) {
+                                out.push((x, sy, z));
+                                stopped = true;
+                                break;
+                            }
+                            sy += step;
+                            if sy < MIN_Y || sy >= MIN_Y + LAYERS as i32 {
+                                stopped = true;
+                                break;
+                            }
+                            if !features::test_predicate(self, allowed, x, sy, z) {
+                                break;
+                            }
+                        }
+                        if !stopped && features::test_predicate(self, target, x, sy, z) {
+                            out.push((x, sy, z));
+                        }
                     }
                 }
                 Modifier::Unsupported => return,

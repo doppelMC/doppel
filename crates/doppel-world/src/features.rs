@@ -12,7 +12,9 @@ use std::f64::consts::PI;
 
 use serde_json::Value;
 
-use crate::decoration::{DecorRng, Decorator, HeightKind, IntDraw, PlacedFeatureCfg, Predicate};
+use crate::decoration::{
+    DecorRng, Decorator, HeightKind, IntDraw, PlacedFeatureCfg, Predicate, LAYERS,
+};
 use crate::registry::BlockRegistry;
 use crate::worldgen::MIN_Y;
 
@@ -510,6 +512,17 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
             Some(state) => can_survive(d, state, x, y, z),
             None => false,
         },
+        // Both vertical face directions collapse onto the motion tag.
+        Predicate::SturdyFace { offset } => {
+            let name = d
+                .block_name(d.block(x + offset[0], y + offset[1], z + offset[2]))
+                .to_string();
+            d.tag_contains("blocks_motion_no_leaves", &name)
+        }
+        Predicate::InsideBounds { offset } => {
+            let y = y + offset[1];
+            (MIN_Y..=MIN_Y + LAYERS as i32 - 1).contains(&y)
+        }
         Predicate::Replaceable => {
             let name = d.block_name(d.block(x, y, z)).to_string();
             d.tag_contains("replaceable", &name)
@@ -534,7 +547,7 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
 }
 
 /// Blocks that survive on the vegetation substrate.
-const VEGETATION: [&str; 27] = [
+const VEGETATION: [&str; 26] = [
     "minecraft:short_grass",
     "minecraft:fern",
     "minecraft:tall_grass",
@@ -561,7 +574,6 @@ const VEGETATION: [&str; 27] = [
     "minecraft:oak_sapling",
     "minecraft:birch_sapling",
     "minecraft:dark_oak_sapling",
-    "minecraft:spore_blossom",
 ];
 
 /// Blocks that survive on the dry substrate.
@@ -600,6 +612,13 @@ fn can_survive(d: &mut Decorator, state: u32, x: i32, y: i32, z: i32) -> bool {
             })
         }
         "minecraft:leaf_litter" => d.tag_contains("blocks_motion_no_leaves", &below),
+        // The blossom hangs: a full center face above and dry air at the
+        // cell itself.
+        "minecraft:spore_blossom" => {
+            let above = d.block_name(d.block(x, y + 1, z)).to_string();
+            d.tag_contains("blocks_motion_no_leaves", &above)
+                && d.block_name(d.block(x, y, z)) != "minecraft:water"
+        }
         "minecraft:brown_mushroom" | "minecraft:red_mushroom" => {
             d.tag_contains("overrides_mushroom_light_requirement", &below)
                 || d.tag_contains("blocks_motion_no_leaves", &below)
