@@ -241,6 +241,7 @@ struct ChunkEmitter {
     air: u32,
     water: u32,
     biome: u32,
+    registry: BlockRegistry,
 }
 
 impl ChunkEmitter {
@@ -250,6 +251,7 @@ impl ChunkEmitter {
             air: states.air,
             water: states.water,
             biome: PLAINS_BIOME_ID,
+            registry: registry.clone(),
         })
     }
 
@@ -272,7 +274,8 @@ impl ChunkEmitter {
             sections.push(self.section(cells, solid, section_biomes));
         }
 
-        // First free layer per column (heightmap value).
+        // First free layer per column (the world-surface map and the sky
+        // light floor).
         let mut first_free = [0usize; HEIGHTMAP_CELLS];
         for column in 0..HEIGHTMAP_CELLS {
             let top = (MIN_Y..MIN_Y + WORLD_LAYERS as i32)
@@ -280,9 +283,17 @@ impl ChunkEmitter {
                 .find(|&y| blocks[layer_index(y) * HEIGHTMAP_CELLS + column] != self.air);
             first_free[column] = top.map(|y| (y + 1 - MIN_Y) as usize).unwrap_or(0);
         }
-        let heightmaps: Vec<(u32, Vec<u64>)> = CLIENT_HEIGHTMAPS
-            .map(|ty| (ty, pack(&first_free.map(|v| v as u16), HEIGHTMAP_BITS)))
-            .to_vec();
+        // Each client map carries its own surface predicate; without the
+        // pinned tags the shared top-non-air scan stands in for all three.
+        let heightmaps: Vec<(u32, Vec<u64>)> =
+            match crate::decoration::wire_heightmaps(&self.registry, blocks) {
+                Ok(maps) => maps
+                    .map(|(ty, columns)| (ty, pack(&columns, HEIGHTMAP_BITS)))
+                    .to_vec(),
+                Err(_) => CLIENT_HEIGHTMAPS
+                    .map(|ty| (ty, pack(&first_free.map(|v| v as u16), HEIGHTMAP_BITS)))
+                    .to_vec(),
+            };
 
         WireChunk {
             x: cx,
