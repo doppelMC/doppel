@@ -10,6 +10,8 @@ pub mod wire;
 
 #[cfg(test)]
 mod piston_tests;
+#[cfg(test)]
+mod self_trace;
 
 use anyhow::{bail, Context, Result};
 use blobs::Blobs;
