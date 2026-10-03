@@ -34,12 +34,14 @@ const MAX_MEDIAN_DELTA: f64 = 2.0;
 const MAX_P95_DELTA: f64 = 10.0;
 /// Shape alignment: Pearson correlation of the height fields.
 const MIN_CORRELATION: f64 = 0.75;
-/// Material agreement: histogram overlap over block names.
-const MIN_OVERLAP: f64 = 0.98;
+/// Material agreement: histogram overlap over block names. The tail is
+/// stone-variety noise (deepslate, gravel, granite, tuff).
+const MIN_OVERLAP: f64 = 0.99;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
-/// breakage like wrong world height or offset sections). The carve and
-/// aquifer fields match; the remaining gap is lush-cave ground cover.
-const MIN_CELL_AGREEMENT: f64 = 0.97;
+/// breakage like wrong world height or offset sections). The carve,
+/// aquifer, and lush-cave fields match; the remaining gap is
+/// stone-variety noise and drifting tree canopies.
+const MIN_CELL_AGREEMENT: f64 = 0.971;
 /// Coastline agreement: the density surface matches vanilla block for
 /// block; the remaining disagreement columns carry vanilla ground cover
 /// (leaf litter, grass, tree canopies) the tree stream desync moves.
