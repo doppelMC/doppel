@@ -89,7 +89,7 @@ pub fn status_ping(host: &str, port: u16, protocol_hint: i32, timeout: Duration)
     Ok(value)
 }
 
-/// `status_ping` with retries — used right after booting a server.
+/// `status_ping` with retries - used right after booting a server.
 pub fn status_ping_retry(
     host: &str,
     port: u16,
@@ -243,8 +243,8 @@ pub struct LeggedCapture {
 }
 
 /// Connects as an offline-mode login client and records every packet the
-/// server sends, driving the full confirmed choreography — login, ack,
-/// client information, known packs, finish configuration — into the PLAY
+/// server sends, driving the full confirmed choreography - login, ack,
+/// client information, known packs, finish configuration - into the PLAY
 /// state, capturing the join sequence. When `dump_dir` is set, every
 /// packet's FULL body is also written to `pNNN.bin` there (the JSONL head
 /// is truncated; the dumps carry full bodies).
@@ -466,7 +466,7 @@ pub fn login_capture_legs(
         if packs_answered && !play_started && id == 0x03 && body.is_empty() {
             conn.write_packet(0x03, &[])?;
             play_started = true;
-            note = Some("finish configuration; acked — entering play state".into());
+            note = Some("finish configuration; acked - entering play state".into());
         }
         // Keep-alive (S->C play 0x2d): echo the i64
         // challenge back as serverbound 0x1c so the connection survives
@@ -521,7 +521,7 @@ pub fn login_capture_legs(
         }
         // Once the chunk batch closes, run the scripted commands one at a
         // time (unsigned chat_command: serverbound play 0x07; the wire
-        // string has NO leading slash — clients strip it before sending).
+        // string has NO leading slash - clients strip it before sending).
         // Each command waits for the server's system_chat (0x7c) response
         // before the next is sent: a blasted volley makes the reference's
         // command->tick grouping racy, and the final circuit states with
@@ -691,7 +691,7 @@ pub fn login_capture_legs(
             });
             break;
         }
-        // Walk pacing: cross one chunk per step via /tp — vanilla's
+        // Walk pacing: cross one chunk per step via /tp - vanilla's
         // movement speed checks reject raw move packets this fast, but
         // teleports are legal and trigger the same chunk streaming.
         if let (Some(steps), Some((bx, by, bz))) = (walk, walk_base) {

@@ -326,7 +326,8 @@ fn compare_leg(
     let mut cells_equal = 0u64;
 
     for v in captured {
-        let mine = generate_chunk(terrain, well, SEED, v.x, v.z);
+        let mine = generate_chunk(terrain, well, SEED, v.x, v.z)
+            .with_context(|| format!("generating chunk ({}, {})", v.x, v.z))?;
         heights.add_chunk(v, &mine);
         let ours_cells = chunk_cells(&mine, registry);
         let vanilla_cells = chunk_cells(v, registry);
