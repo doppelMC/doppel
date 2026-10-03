@@ -1380,6 +1380,7 @@ mod tests {
                 sequence: 1,
             },
         });
+        g.flush_connections();
         assert_eq!(g.block_label_for_test(5, 100, 5), "minecraft:air[]");
         assert_eq!(g.survival.items.len(), 1, "the torch drop spawned");
         // The pairing: add_entity with the item type + entity data. The

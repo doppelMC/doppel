@@ -769,11 +769,12 @@ pub fn parity_break() -> Result<bool> {
         ));
     }
 
-    // Cross-type same-tick order: every pair vanilla orders the same way
-    // in every shared burst must never draw an opposite vote from doppel
-    // (frame identity differs per server; the sequence does not). Pairs
-    // vanilla splits across bursts carry no evidence and stay unjudged;
-    // the positive-pair count keeps an empty capture from passing.
+    // Cross-type same-tick order: a pair the reference orders unanimously
+    // in at least two bursts is a settled invariant; doppel must never
+    // vote it opposite. Single-burst evidence stays unjudged: one burst
+    // is a timing coincidence on the reference's own side (its reruns
+    // split), so it proves nothing either way. The positive-pair count
+    // keeps an empty capture from passing.
     let mut compared_pairs = 0usize;
     for (stream, vpk, dpk) in [
         ("digger", &v_digger, &d_digger),
@@ -790,7 +791,8 @@ pub fn parity_break() -> Result<bool> {
         let vvotes = order_votes(vpk, vstart);
         let dvotes = order_votes(dpk, dstart);
         for ((lo, hi), [lo_first, hi_first]) in &vvotes {
-            let van_unanimous = (*lo_first == 0) != (*hi_first == 0);
+            let van_votes = lo_first + hi_first;
+            let van_unanimous = van_votes >= 2 && (*lo_first == 0) != (*hi_first == 0);
             if !van_unanimous {
                 continue;
             }

@@ -1851,10 +1851,12 @@ mod tests {
             item: item.to_string(),
             count,
         });
+        g.flush_connections();
     }
 
     fn click(g: &mut Game, click: ContainerClick) {
         g.handle(Inbound::ContainerClick { conn: 0, click });
+        g.flush_connections();
     }
 
     /// The next set_content frame, decoded to (containerId, stateId,

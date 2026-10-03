@@ -622,6 +622,7 @@ mod tests {
             item: item.to_string(),
             count,
         });
+        g.flush_connections();
     }
 
     fn use_on(g: &mut Game, x: i32, y: i32, z: i32, face: u8, hand: u8) {
@@ -637,6 +638,7 @@ mod tests {
             hand,
             sequence: 1,
         });
+        g.flush_connections();
     }
 
     fn at(g: &Game, x: i32, y: i32, z: i32) -> String {
@@ -764,6 +766,7 @@ mod tests {
                 sequence: 1,
             },
         });
+        g.flush_connections();
     }
 
     /// The witness's block_destruction frames as (entity, pos, stage).

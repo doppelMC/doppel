@@ -1438,6 +1438,7 @@ mod tests {
             z: parts[3].parse().unwrap(),
             name: parts[4].to_string(),
         });
+        g.flush_connections();
     }
 
     /// Drains every queued frame.
@@ -1496,6 +1497,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         let fs = frames(&rx);
         // open_screen: containerId 1, menu generic_9x3 (2), then the bare
         // NBT title compound (one "translate" string).
@@ -1531,6 +1533,7 @@ mod tests {
             conn: 0,
             container_id: 1,
         });
+        g.flush_connections();
         let fs = frames(&rx);
         assert!(find_frame(&fs, PACKET_CONTAINER_CLOSE).is_none());
         g.tick_once_for_test();
@@ -1566,6 +1569,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         let fs = frames(&rx);
         let open = find_frame(&fs, PACKET_OPEN_SCREEN).expect("open_screen");
         assert_eq!(open[1], MENU_GENERIC_9X6 as u8, "double chest is 9x6");
@@ -1578,12 +1582,14 @@ mod tests {
             item: "minecraft:stone".to_string(),
             count: 64,
         });
+        g.flush_connections();
         frames(&rx);
         // Player hotbar container 0 = menu slot 54 + 27 = 81.
         g.handle(Inbound::ContainerClick {
             conn: 0,
             click: click_raw(1, 2, 81, 0, crate::inventory::ClickKind::QuickMove),
         });
+        g.flush_connections();
         let fs = frames(&rx);
         let content = find_frame(&fs, PACKET_CONTAINER_SET_CONTENT).expect("set_content");
         let (_, _, slots, _) = crate::inventory::decode_container_set_content(&content).unwrap();
@@ -1604,11 +1610,13 @@ mod tests {
             conn: 0,
             click: click_raw(1, 3, 0, 0, crate::inventory::ClickKind::Pickup),
         });
+        g.flush_connections();
         frames(&rx);
         g.handle(Inbound::ContainerClick {
             conn: 0,
             click: click_raw(1, 4, 27, 0, crate::inventory::ClickKind::Pickup),
         });
+        g.flush_connections();
         let fs = frames(&rx);
         let content = find_frame(&fs, PACKET_CONTAINER_SET_CONTENT).expect("set_content");
         let (_, _, slots, _) = crate::inventory::decode_container_set_content(&content).unwrap();
@@ -1635,6 +1643,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         let fs = frames(&rx);
         let content = find_frame(&fs, PACKET_CONTAINER_SET_CONTENT).expect("set_content");
         let (_, _, slots, _) = crate::inventory::decode_container_set_content(&content).unwrap();
@@ -1975,6 +1984,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         frames(&rx);
         g.container_set_for_test((10, 100, 10), 0, stone());
         cmd(&mut g, "setblock 10 100 10 minecraft:air");
@@ -2050,6 +2060,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         let fs = frames(&rx);
         assert!(
             find_frame(&fs, PACKET_OPEN_SCREEN).is_none(),
@@ -2072,6 +2083,7 @@ mod tests {
             y: 100,
             z: 10,
         });
+        g.flush_connections();
         frames(&rx);
         // Far away: the next tick closes the menu server-side.
         g.teleport_player_for_test(0, 0.5, 0.5, 0.5);

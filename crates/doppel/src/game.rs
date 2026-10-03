@@ -226,6 +226,12 @@ pub struct Game {
     viewers: std::collections::BTreeMap<(i32, i32), Vec<ConnId>>,
     inbound: Receiver<Inbound>,
     outbounds: HashMap<ConnId, Sender<Outbound>>,
+    /// Frames buffered since the last connection flush (once per tick).
+    pending_frames: Vec<(ConnId, i32, Vec<u8>)>,
+    /// True inside a stepped-tick batch: per-tick flushes defer to one
+    /// flush after the batch (the reference flushes once per server
+    /// cycle, and a step batch is one cycle).
+    flush_suspended: bool,
     world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
     blobs: Option<std::sync::Arc<Blobs>>,
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
@@ -363,6 +369,8 @@ impl Game {
             viewers: std::collections::BTreeMap::new(),
             inbound,
             outbounds: HashMap::new(),
+            pending_frames: Vec::new(),
+            flush_suspended: false,
             world,
             blobs,
             dirty: std::collections::BTreeMap::new(),
@@ -430,6 +438,12 @@ impl Game {
                 if !self.frozen {
                     self.game_tick();
                 }
+                // One wire flush per cycle, always: the reference
+                // suspends connection flushing for the whole server tick
+                // (world work, stepped batches, and command handling all
+                // included) and flushes once after it. Nothing flushes
+                // off-cycle.
+                self.flush_connections();
                 self.tick_keep_alives();
                 next_tick += TICK;
             }
@@ -468,6 +482,9 @@ impl Game {
     ///     same block-entity phase (block entities interleave by
     ///     insertion order there, not by kind)
     /// 13. flush_block_entities (containers.rs): block entity data
+    ///     packets for changed block entities.
+    /// 14. flush_connections: the once-per-tick wire drain (the
+    ///     reference flushes every connection after the world tick).
     ///     syncs
     ///
     /// Reference loop slots with no implementation yet, in order: the
@@ -518,6 +535,9 @@ impl Game {
         // --- containers hooks (containers.rs) ---
         // Changed block entities sync their data packet.
         self.flush_block_entities();
+        // Connection flush: one wire drain per tick, after all world
+        // work (the reference's post-tick flushQueue).
+        self.flush_connections();
     }
 
     /// set_time (0x73): gameTime i64 + day counter, every 20 ticks.
@@ -755,10 +775,15 @@ impl Game {
             Inbound::TickStep { conn, steps } => {
                 // Run the stepped ticks inline: commands queued behind this
                 // event in the same channel batch land on later ticks,
-                // matching vanilla's `tick step` barrier.
+                // matching vanilla's `tick step` barrier. The whole step
+                // batch shares ONE connection flush: stepped ticks execute
+                // inside a single server cycle, and the reference flushes
+                // once after it.
+                self.flush_suspended = true;
                 for _ in 0..steps {
                     self.game_tick();
                 }
+                self.flush_suspended = false;
                 self.send_command_feedback(conn);
             }
             Inbound::TickFreeze { conn, frozen } => {
@@ -1905,11 +1930,24 @@ impl Game {
 
     // pub(crate) for the inventory module's broadcast helpers.
     pub(crate) fn send(&mut self, conn: ConnId, id: i32, body: &[u8]) {
-        if let Some(tx) = self.outbounds.get(&conn) {
-            let _ = tx.send(Outbound::Frame {
-                id,
-                body: body.to_vec(),
-            });
+        // The reference suspends per-connection flushing for the duration
+        // of the world tick and flushes once after it; buffering here and
+        // draining at the tick end reproduces that pacing (frames leave
+        // in identical order, once per tick).
+        self.pending_frames.push((conn, id, body.to_vec()));
+    }
+
+    /// The once-per-tick connection flush: everything buffered this tick
+    /// hits the writer channels in order.
+    pub(crate) fn flush_connections(&mut self) {
+        if self.flush_suspended || self.pending_frames.is_empty() {
+            return;
+        }
+        let frames = std::mem::take(&mut self.pending_frames);
+        for (conn, id, body) in frames {
+            if let Some(tx) = self.outbounds.get(&conn) {
+                let _ = tx.send(Outbound::Frame { id, body });
+            }
         }
     }
 

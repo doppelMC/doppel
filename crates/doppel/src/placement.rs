@@ -630,6 +630,7 @@ mod tests {
             item: item.to_string(),
             count,
         });
+        g.flush_connections();
     }
 
     fn look(g: &mut Game, yaw: f32, pitch: f32) {
@@ -653,6 +654,7 @@ mod tests {
             hand,
             sequence: 1,
         });
+        g.flush_connections();
     }
 
     fn click_swap(g: &mut Game, menu_slot: i16, button: i8) {
