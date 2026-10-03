@@ -822,7 +822,7 @@ pub fn parity_break() -> Result<bool> {
                         let firsts: std::collections::BTreeMap<char, u128> =
                             burst.iter().map(|(l, _, t)| (*l, *t)).collect();
                         if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
-                            if bt < at {
+                            if at < bt {
                                 println!(
                                     "  {stream} opposite burst: {}",
                                     burst
