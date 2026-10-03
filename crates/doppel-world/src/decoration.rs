@@ -41,9 +41,12 @@ const LAYERS: usize = SECTION_SPAN * 16;
 // The decoration random.
 // ---------------------------------------------------------------------------
 
-/// The decoration random: the rotate-xor stream reseeded per stage.
+/// The decoration random: the rotate-xor stream reseeded per stage, with
+/// every draw sliced from the high bits of one stream step.
 pub struct DecorRng {
     rng: Xoroshiro,
+    /// Stream steps consumed so far; reseed does not clear it.
+    pub(crate) words: u64,
 }
 
 impl Default for DecorRng {
@@ -56,6 +59,7 @@ impl DecorRng {
     pub fn new() -> DecorRng {
         DecorRng {
             rng: Xoroshiro::new(-7046029254386353131, 0),
+            words: 0,
         }
     }
 
@@ -63,23 +67,41 @@ impl DecorRng {
         self.rng.set_seed_wide(seed);
     }
 
-    pub fn next_long(&mut self) -> i64 {
-        self.rng.next_long()
+    /// One draw slice: the high `bits` bits of one stream step.
+    fn next(&mut self, bits: u32) -> i32 {
+        self.words += 1;
+        (self.rng.next_long() as u64 >> (64 - bits)) as u32 as i32
     }
 
-    /// The wide-multiply draw with rejection for bias.
+    pub fn next_long(&mut self) -> i64 {
+        let upper = self.next(32) as i64;
+        let lower = self.next(32) as i64;
+        (upper << 32).wrapping_add(lower)
+    }
+
+    /// The modulo draw with rejection for bias; power-of-two bounds take
+    /// the scaled product path.
     pub fn next_int(&mut self, bound: i32) -> i32 {
         debug_assert!(bound > 0);
-        self.rng.next_int(bound)
+        if bound & bound.wrapping_sub(1) == 0 {
+            return ((bound as i64 * self.next(31) as i64) >> 31) as i32;
+        }
+        loop {
+            let sample = self.next(31);
+            let value = sample % bound;
+            if sample.wrapping_sub(value).wrapping_add(bound - 1) >= 0 {
+                return value;
+            }
+        }
     }
 
     pub fn next_f32(&mut self) -> f32 {
-        self.rng.next_f32()
+        self.next(24) as f32 * (1.0 / (1u64 << 24) as f32)
     }
 
-    /// The boolean draw: the low bit of one full stream step.
+    /// The boolean draw: the high bit of one stream step.
     pub fn next_bool(&mut self) -> bool {
-        self.rng.next_long() & 1 == 1
+        self.next(1) != 0
     }
 
     /// The per-chunk decoration seed: two odd draws scale the chunk
@@ -139,6 +161,9 @@ pub(crate) enum IntDraw {
         total: i32,
         entries: Vec<(i32, IntDraw)>,
     },
+    /// Recognized but never sampled: the modifier carrying one is
+    /// unsupported and its feature skips.
+    Unsupported,
 }
 
 impl IntDraw {
@@ -196,6 +221,7 @@ impl IntDraw {
                 }
                 Ok(IntDraw::Weighted { total, entries })
             }
+            "minecraft:clamped_normal" => Ok(IntDraw::Unsupported),
             other => bail!("unsupported integer draw {other}"),
         }
     }
@@ -231,7 +257,16 @@ impl IntDraw {
                 }
                 entries[entries.len() - 1].1.sample(rng)
             }
+            IntDraw::Unsupported => {
+                debug_assert!(false, "unsupported draw sampled");
+                0
+            }
         }
+    }
+
+    /// Whether the draw never samples (its modifier is unsupported).
+    pub(crate) fn is_unsupported(&self) -> bool {
+        matches!(self, IntDraw::Unsupported)
     }
 }
 
@@ -284,6 +319,12 @@ enum Anchor {
 
 impl Anchor {
     fn parse(v: &Value) -> Result<Anchor> {
+        let Some(fields) = v.as_object() else {
+            bail!("anchor is not an object");
+        };
+        if fields.len() != 1 {
+            bail!("anchor needs exactly one field, found {}", fields.len());
+        }
         if let Some(n) = v.get("absolute").and_then(Value::as_i64) {
             return Ok(Anchor::Absolute(n as i32));
         }
@@ -329,6 +370,8 @@ pub(crate) enum Predicate {
     AnyOf(Vec<Predicate>),
     Not(Box<Predicate>),
     True,
+    /// Recognized but never true: the filter leg carrying one refuses.
+    Unsupported,
 }
 
 fn predicate_offset(v: &Value) -> [i32; 3] {
@@ -405,6 +448,9 @@ impl Predicate {
                 v.get("predicate").context("not predicate")?,
             )?))),
             "minecraft:true" => Ok(Predicate::True),
+            "minecraft:has_sturdy_face" | "minecraft:solid" | "minecraft:volume_match" => {
+                Ok(Predicate::Unsupported)
+            }
             other => bail!("unsupported predicate {other}"),
         }
     }
@@ -438,9 +484,13 @@ impl Modifier {
     fn parse(v: &Value) -> Result<Modifier> {
         let kind = v.get("type").and_then(Value::as_str).context("modifier")?;
         match kind {
-            "minecraft:count" => Ok(Modifier::Count(IntDraw::parse(
-                v.get("count").context("count")?,
-            )?)),
+            "minecraft:count" => {
+                let draw = IntDraw::parse(v.get("count").context("count")?)?;
+                if draw.is_unsupported() {
+                    return Ok(Modifier::Unsupported);
+                }
+                Ok(Modifier::Count(draw))
+            }
             "minecraft:rarity_filter" => Ok(Modifier::Rarity(
                 v.get("chance")
                     .and_then(Value::as_i64)
@@ -464,11 +514,18 @@ impl Modifier {
                     max: Anchor::parse(height.get("max_inclusive").context("range max")?)?,
                 })
             }
-            "minecraft:offset" => Ok(Modifier::Offset(
-                IntDraw::parse(v.get("x").context("offset x")?)?,
-                IntDraw::parse(v.get("y").context("offset y")?)?,
-                IntDraw::parse(v.get("z").context("offset z")?)?,
-            )),
+            "minecraft:offset" => {
+                let draws = [
+                    IntDraw::parse(v.get("x").context("offset x")?)?,
+                    IntDraw::parse(v.get("y").context("offset y")?)?,
+                    IntDraw::parse(v.get("z").context("offset z")?)?,
+                ];
+                if draws.iter().any(IntDraw::is_unsupported) {
+                    return Ok(Modifier::Unsupported);
+                }
+                let [x, y, z] = draws;
+                Ok(Modifier::Offset(x, y, z))
+            }
             "minecraft:surface_water_depth_filter" => Ok(Modifier::WaterDepth(
                 v.get("max_water_depth")
                     .and_then(Value::as_i64)
@@ -497,7 +554,9 @@ impl Modifier {
             | "minecraft:noise_based_count"
             | "minecraft:noise_threshold_count"
             | "minecraft:random_chance"
-            | "minecraft:randomly_selected" => Ok(Modifier::Unsupported),
+            | "minecraft:randomly_selected"
+            | "minecraft:cuboid"
+            | "minecraft:fixed_placement" => Ok(Modifier::Unsupported),
             other => bail!("unsupported placement modifier {other}"),
         }
     }
@@ -875,6 +934,12 @@ pub struct Decorator<'a> {
     /// Probe of the placements that reached a feature, for tests.
     #[cfg(test)]
     pub(crate) visits: Option<Vec<(String, i32, i32, i32)>>,
+    /// Probe of the stream word count at each placement, for tests.
+    #[cfg(test)]
+    pub(crate) try_words: Option<Vec<u64>>,
+    /// Probe of the ground-scatter verdicts, for tests.
+    #[cfg(test)]
+    pub(crate) scatter_log: Option<Vec<String>>,
     /// One plan feature decoration skips entirely, for tests.
     #[cfg(test)]
     pub(crate) skip: Option<usize>,
@@ -882,6 +947,9 @@ pub struct Decorator<'a> {
     /// reseeds from instead of the plan position, for tests.
     #[cfg(test)]
     pub(crate) seed_override: Option<(usize, i32, i32)>,
+    /// One step the driver runs, for tests.
+    #[cfg(test)]
+    pub(crate) only_step: Option<usize>,
 }
 
 impl<'a> Decorator<'a> {
@@ -895,7 +963,7 @@ impl<'a> Decorator<'a> {
         let pins = crate::density::locate_pins()?;
         let table = BiomeTable::load(&pins)?;
         let plan = FeaturePlan::build(&pins, &table)?;
-        Ok(Decorator {
+        let mut dec = Decorator {
             terrain,
             world_seed,
             plan,
@@ -911,10 +979,278 @@ impl<'a> Decorator<'a> {
             #[cfg(test)]
             visits: None,
             #[cfg(test)]
+            try_words: None,
+            #[cfg(test)]
+            scatter_log: None,
+            #[cfg(test)]
             skip: None,
             #[cfg(test)]
             seed_override: None,
-        })
+            #[cfg(test)]
+            only_step: None,
+        };
+        dec.validate_pins()?;
+        Ok(dec)
+    }
+
+    /// Loads every plan feature and validates the configs they reach: a
+    /// missing pin, an unrecognized kind, or a malformed selector fails
+    /// here instead of skipping silently at placement time.
+    fn validate_pins(&mut self) -> Result<()> {
+        for key in 0..self.plan.names.len() {
+            if self.load_feature(key).is_none() {
+                bail!("placed feature {} failed to load", self.plan.names[key]);
+            }
+        }
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for key in 0..self.plan.names.len() {
+            let cfg = self
+                .load_feature(key)
+                .expect("loaded in the pass above")
+                .clone();
+            let name = self.plan.names[key].clone();
+            self.validate_feature_value(&cfg.feature, &mut seen)
+                .with_context(|| format!("validating placed feature {name}"))?;
+        }
+        Ok(())
+    }
+
+    /// Whether a pin file exists under the given directory.
+    fn pin_exists(&self, dir: &str, key: &str) -> bool {
+        self.pins.join(dir).join(format!("{key}.json")).exists()
+    }
+
+    /// Validates one feature config: a pinned id resolves, the kind is
+    /// placed or explicitly unplaced, selectors carry well formed entries,
+    /// and every nested reference recurses. References the pin snapshot
+    /// flattened out of their subdirectory (ids carrying a slash) accept as
+    /// unplaced; a missing flat-named pin fails the load.
+    fn validate_feature_value(&mut self, v: &Value, seen: &mut BTreeSet<String>) -> Result<()> {
+        match v {
+            Value::String(id) => {
+                let key = id.strip_prefix("minecraft:").unwrap_or(id);
+                if !seen.insert(format!("feature:{key}")) {
+                    return Ok(());
+                }
+                if !self.pin_exists("feature", key) {
+                    if key.contains('/') {
+                        return Ok(());
+                    }
+                    bail!("missing feature config {key}");
+                }
+                let cfg = self
+                    .load_feature_config(key)
+                    .with_context(|| format!("feature config {key} failed to parse"))?;
+                self.validate_feature_value(&cfg, seen)
+            }
+            Value::Object(_) => {
+                let kind = v
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .context("feature type")?;
+                if features::UNPLACED_FEATURE_KINDS.contains(&kind) {
+                    return Ok(());
+                }
+                match kind {
+                    "minecraft:random_selector" => {
+                        let list = v
+                            .get("features")
+                            .and_then(Value::as_array)
+                            .context("selector list")?;
+                        if list.is_empty() {
+                            bail!("random selector without entries");
+                        }
+                        for entry in list {
+                            if !entry.get("chance").is_some_and(Value::is_number) {
+                                bail!("random selector entry without a numeric chance");
+                            }
+                            self.validate_placed_ref(
+                                entry.get("feature").context("selector feature")?,
+                                seen,
+                            )?;
+                        }
+                        self.validate_placed_ref(
+                            v.get("default").context("selector default")?,
+                            seen,
+                        )
+                    }
+                    "minecraft:simple_random_selector" => {
+                        let list = v
+                            .get("features")
+                            .and_then(Value::as_array)
+                            .context("selector list")?;
+                        if list.is_empty() {
+                            bail!("simple selector without entries");
+                        }
+                        for entry in list {
+                            self.validate_placed_ref(entry, seen)?;
+                        }
+                        Ok(())
+                    }
+                    "minecraft:weighted_random_selector" => {
+                        let list = v
+                            .get("features")
+                            .and_then(Value::as_array)
+                            .context("selector list")?;
+                        if list.is_empty() {
+                            bail!("weighted selector without entries");
+                        }
+                        let mut total = 0i64;
+                        for entry in list {
+                            let weight = entry
+                                .get("weight")
+                                .and_then(Value::as_i64)
+                                .context("weighted entry weight")?;
+                            if weight <= 0 {
+                                bail!("weighted entry needs a positive weight");
+                            }
+                            total += weight;
+                            self.validate_placed_ref(
+                                entry.get("data").context("weighted data")?,
+                                seen,
+                            )?;
+                        }
+                        if total > i32::MAX as i64 {
+                            bail!("weighted selector total weight overflows a draw");
+                        }
+                        Ok(())
+                    }
+                    "minecraft:tree" => {
+                        let unplaced_shape = |v: &Value, key: &str| {
+                            v.get(key)
+                                .and_then(|s| s.get("type"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| features::UNPLACED_TREE_SHAPES.contains(&t))
+                        };
+                        let mut unplaced = unplaced_shape(v, "trunk_placer")
+                            || unplaced_shape(v, "foliage_placer");
+                        for deco in v
+                            .get("decorators")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if deco
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| features::UNPLACED_TREE_SHAPES.contains(&t))
+                            {
+                                unplaced = true;
+                            }
+                        }
+                        if unplaced {
+                            return Ok(());
+                        }
+                        if features::parse_tree(self, v).is_some() {
+                            Ok(())
+                        } else {
+                            bail!("tree config rejected by the parser")
+                        }
+                    }
+                    "minecraft:fallen_tree" => {
+                        let unplaced = ["log_decorators", "stump_decorators"].iter().any(|key| {
+                            v.get(key)
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .any(|deco| {
+                                    deco.get("type").and_then(Value::as_str).is_some_and(|t| {
+                                        features::UNPLACED_TREE_SHAPES.contains(&t)
+                                    })
+                                })
+                        });
+                        if unplaced {
+                            return Ok(());
+                        }
+                        if features::parse_fallen(self, v).is_some() {
+                            Ok(())
+                        } else {
+                            bail!("fallen tree config rejected by the parser")
+                        }
+                    }
+                    "minecraft:huge_brown_mushroom" | "minecraft:huge_red_mushroom" => {
+                        let red = kind.ends_with("red_mushroom");
+                        if features::parse_mushroom(self, v, red).is_some() {
+                            Ok(())
+                        } else {
+                            bail!("mushroom config rejected by the parser")
+                        }
+                    }
+                    "minecraft:simple_block" => {
+                        if v.get("to_place").is_some() {
+                            Ok(())
+                        } else {
+                            bail!("simple block without a provider")
+                        }
+                    }
+                    "minecraft:block_column" => {
+                        let direction = v
+                            .get("direction")
+                            .and_then(Value::as_str)
+                            .context("column direction")?;
+                        if direction != "up" && direction != "down" {
+                            bail!("unsupported column direction {direction}");
+                        }
+                        let layers = v
+                            .get("layers")
+                            .and_then(Value::as_array)
+                            .context("column layers")?;
+                        if layers.is_empty() {
+                            bail!("column without layers");
+                        }
+                        if v.get("allowed_placement").is_none() {
+                            bail!("column without an allowed placement predicate");
+                        }
+                        Ok(())
+                    }
+                    "minecraft:multiface_growth" => {
+                        v.get("block")
+                            .and_then(Value::as_str)
+                            .context("multiface block")?;
+                        let surfaces = v.get("can_be_placed_on");
+                        let empty = surfaces
+                            .and_then(Value::as_array)
+                            .is_some_and(|l| l.is_empty());
+                        if surfaces.is_none() || empty {
+                            bail!("multiface growth without surfaces");
+                        }
+                        Ok(())
+                    }
+                    other => bail!("unsupported feature kind {other}"),
+                }
+            }
+            _ => bail!("unsupported feature reference"),
+        }
+    }
+
+    /// Validates a placed feature reference: a pinned id loads with a
+    /// placement stack that parses, an inline object parses directly, and
+    /// the wrapped feature config recurses. Slash-path ids the pin snapshot
+    /// flattened away accept as unplaced.
+    fn validate_placed_ref(&mut self, v: &Value, seen: &mut BTreeSet<String>) -> Result<()> {
+        match v {
+            Value::String(id) => {
+                let key = id.strip_prefix("minecraft:").unwrap_or(id);
+                if !seen.insert(format!("placed:{key}")) {
+                    return Ok(());
+                }
+                if !self.pin_exists("placed_feature", key) {
+                    if key.contains('/') {
+                        return Ok(());
+                    }
+                    bail!("missing placed feature {key}");
+                }
+                let cfg = self
+                    .load_named(key)
+                    .with_context(|| format!("placed feature {key} failed to parse"))?;
+                self.validate_feature_value(&cfg.feature, seen)
+            }
+            Value::Object(_) => {
+                let cfg = PlacedFeatureCfg::from_value(v)?;
+                self.validate_feature_value(&cfg.feature, seen)
+            }
+            _ => bail!("unsupported placed feature reference"),
+        }
     }
 
     /// The number of placement steps in the plan.
@@ -1008,6 +1344,10 @@ impl<'a> Decorator<'a> {
         let mut rng = DecorRng::new();
         let decoration_seed = rng.decoration_seed(self.world_seed, cx * EDGE, cz * EDGE);
         for step in 0..self.plan.steps.len() {
+            #[cfg(test)]
+            if self.only_step.is_some_and(|only| only != step) {
+                continue;
+            }
             let mut indices: BTreeSet<usize> = BTreeSet::new();
             for biome in &possible {
                 indices.extend(self.plan.step_indices(*biome, step));
@@ -1143,7 +1483,7 @@ impl<'a> Decorator<'a> {
     /// Runs the configured feature at one resolved position.
     fn place_final(
         &mut self,
-        _name: &str,
+        name: &str,
         feature: &Value,
         rng: &mut DecorRng,
         x: i32,
@@ -1152,11 +1492,25 @@ impl<'a> Decorator<'a> {
     ) {
         #[cfg(test)]
         if let Some(log) = self.visits.as_mut() {
-            if !_name.is_empty() {
-                log.push((_name.to_string(), x, y, z));
+            if !name.is_empty() {
+                log.push((name.to_string(), x, y, z));
             }
         }
+        #[cfg(not(test))]
+        let _ = name;
+        #[cfg(test)]
+        if let Some(words) = self.try_words.as_mut() {
+            words.push(rng.words);
+        }
+        #[cfg(test)]
+        if let Some(log) = self.scatter_log.as_mut() {
+            log.push(format!("try {name} ({x},{y},{z}) start w{}", rng.words));
+        }
         features::run_feature(self, feature, rng, x, y, z);
+        #[cfg(test)]
+        if let Some(log) = self.scatter_log.as_mut() {
+            log.push(format!("try {name} end w{}", rng.words));
+        }
     }
 
     /// Loads (and caches) a placed feature config; None marks a pin that
@@ -1312,7 +1666,7 @@ impl<'a> Decorator<'a> {
     }
 
     /// Emits the chunk as a wire chunk from its current buffer.
-    pub fn emit(&mut self, cx: i32, cz: i32) -> WireChunk {
+    pub fn emit(&mut self, cx: i32, cz: i32) -> Result<WireChunk> {
         self.ensure_chunk(cx, cz);
         let chunk = self.chunks.get(&(cx, cz)).expect("ensured above");
         let blocks = chunk.blocks.clone();
@@ -1501,8 +1855,1108 @@ mod tests {
             .collect()
     }
 
-    /// Compares one decorated chunk against the captured vanilla chunk and
-    /// prints the divergent cells.
+    /// Prints the surface litter cells of the first vegetation tree's
+    /// scatter box against the capture: which columns hold litter in each
+    /// run and which state, so the first divergent placement stands out.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_scatter_cells() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let mut by_pos: Vec<((i32, i32), Vec<u32>)> = Vec::new();
+        for (_, pos, cells) in &hits {
+            by_pos.push((*pos, wire_cells(cells)));
+        }
+        let mut order: Vec<(i32, i32)> = hits.iter().map(|(_, pos, _)| *pos).collect();
+        order.dedup();
+        if order.len() != 9 {
+            order = (target.0 - 1..=target.0 + 1)
+                .flat_map(|x| (target.1 - 1..=target.1 + 1).map(move |z| (x, z)))
+                .collect();
+            by_pos.clear();
+        }
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        for &(cx, cz) in &order {
+            dec.decorate(cx, cz);
+        }
+        let describe = |state: u32| -> String {
+            reg.state_of(state)
+                .map_or("unknown".into(), |(n, p)| format!("{n}[{p}]"))
+        };
+        let read = |cells: &[((i32, i32), Vec<u32>)], wx: i32, wz: i32, y: i32| -> u32 {
+            let cx = wx.div_euclid(16);
+            let cz = wz.div_euclid(16);
+            for (pos, data) in cells {
+                if pos.0 == cx && pos.1 == cz {
+                    let lx = (wx - cx * 16) as usize;
+                    let lz = (wz - cz * 16) as usize;
+                    let layer = (y - MIN_Y) as usize;
+                    return data[layer * COLUMNS + lz * 16 + lx];
+                }
+            }
+            0
+        };
+        let mut ours: Vec<((i32, i32), Vec<u32>)> = Vec::new();
+        for &(cx, cz) in &order {
+            let chunk = dec.emit(cx, cz).unwrap();
+            ours.push(((cx, cz), wire_cells(&chunk)));
+        }
+        // Tree one stands at local (7,11); its scatter box spans local
+        // x 3..12 and z 7..16, y range base-2..base+2 with base 63.
+        for lz in 6..=17i32 {
+            let mut row = String::new();
+            for lx in 2..=13i32 {
+                let wx = target.0 * 16 + lx;
+                let wz = target.1 * 16 + lz;
+                let a = read(&ours, wx, wz, 63);
+                let b = read(&by_pos, wx, wz, 63);
+                let mark = if a == b { '.' } else { '!' };
+                let short = |s: &str| -> String {
+                    s.trim_start_matches("minecraft:")
+                        .replace(",facing", " f")
+                        .replace(",segment_amount=", "s")
+                };
+                row.push_str(&format!(
+                    "{mark}{}:{:>18}|{:>18} ",
+                    if lz == 16 { '>' } else { ' ' },
+                    short(&describe(a)),
+                    short(&describe(b))
+                ));
+            }
+            println!("z{lz:2} {row}");
+        }
+    }
+
+    /// Compares the terrain-only surface of every dump column against the
+    /// capture: the highest non-air block of the undecorated region versus
+    /// the capture's ground layer, skipping columns the capture's features
+    /// occupy, so terrain height drift shows up per column.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_terrain_surface() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let mut order: Vec<(i32, i32)> = hits.iter().map(|(_, pos, _)| *pos).collect();
+        order.dedup();
+        if order.len() != 9 {
+            order = (target.0 - 1..=target.0 + 1)
+                .flat_map(|x| (target.1 - 1..=target.1 + 1).map(move |z| (x, z)))
+                .collect();
+        }
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        let mut ours: Vec<((i32, i32), Vec<u32>)> = Vec::new();
+        for &(cx, cz) in &order {
+            let chunk = dec.emit(cx, cz).unwrap();
+            ours.push(((cx, cz), wire_cells(&chunk)));
+        }
+        let name_of = |cells: &[((i32, i32), Vec<u32>)], wx: i32, wz: i32, y: i32| -> String {
+            let cx = wx.div_euclid(16);
+            let cz = wz.div_euclid(16);
+            for (pos, data) in cells {
+                if pos.0 == cx && pos.1 == cz {
+                    let lx = (wx - cx * 16) as usize;
+                    let lz = (wz - cz * 16) as usize;
+                    let layer = (y - MIN_Y) as usize;
+                    let state = data[layer * COLUMNS + lz * 16 + lx];
+                    return reg
+                        .state_of(state)
+                        .map_or("unknown".into(), |(n, _)| n.to_string());
+                }
+            }
+            "missing".into()
+        };
+        let top_non_air = |cells: &[((i32, i32), Vec<u32>)], wx: i32, wz: i32| -> i32 {
+            let cx = wx.div_euclid(16);
+            let cz = wz.div_euclid(16);
+            for (pos, data) in cells {
+                if pos.0 == cx && pos.1 == cz {
+                    let lx = (wx - cx * 16) as usize;
+                    let lz = (wz - cz * 16) as usize;
+                    for layer in (0..LAYERS).rev() {
+                        let state = data[layer * COLUMNS + lz * 16 + lx];
+                        let name = reg.state_of(state).map_or("", |(n, _)| n);
+                        if name != "minecraft:air" {
+                            return MIN_Y + layer as i32;
+                        }
+                    }
+                }
+            }
+            MIN_Y
+        };
+        // Ground blocks in the capture that reveal the terrain layer even
+        // under placed features; feature-cover columns are skipped.
+        let ground = [
+            "minecraft:grass_block",
+            "minecraft:dirt",
+            "minecraft:coarse_dirt",
+            "minecraft:podzol",
+            "minecraft:stone",
+            "minecraft:gravel",
+            "minecraft:clay",
+            "minecraft:water",
+            "minecraft:sand",
+        ];
+        let feature_cover = [
+            "minecraft:dark_oak_log",
+            "minecraft:oak_log",
+            "minecraft:birch_log",
+            "minecraft:dark_oak_leaves",
+            "minecraft:oak_leaves",
+            "minecraft:birch_leaves",
+        ];
+        let mut diff = 0usize;
+        let mut same = 0usize;
+        let mut hist: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        for (_, pos, cells) in &hits {
+            let theirs = wire_cells(cells);
+            let _ = pos;
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let wx = pos.0 * 16 + lx as i32;
+                    let wz = pos.1 * 16 + lz as i32;
+                    // Find the capture's ground layer: the highest cell that
+                    // is a ground block or a ground plant, then the block
+                    // under it.
+                    let mut van_top = None;
+                    for layer in (0..LAYERS).rev() {
+                        let state = theirs[layer * COLUMNS + lz * 16 + lx];
+                        let name = reg.state_of(state).map_or("", |(n, _)| n);
+                        if feature_cover.contains(&name) {
+                            continue;
+                        }
+                        if name == "minecraft:air" {
+                            continue;
+                        }
+                        van_top = Some((MIN_Y + layer as i32, name.to_string()));
+                        break;
+                    }
+                    let Some((vy, vname)) = van_top else {
+                        continue;
+                    };
+                    if !ground.contains(&vname.as_str()) {
+                        // Litter, grass, mushrooms: the ground is below.
+                        continue;
+                    }
+                    let oy = top_non_air(&ours, wx, wz);
+                    let oname = name_of(&ours, wx, wz, oy);
+                    if !ground.contains(&oname.as_str()) {
+                        continue;
+                    }
+                    let d = vy - oy;
+                    *hist.entry(d).or_default() += 1;
+                    if d == 0 {
+                        same += 1;
+                    } else {
+                        diff += 1;
+                        // The four cells under a trunk base: soil rings read
+                        // as +1 ground but are feature placements.
+                        let below = if vy - 1 > MIN_Y {
+                            let state = theirs[(vy - 1 - MIN_Y) as usize * COLUMNS + lz * 16 + lx];
+                            reg.state_of(state).map_or("", |(n, _)| n)
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  ({wx},{wz}) d={d} vanilla {vname}@{vy} over {below} ours {oname}@{oy}"
+                        );
+                    }
+                }
+            }
+        }
+        println!("terrain ground columns: same {same}, diff {diff}");
+        println!("delta histogram {hist:?}");
+    }
+
+    /// Prints the ground-scatter verdicts of the first tree's two litter
+    /// passes: every try position, the verdict, and the heightmap read,
+    /// then matches the placed cells against the capture's final states.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_scatter_trace() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let vanilla = hits
+            .iter()
+            .find(|(_, pos, _)| *pos == target)
+            .map(|(_, _, chunk)| wire_cells(chunk))
+            .expect("target chunk in the capture dump");
+        let read_vanilla = |wx: i32, y: i32, wz: i32| -> String {
+            let lx = (wx - target.0 * 16) as usize;
+            let lz = (wz - target.1 * 16) as usize;
+            if lx > 15 || lz > 15 || y <= MIN_Y {
+                return "outside".into();
+            }
+            let state = vanilla[(y - MIN_Y) as usize * COLUMNS + lz * 16 + lx];
+            reg.state_of(state)
+                .map_or("unknown".into(), |(n, p)| format!("{n}[{p}]"))
+        };
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        dec.scatter_log = Some(Vec::new());
+        dec.decorate(target.0, target.1);
+        let log = dec.scatter_log.take().unwrap_or_default();
+        println!("{} scatter entries in the target chunk", log.len());
+        // Vanilla trunk bases: columns whose y-63..64 cells hold dark oak
+        // logs, clustered as 2x2 groups.
+        {
+            let log_id = |y: i32, x: i32, z: i32| {
+                read_vanilla(x, y, z).starts_with("minecraft:dark_oak_log")
+            };
+            let mut bases: Vec<(i32, i32)> = Vec::new();
+            for lz in 0..15i32 {
+                for lx in 0..15i32 {
+                    let (wx, wz) = (target.0 * 16 + lx, target.1 * 16 + lz);
+                    for y in [63i32, 64, 65, 66] {
+                        if log_id(y, wx, wz)
+                            && log_id(y, wx + 1, wz)
+                            && log_id(y, wx, wz + 1)
+                            && log_id(y, wx + 1, wz + 1)
+                        {
+                            let local = (lx, lz);
+                            if !bases.contains(&local) {
+                                bases.push(local);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            println!("vanilla trunk 2x2 bases (local): {bases:?}");
+        }
+        for (i, entry) in log.iter().enumerate() {
+            if entry.contains("dark_forest")
+                || entry.starts_with("tree ")
+                || entry.starts_with("pass")
+            {
+                println!("mark {i:4} {entry}");
+            }
+        }
+        // The first tree's two scatter passes, verdict by verdict.
+        if let Some(first) = log.iter().position(|e| e.starts_with("pass")) {
+            for (i, entry) in log.iter().skip(first).take(250).enumerate() {
+                println!("v{i:3} {entry}");
+            }
+        }
+        // Pass markers split the log; each pass logs one verdict per try.
+        let mut passes: Vec<(usize, usize, [i32; 6], i64)> = Vec::new();
+        for (i, entry) in log.iter().enumerate() {
+            if entry.starts_with("pass") {
+                let nums: Vec<i32> = entry
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<i32>().ok())
+                    .collect();
+                let words = entry
+                    .split_whitespace()
+                    .find_map(|t| t.strip_prefix('w'))
+                    .and_then(|t| t.parse::<i64>().ok())
+                    .unwrap_or(0);
+                // tries, x0, x1, y0, y1, z0, z1
+                passes.push((
+                    i,
+                    nums[0] as usize,
+                    [nums[1], nums[2], nums[3], nums[4], nums[5], nums[6]],
+                    words,
+                ));
+            }
+            if entry.starts_with("tree (") {
+                println!("tree marker {i}: {entry}");
+            }
+        }
+        for (idx, (start, tries, box_, words)) in passes.iter().enumerate() {
+            let end = passes.get(idx + 1).map_or(log.len(), |(s, _, _, _)| *s);
+            let placed = log[*start..end]
+                .iter()
+                .filter(|e| e.contains(" place "))
+                .count();
+            let last_words = passes.get(idx + 1).map_or(*words, |(_, _, _, w)| *w);
+            println!(
+                "pass {idx} log {start} tries {tries} entries {} placed {placed} words {words}..{last_words} box x {}..{} y {}..{} z {}..{}",
+                end - start - 1,
+                box_[0],
+                box_[1],
+                box_[2],
+                box_[3],
+                box_[4],
+                box_[5]
+            );
+        }
+        // Tree one stands at world (-9,-37): the first pass whose box holds it.
+        let origin = (-9i32, -37i32);
+        let holds = |box_: &[i32; 6]| {
+            box_[0] <= origin.0 && origin.0 <= box_[1] && box_[4] <= origin.1 && origin.1 <= box_[5]
+        };
+        let tree_passes: Vec<(usize, usize)> = passes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, box_, _))| holds(box_))
+            .map(|(idx, (start, _, _, _))| {
+                let end = passes.get(idx + 1).map_or(log.len(), |(s, _, _, _)| *s);
+                (*start, end)
+            })
+            .collect();
+        println!("tree-one passes: {:?}", tree_passes);
+        let mut ours: Vec<(i32, i32, i32)> = Vec::new();
+        let mut ours_order: Vec<usize> = Vec::new();
+        for (start, end) in tree_passes.iter().take(2) {
+            let mut v = 0usize;
+            for entry in &log[*start..*end] {
+                if let Some(rest) = entry.strip_prefix('(') {
+                    let Some((pos, _)) = rest.split_once(')') else {
+                        continue;
+                    };
+                    let placed = entry.contains(" place ");
+                    if !placed {
+                        v += 1;
+                        continue;
+                    }
+                    let nums: Vec<i32> = pos.split(',').filter_map(|n| n.parse().ok()).collect();
+                    // The verdict position is the ground cell; litter lands above.
+                    ours.push((nums[0], nums[1] + 1, nums[2]));
+                    ours_order.push(v);
+                }
+                v += 1;
+            }
+        }
+        // Match status in try order: e = exact state, c = cell only,
+        // m = vanilla cell empty.
+        {
+            let mut row = String::new();
+            for (k, &(x, y, z)) in ours.iter().enumerate() {
+                let van = read_vanilla(x, y, z);
+                let ours_state = dec
+                    .registry()
+                    .state_of(dec.block(x, y, z))
+                    .map_or(String::new(), |(n, p)| format!("{n}[{p}]"));
+                let mark = if ours_state == van {
+                    'e'
+                } else if van.starts_with("minecraft:leaf_litter") {
+                    'c'
+                } else {
+                    'm'
+                };
+                row.push_str(&format!("v{}{mark} ", ours_order[k]));
+            }
+            println!("placement agreement in try order: {row}");
+        }
+        println!("tree-one placements: {}", ours.len());
+        let mut extra = 0;
+        for &(x, y, z) in &ours {
+            let there = read_vanilla(x, y, z);
+            if !there.starts_with("minecraft:leaf_litter") {
+                extra += 1;
+                // The full column both sides: a vanilla-only motion block
+                // above the cell would flip its heightmap verdict.
+                let column = |read: &dyn Fn(i32, i32, i32) -> String| -> String {
+                    (y - 1..=y + 15)
+                        .map(|yy| {
+                            let name = read(x, yy, z);
+                            let name = name.split('[').next().unwrap_or("");
+                            match name.strip_prefix("minecraft:") {
+                                Some("air") => String::new(),
+                                Some(n) => format!("{yy}:{n} "),
+                                None => String::new(),
+                            }
+                        })
+                        .collect()
+                };
+                let ours_col = {
+                    let dec_ref = &dec;
+                    let read = move |xx: i32, yy: i32, zz: i32| -> String {
+                        dec_ref
+                            .registry()
+                            .state_of(dec_ref.block(xx, yy, zz))
+                            .map_or(String::new(), |(n, _)| n.to_string())
+                    };
+                    column(&read)
+                };
+                println!(
+                    "  ours ({x},{y},{z}) vanilla {there}\n    vanilla col {van}\n    ours    col {ours_col}",
+                    van = {
+                        let read = |xx: i32, yy: i32, zz: i32| read_vanilla(xx, yy, zz);
+                        column(&read)
+                    }
+                );
+            }
+        }
+        // Exact placement agreement: same cell and same state (the
+        // segment_amount pins the weighted draw) means the same try on the
+        // same stream; the patch feature's litter would share cells by
+        // coincidence but not states.
+        {
+            let mut exact = 0usize;
+            let mut cell_only = 0usize;
+            for &(x, y, z) in &ours {
+                let van = read_vanilla(x, y, z);
+                let ours_state = dec
+                    .registry()
+                    .state_of(dec.block(x, y, z))
+                    .map_or(String::new(), |(n, p)| format!("{n}[{p}]"));
+                if ours_state == van {
+                    exact += 1;
+                } else if van.starts_with("minecraft:leaf_litter") {
+                    cell_only += 1;
+                    println!("  state split ({x},{y},{z}) ours {ours_state} vanilla {van}");
+                }
+            }
+            println!(
+                "exact-state placements {exact}/{}, same-cell-different-state {cell_only}",
+                ours.len()
+            );
+        }
+        println!("placements without vanilla litter: {extra}");
+        // Vanilla litter in the first pass box that we did not place.
+        if let Some((_, _, box_, _)) = passes.iter().find(|(_, _, b, _)| holds(b)) {
+            let mut missed = 0;
+            for y in box_[2]..=box_[3] {
+                for z in box_[4]..=box_[5] {
+                    for x in box_[0]..=box_[1] {
+                        if read_vanilla(x, y, z).starts_with("minecraft:leaf_litter")
+                            && !ours.contains(&(x, y, z))
+                        {
+                            missed += 1;
+                            if missed <= 30 {
+                                println!(
+                                    "  vanilla-only ({x},{y},{z}) ours {}",
+                                    dec.block_name(dec.block(x, y, z))
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            println!("vanilla-only litter cells in the box: {missed}");
+        }
+        // Tree zero's footprint, cell by cell: every log or leaf column in
+        // the tree's neighborhood, ours against the capture.
+        {
+            let base = (-9i32, -37i32);
+            let short = |state: u32, reg: &BlockRegistry| -> char {
+                reg.state_of(state)
+                    .map_or('.', |(n, _)| match n.trim_start_matches("minecraft:") {
+                        "dark_oak_log" => 'L',
+                        "oak_log" | "birch_log" => 'l',
+                        "dark_oak_leaves" => 'D',
+                        "oak_leaves" => 'o',
+                        "birch_leaves" => 'b',
+                        "leaf_litter" => '.',
+                        "air" => '.',
+                        _ => '?',
+                    })
+            };
+            for z in base.1 - 6..=base.1 + 7 {
+                let mut ours_row = String::new();
+                let mut van_row = String::new();
+                for x in base.0 - 6..=base.0 + 6 {
+                    let mut col_o = String::new();
+                    let mut col_v = String::new();
+                    for y in 62..=78 {
+                        col_o.push(short(dec.block(x, y, z), &reg));
+                        col_v.push(short(
+                            {
+                                let lx = (x - target.0 * 16) as usize;
+                                let lz = (z - target.1 * 16) as usize;
+                                if lx > 15 || lz > 15 {
+                                    0
+                                } else {
+                                    vanilla[(y - MIN_Y) as usize * COLUMNS + lz * 16 + lx]
+                                }
+                            },
+                            &reg,
+                        ));
+                    }
+                    ours_row.push_str(&format!("{col_o} "));
+                    van_row.push_str(&format!("{col_v} "));
+                }
+                println!("z{z:4} ours {ours_row}| van {van_row}");
+            }
+        }
+        // Full state names for the floating-canopy columns, both sides.
+        {
+            let cells = [
+                (-8, -34),
+                (-7, -33),
+                (-4, -41),
+                (-3, -40),
+                (-9, -40),
+                (-15, -36),
+                (-16, -37),
+                (-11, -39),
+            ];
+            for (x, z) in cells {
+                let mut ours_col = String::new();
+                let mut van_col = String::new();
+                for y in 62..=76 {
+                    let name = |state: u32| {
+                        reg.state_of(state)
+                            .map_or(String::new(), |(n, p)| format!("{n}[{p}]"))
+                    };
+                    let o = name(dec.block(x, y, z));
+                    if !o.starts_with("minecraft:air") && !o.is_empty() {
+                        ours_col.push_str(&format!("{y}:{o} "));
+                    }
+                    let v = read_vanilla(x, y, z);
+                    if !v.starts_with("minecraft:air") && v != "outside" {
+                        van_col.push_str(&format!("{y}:{v} "));
+                    }
+                }
+                println!("col ({x},{z})\n  ours {ours_col}\n  van  {van_col}");
+            }
+        }
+    }
+
+    /// Replays the first tree's two ground-scatter passes straight from
+    /// the feature stream: each try draws x, y, z (one word each) and a
+    /// placed try draws one weighted state word, so a start offset plus a
+    /// heightmap policy fixes the whole placement sequence. Every
+    /// candidate offset is scored against the capture's litter cells and
+    /// states; the offset and policy that reproduce them name where the
+    /// reference run's pass began and which heightmap it read.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_scatter_simulate() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let hits = scan_dump(target);
+        let vanilla = hits
+            .iter()
+            .find(|(_, pos, _)| *pos == target)
+            .map(|(_, _, chunk)| wire_cells(chunk))
+            .expect("target chunk in the capture dump");
+        let read_vanilla = |wx: i32, y: i32, wz: i32| -> String {
+            let lx = (wx - target.0 * 16) as usize;
+            let lz = (wz - target.1 * 16) as usize;
+            if lx > 15 || lz > 15 || y <= MIN_Y {
+                return "outside".into();
+            }
+            let state = vanilla[(y - MIN_Y) as usize * COLUMNS + lz * 16 + lx];
+            reg.state_of(state)
+                .map_or("unknown".into(), |(n, p)| format!("{n}[{p}]"))
+        };
+
+        // The two decorators' weighted tables in entry order.
+        let pin: Value = serde_json::from_str(
+            &std::fs::read_to_string(pins().join("feature").join("dark_oak_leaf_litter.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        let table = |deco: usize| -> Vec<String> {
+            pin.get("decorators").and_then(Value::as_array).unwrap()[deco]
+                .get("block_state_provider")
+                .and_then(|p| p.get("entries"))
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    let data = e.get("data").unwrap();
+                    let (name, props) = match data {
+                        Value::String(id) => (id.clone(), String::new()),
+                        Value::Object(_) => {
+                            let id = data.get("id").and_then(Value::as_str).unwrap().to_string();
+                            let mut pairs: Vec<String> = data
+                                .get("properties")
+                                .and_then(Value::as_object)
+                                .map(|m| {
+                                    m.iter()
+                                        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            pairs.sort();
+                            (id, pairs.join(","))
+                        }
+                        _ => (String::new(), String::new()),
+                    };
+                    let state = dec.state_id_of(&name, &props).unwrap();
+                    let (n, p) = dec.registry().state_of(state).unwrap();
+                    format!("{n}[{p}]")
+                })
+                .collect()
+        };
+        let tables = [table(0), table(1)];
+        println!(
+            "tables: {} and {} entries",
+            tables[0].len(),
+            tables[1].len()
+        );
+
+        // Log tops per column from the capture: the live heightmap policy
+        // reads motion blocks (logs) above the ground layer.
+        let mut log_top: HashMap<(i32, i32), i32> = HashMap::new();
+        for z in -44..=-28i32 {
+            for x in -18..=0i32 {
+                for y in 63..=90i32 {
+                    let name = read_vanilla(x, y, z);
+                    let name = name.split('[').next().unwrap_or("");
+                    if name.ends_with("_log") {
+                        log_top.insert((x, z), y);
+                    }
+                }
+            }
+        }
+        println!("log columns in the neighborhood: {}", log_top.len());
+
+        // The raw feature stream: one word per draw at these bounds.
+        let mut probe = DecorRng::new();
+        let deco = probe.decoration_seed(42, target.0 * EDGE, target.1 * EDGE);
+        probe.set_feature_seed(deco, 20, 9);
+        let raw: Vec<i32> = (0..1600).map(|_| probe.next_int(2147483647)).collect();
+        let ni = |w: i32, bound: i32| -> i32 {
+            let v = raw[w as usize];
+            if bound & bound.wrapping_sub(1) == 0 {
+                ((bound as i64 * v as i64) >> 31) as i32
+            } else {
+                v % bound
+            }
+        };
+
+        // The trunk 2x2 blocks the above-check at y 63.
+        let trunk: Vec<(i32, i32)> = (-9..=-8)
+            .flat_map(|x| (-37..=-36).map(move |z| (x, z)))
+            .collect();
+
+        // Ground level per box column: the capture's top ground block,
+        // the capture's litter layer above it, and our terrain fill.
+        let ground = [
+            "grass_block",
+            "dirt",
+            "stone",
+            "coarse_dirt",
+            "podzol",
+            "water",
+        ];
+        let van_surface = |x: i32, z: i32| -> i32 {
+            for y in (58..=66).rev() {
+                let name = read_vanilla(x, y, z);
+                let name = name
+                    .split('[')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches("minecraft:");
+                if ground.contains(&name) {
+                    return y;
+                }
+            }
+            0
+        };
+        {
+            let mut dec2 = Decorator::new(&terrain, &reg, 42).unwrap();
+            dec2.ensure_chunk(target.0, target.1);
+            let mut raised = 0;
+            for z in -41..=-32i32 {
+                for x in -13..=-4i32 {
+                    let mut ours_y = 0;
+                    for y in (58..=66).rev() {
+                        let name = dec2
+                            .registry()
+                            .state_of(dec2.block(x, y, z))
+                            .map_or(String::new(), |(n, _)| n.to_string());
+                        let name = name.trim_start_matches("minecraft:");
+                        if ground.contains(&name) {
+                            ours_y = y;
+                            break;
+                        }
+                    }
+                    let van_y = van_surface(x, z);
+                    let litter_y = (van_y + 1..=van_y + 2)
+                        .find(|&y| read_vanilla(x, y, z).starts_with("minecraft:leaf_litter"))
+                        .unwrap_or(0);
+                    if (x, z) == (-6, -38) {
+                        let look = |props: &str| {
+                            dec2.registry()
+                                .state_id("minecraft:grass_block", props)
+                                .map(|id| {
+                                    format!(
+                                        "{id}={}",
+                                        dec2.registry()
+                                            .state_of(id)
+                                            .map_or("?".to_string(), |(n, p)| {
+                                                format!("{n}[{p}]")
+                                            })
+                                    )
+                                })
+                                .unwrap_or_else(|| "none".into())
+                        };
+                        println!(
+                            "  grass probe ({x},{z}): ours 62 {} van 62 {} van 63 {} | state_id false {} default {} true {}",
+                            dec2.registry()
+                                .state_of(dec2.block(x, 62, z))
+                                .map_or("?".into(), |(n, p)| format!("{n}[{p}]")),
+                            read_vanilla(x, 62, z),
+                            read_vanilla(x, 63, z),
+                            look("snowy=false"),
+                            look(""),
+                            look("snowy=true"),
+                        );
+                    }
+                    if van_y != 62 || ours_y != van_y {
+                        raised += 1;
+                        let col = (59..=65)
+                            .map(|y| {
+                                format!(
+                                    "{y}:{}",
+                                    read_vanilla(x, y, z)
+                                        .trim_start_matches("minecraft:")
+                                        .replace("[]", "")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        println!("  col ({x},{z}) van surface {van_y} ours {ours_y} litter {litter_y}: {col}");
+                    }
+                }
+            }
+            println!("columns off the flat 62 surface: {raised}");
+        }
+
+        // Per-column ground level from the capture drives the checks.
+        let mut surface: HashMap<(i32, i32), i32> = HashMap::new();
+        for z in -41..=-32i32 {
+            for x in -13..=-4i32 {
+                let y = van_surface(x, z);
+                if y > 0 {
+                    surface.insert((x, z), y);
+                }
+            }
+        }
+
+        // One pass: the end word plus per-placement agreement.
+        let sim = |start: i32,
+                   tries: i32,
+                   bx0: i32,
+                   bx1: i32,
+                   bz0: i32,
+                   bz1: i32,
+                   tbl: &[String],
+                   policy: usize,
+                   litter: &mut std::collections::HashSet<(i32, i32)>,
+                   detail: &mut Vec<String>|
+         -> (i32, usize, usize, usize) {
+            let mut w = start;
+            let (mut exact, mut cellonly, mut miss) = (0usize, 0usize, 0usize);
+            for i in 0..tries {
+                let x = bx0 + ni(w, bx1 - bx0 + 1);
+                let y = 60 + ni(w + 1, 5);
+                let z = bz0 + ni(w + 2, bz1 - bz0 + 1);
+                w += 3;
+                let s = surface.get(&(x, z)).copied().unwrap_or(62);
+                let above_ok = y == s && !trunk.contains(&(x, z)) && !litter.contains(&(x, z));
+                let h_ok = policy == 0 || log_top.get(&(x, z)).copied().unwrap_or(0) <= s;
+                if above_ok && h_ok {
+                    let idx = ni(w, tbl.len() as i32) as usize;
+                    w += 1;
+                    let state = tbl[idx.min(tbl.len() - 1)].clone();
+                    let van = read_vanilla(x, s + 1, z);
+                    let mark = if van == state {
+                        exact += 1;
+                        "e"
+                    } else if van.starts_with("minecraft:leaf_litter") {
+                        cellonly += 1;
+                        "c"
+                    } else {
+                        miss += 1;
+                        "m"
+                    };
+                    detail.push(format!(
+                        "  t{i} ({x},{},{z}) {state} van {van} {mark}",
+                        s + 1
+                    ));
+                    litter.insert((x, z));
+                }
+            }
+            (w, exact, cellonly, miss)
+        };
+
+        let mut best: Vec<(usize, i32, usize)> = Vec::new();
+        for policy in 0..2usize {
+            for s in 0..140i32 {
+                let mut litter = std::collections::HashSet::new();
+                let mut detail = Vec::new();
+                let (w0, e0, c0, m0) = sim(
+                    s,
+                    96,
+                    -13,
+                    -4,
+                    -41,
+                    -32,
+                    &tables[0],
+                    policy,
+                    &mut litter,
+                    &mut detail,
+                );
+                let (_w1, e1, c1, m1) = sim(
+                    w0,
+                    150,
+                    -11,
+                    -6,
+                    -39,
+                    -34,
+                    &tables[1],
+                    policy,
+                    &mut litter,
+                    &mut detail,
+                );
+                let score = e0 + e1;
+                if score >= 8 {
+                    println!(
+                        "policy {policy} start {s}: exact {e0}+{e1}={score} cellonly {c0}+{c1} miss {m0}+{m1}"
+                    );
+                    for row in detail.iter() {
+                        println!("{row}");
+                    }
+                }
+                best.push((score, s, policy));
+            }
+        }
+        best.sort_by_key(|b| std::cmp::Reverse(b.0));
+        println!(
+            "top (score, start, policy): {:?}",
+            &best[..8.min(best.len())]
+        );
+    }
+
+    /// Minimal-distance BFS over the captured 3x3 region versus the
+    /// captured distance property: every leaf cell's vanilla distance
+    /// against the true shortest path to any log. Non-minimal captures
+    /// name the pop-order overwrite the bucket walk produces, so the
+    /// match rate decides whether the engine models a clean BFS.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_leaf_distance() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let hits = scan_dump(target);
+        let (x0, z0) = ((target.0 - 1) * 16, (target.1 - 1) * 16);
+        // The region block volume, non-air cells only.
+        let mut names: HashMap<(i32, i32, i32), String> = HashMap::new();
+        let mut props: HashMap<(i32, i32, i32), String> = HashMap::new();
+        for (_, pos, chunk) in &hits {
+            let cells = wire_cells(chunk);
+            for lz in 0..16i32 {
+                for lx in 0..16i32 {
+                    for y in 40..=120i32 {
+                        let state =
+                            cells[((y - MIN_Y) as usize) * COLUMNS + ((lz * 16 + lx) as usize)];
+                        let Some((n, p)) = reg.state_of(state) else {
+                            continue;
+                        };
+                        if n == "minecraft:air" {
+                            continue;
+                        }
+                        let at = (pos.0 * 16 + lx, y, pos.1 * 16 + lz);
+                        names.insert(at, n.to_string());
+                        props.insert(at, p.to_string());
+                    }
+                }
+            }
+        }
+        // Multi-source BFS from every log cell; expansion runs through
+        // leaf cells only.
+        let is_log = |n: &str| n.ends_with("_log");
+        let is_leaf = |n: &str| n.ends_with("_leaves");
+        let mut dist: HashMap<(i32, i32, i32), i32> = HashMap::new();
+        let mut queue: Vec<(i32, i32, i32)> = Vec::new();
+        for (&at, n) in &names {
+            if is_log(n) {
+                dist.insert(at, 0);
+                queue.push(at);
+            }
+        }
+        let mut head = 0usize;
+        while head < queue.len() {
+            let at @ (x, y, z) = queue[head];
+            head += 1;
+            let d = *dist.get(&at).unwrap();
+            if d >= 7 {
+                continue;
+            }
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let next = (x + dx, y + dy, z + dz);
+                if dist.contains_key(&next) {
+                    continue;
+                }
+                if names.get(&next).is_some_and(|n| is_leaf(n)) {
+                    dist.insert(next, d + 1);
+                    queue.push(next);
+                }
+            }
+        }
+        // Score every leaf cell two blocks inside the region edge.
+        let mut same = 0usize;
+        let mut off: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        for (&at @ (x, _y, z), n) in &names {
+            if !is_leaf(n) {
+                continue;
+            }
+            if x < x0 + 2 || x >= x0 + 46 || z < z0 + 2 || z >= z0 + 46 {
+                continue;
+            }
+            let captured = BlockRegistry::prop_int(&props[&at], "distance").unwrap_or(7);
+            let minimal = dist.get(&at).copied().unwrap_or(7).min(7);
+            if captured == minimal {
+                same += 1;
+            } else {
+                *off.entry(captured - minimal).or_default() += 1;
+            }
+        }
+        let total = same + off.values().sum::<usize>();
+        println!("minimal BFS: {same}/{total} leaf cells match, captured-minus-minimal {off:?}");
+
+        // The bucket walk the reference runs: buckets of pending cells by
+        // distance, logs at zero, one blind pop per step (a cell visiting
+        // two buckets has its distance written twice, the later bucket
+        // overwriting), expansion into unwritten distance-carrying
+        // neighbors at min(current, bucket + 1), and pops reading the
+        // pending set in spread-hash table order with insertion-order
+        // ties. Cell order decides which cells take the overwrite.
+        let pos_hash = |p: &(i32, i32, i32)| -> i32 {
+            (p.1.wrapping_add(p.2.wrapping_mul(31)))
+                .wrapping_mul(31)
+                .wrapping_add(p.0)
+        };
+        let spread = |h: i32| -> u32 { (h as u32) ^ ((h as u32) >> 16) };
+        let cap_for = |max_size: usize| -> u32 {
+            let mut cap = 16u32;
+            while max_size > (cap as usize * 3) / 4 {
+                cap *= 2;
+            }
+            cap
+        };
+        // (position, insertion sequence, capacity reached at max size)
+        type WalkCell = ((i32, i32, i32), usize);
+        let mut buckets: Vec<Vec<WalkCell>> = vec![Vec::new(); 7];
+        let mut caps = [16u32; 7];
+        let mut written: HashMap<(i32, i32, i32), i32> = HashMap::new();
+        let mut shape: std::collections::HashSet<(i32, i32, i32)> =
+            std::collections::HashSet::new();
+        let mut seq = 0usize;
+        let mut seeds: Vec<(i32, i32, i32)> = names
+            .iter()
+            .filter(|(_, n)| is_log(n))
+            .map(|(&at, _)| at)
+            .collect();
+        seeds.sort_unstable_by_key(|p| p.1);
+        for at in seeds {
+            buckets[0].push((at, seq));
+            seq += 1;
+        }
+        caps[0] = cap_for(buckets[0].len());
+        let mut smallest = 0usize;
+        let mut pops = 0usize;
+        let mut overwrites = 0usize;
+        loop {
+            while smallest < 7 && buckets[smallest].is_empty() {
+                smallest += 1;
+            }
+            if smallest >= 7 {
+                break;
+            }
+            // Pop the first cell in table order: the low spread bits name
+            // the table slot, the insertion sequence orders within it.
+            let cap = caps[smallest];
+            let mask = cap - 1;
+            let pick = buckets[smallest]
+                .iter()
+                .enumerate()
+                .min_by_key(|&(k, &(at, s))| (spread(pos_hash(&at)) & mask, s, k))
+                .map(|(k, _)| k)
+                .expect("bucket nonempty above");
+            let (at @ (px, py, pz), _) = buckets[smallest][pick];
+            buckets[smallest].swap_remove(pick);
+            pops += 1;
+            if shape.contains(&at) {
+                overwrites += 1;
+            }
+            if smallest != 0 {
+                written.insert(at, smallest as i32);
+            }
+            shape.insert(at);
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let next = (px + dx, py + dy, pz + dz);
+                if shape.contains(&next) {
+                    continue;
+                }
+                let Some(n) = names.get(&next) else {
+                    continue;
+                };
+                // Logs read as distance zero; leaves carry their property.
+                let current_distance = if is_log(n) {
+                    0
+                } else {
+                    match props
+                        .get(&next)
+                        .and_then(|p| BlockRegistry::prop_int(p, "distance"))
+                    {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                };
+                let new_distance = current_distance.min(smallest as i32 + 1);
+                if new_distance < 7 {
+                    let bucket = &mut buckets[new_distance as usize];
+                    if bucket.iter().any(|&(b, _)| b == next) {
+                        continue;
+                    }
+                    bucket.push((next, seq));
+                    seq += 1;
+                    // The table only grows; removals never shrink it.
+                    while bucket.len() > (caps[new_distance as usize] as usize * 3) / 4 {
+                        caps[new_distance as usize] *= 2;
+                    }
+                    smallest = smallest.min(new_distance as usize);
+                }
+            }
+        }
+        let mut same = 0usize;
+        let mut off: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+        let mut worst: Vec<((i32, i32, i32), i32, i32)> = Vec::new();
+        for (&at @ (x, _y, z), n) in &names {
+            if !is_leaf(n) {
+                continue;
+            }
+            if x < x0 + 2 || x >= x0 + 46 || z < z0 + 2 || z >= z0 + 46 {
+                continue;
+            }
+            let captured = BlockRegistry::prop_int(&props[&at], "distance").unwrap_or(7);
+            let walked = written.get(&at).copied().unwrap_or(7);
+            if captured == walked {
+                same += 1;
+            } else {
+                *off.entry(captured - walked).or_default() += 1;
+                if worst.len() < 20 {
+                    worst.push((at, captured, walked));
+                }
+            }
+        }
+        let total = same + off.values().sum::<usize>();
+        println!(
+            "bucket walk: {same}/{total} leaf cells match ({pops} pops, {overwrites} overwrite pops), captured-minus-walked {off:?}"
+        );
+        for ((x, y, z), c, w) in &worst {
+            println!("  ({x},{y},{z}) captured {c} walked {w}");
+        }
+    }
+
     #[test]
     #[ignore = "diagnostic: needs a live capture dump"]
     fn diagnose_chunk_divergence() {
@@ -1592,7 +3046,7 @@ mod tests {
                 );
             }
             dec.visits = None;
-            let mine = dec.emit(target.0, target.1);
+            let mine = dec.emit(target.0, target.1).unwrap();
             let mut delta: i64 = 0;
             let mut names: HashMap<String, i64> = HashMap::new();
             let mut leaf_cells: Vec<(usize, u32, u32)> = Vec::new();
@@ -1816,7 +3270,7 @@ mod tests {
         let is_probe_block = |state: u32| reg.state_of(state).is_some_and(|(n, _)| n == block);
         // Everything but the probe feature: how much of the block each
         // side carries from the features that already ran.
-        let base = wire_cells(&dec.emit(target.0, target.1));
+        let base = wire_cells(&dec.emit(target.0, target.1).unwrap());
         let base_ours = base.iter().filter(|s| is_probe_block(**s)).count();
         let base_theirs = theirs.iter().filter(|s| is_probe_block(**s)).count();
         println!(
@@ -1906,7 +3360,7 @@ mod tests {
             for &(cx, cz) in &order {
                 cand.decorate(cx, cz);
             }
-            let ours = wire_cells(&cand.emit(target.0, target.1));
+            let ours = wire_cells(&cand.emit(target.0, target.1).unwrap());
             let ours_total = ours.iter().filter(|s| is_probe_block(**s)).count();
             let mut exact = 0u64;
             let mut ours_only = 0u64;
@@ -1944,7 +3398,7 @@ mod tests {
         for &(cx, cz) in &order {
             cand.decorate(cx, cz);
         }
-        let ours = wire_cells(&cand.emit(target.0, target.1));
+        let ours = wire_cells(&cand.emit(target.0, target.1).unwrap());
         let describe = |state: u32| -> String {
             reg.state_of(state)
                 .map_or("unknown".into(), |(n, p)| format!("{n}[{p}]"))
@@ -2006,6 +3460,541 @@ mod tests {
         }
     }
 
+    /// Tree alignment: vanilla trunk columns versus the try origins the
+    /// driver drew for the vegetation feature. A vanilla trunk column that
+    /// appears in our try list convicts a filter; one that never shows up
+    /// convicts the seed stream.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_tree_alignment() {
+        let target = diag_target();
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let vanilla = hits
+            .iter()
+            .find(|(_, pos, _)| *pos == target)
+            .map(|(_, _, chunk)| chunk)
+            .expect("target chunk in the capture dump")
+            .clone();
+        let mut order: Vec<(i32, i32)> = hits.iter().map(|(_, pos, _)| *pos).collect();
+        order.dedup();
+        if order.len() != 9 {
+            order = (target.0 - 1..=target.0 + 1)
+                .flat_map(|x| (target.1 - 1..=target.1 + 1).map(move |z| (x, z)))
+                .collect();
+        }
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        dec.visits = Some(Vec::new());
+        for &(cx, cz) in &order {
+            dec.decorate(cx, cz);
+        }
+        let feature = "dark_forest_vegetation";
+        let tries: Vec<(i32, i32)> = dec
+            .visits
+            .take()
+            .unwrap_or_default()
+            .iter()
+            .filter(|(n, _, _, _)| n == feature)
+            .map(|(_, x, _, z)| (*x, *z))
+            .collect();
+
+        // Vanilla trunk columns: any log cell in the target chunk.
+        let cells = wire_cells(&vanilla);
+        let mut vanilla_cols: Vec<(i32, i32)> = Vec::new();
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                for layer in 0..LAYERS {
+                    let state = cells[layer * COLUMNS + lz * 16 + lx];
+                    if reg
+                        .state_of(state)
+                        .is_some_and(|(n, _)| n.ends_with("_log"))
+                    {
+                        vanilla_cols.push((target.0 * 16 + lx as i32, target.1 * 16 + lz as i32));
+                        break;
+                    }
+                }
+            }
+        }
+        println!(
+            "vanilla trunk columns ({}): {:?}",
+            vanilla_cols.len(),
+            vanilla_cols
+        );
+        println!("our {feature} try origins ({}): {:?}", tries.len(), tries);
+        let try_hit = vanilla_cols.iter().filter(|c| tries.contains(c)).count();
+        println!(
+            "vanilla columns present in our try list: {try_hit}/{}",
+            vanilla_cols.len()
+        );
+        // Systematic shift probe: does any constant offset map our tries
+        // onto the vanilla columns?
+        for dz in -2..=2i32 {
+            let mut row = Vec::new();
+            for dx in -2..=2i32 {
+                let matched = tries
+                    .iter()
+                    .filter(|t| vanilla_cols.contains(&(t.0 + dx, t.1 + dz)))
+                    .count();
+                row.push(matched);
+            }
+            println!("shift row dz={dz}: {row:?}");
+        }
+        // Vanilla tree origins: the lowest log layer of each contiguous
+        // cluster (the 2x2 trunk base stands exactly at the in_square
+        // origin; lean and branches only add columns above).
+        let mut col_y: std::collections::HashMap<(i32, i32), i32> =
+            std::collections::HashMap::new();
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                for layer in 0..LAYERS {
+                    let state = cells[layer * COLUMNS + lz * 16 + lx];
+                    if reg
+                        .state_of(state)
+                        .is_some_and(|(n, _)| n.ends_with("_log"))
+                    {
+                        col_y.insert(
+                            (target.0 * 16 + lx as i32, target.1 * 16 + lz as i32),
+                            MIN_Y + layer as i32,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        let mut origins: Vec<(i32, i32)> = Vec::new();
+        for (&(x, z), &y) in &col_y {
+            let neighbor_lower = [(x - 1, z), (x, z - 1), (x - 1, z - 1)]
+                .iter()
+                .any(|&(nx, nz)| col_y.get(&(nx, nz)).is_some_and(|&ny| ny <= y));
+            let is_base = !neighbor_lower
+                && col_y.get(&(x + 1, z)).is_some_and(|&ny| ny == y)
+                && col_y.get(&(x, z + 1)).is_some_and(|&ny| ny == y)
+                && col_y.get(&(x + 1, z + 1)).is_some_and(|&ny| ny == y);
+            if is_base {
+                origins.push((x, z));
+            }
+        }
+        origins.sort();
+        origins.dedup();
+        println!("vanilla tree origins ({}): {origins:?}", origins.len());
+        // Sweep (step, index) seeds: the true derivation passes through the
+        // vanilla origins as consecutive in_square draws, interleaved with
+        // whatever the surviving tries consume between them.
+        let mut probe_rng = DecorRng::new();
+        let deco = probe_rng.decoration_seed(42, target.0 * EDGE, target.1 * EDGE);
+        let widest = dec.plan.steps.iter().map(|s| s.len()).max().unwrap_or(0) as i32;
+        let mut scored: Vec<(usize, i32, i32)> = Vec::new();
+        for step in 0..=10i32 {
+            for index in 0..=widest {
+                let mut r = DecorRng::new();
+                r.set_feature_seed(deco, index, step);
+                let draws: Vec<i32> = (0..256).map(|_| r.next_int(16)).collect();
+                let found = origins
+                    .iter()
+                    .filter(|o| {
+                        draws
+                            .windows(2)
+                            .any(|w| w[0] == o.0.rem_euclid(16) && w[1] == o.1.rem_euclid(16))
+                    })
+                    .count();
+                if found * 2 > origins.len() {
+                    scored.push((found, step, index));
+                }
+            }
+        }
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+        println!("seed candidates (hits, step, index): {scored:?}");
+        // Control: our own derivation must appear in the same sweep.
+        let our_index = dec
+            .plan
+            .positions
+            .get(&dec.key_of(feature).unwrap())
+            .map(|(s, i)| (*s as i32, *i as i32))
+            .unwrap_or((-1, -1));
+        println!(
+            "our plan slot for {feature}: (step {}, index {})",
+            our_index.0, our_index.1
+        );
+        let mut r = DecorRng::new();
+        r.set_feature_seed(deco, our_index.1, our_index.0);
+        let draws: Vec<i32> = (0..256).map(|_| r.next_int(16)).collect();
+        let our_hits = tries
+            .iter()
+            .filter(|t| {
+                draws
+                    .windows(2)
+                    .any(|w| w[0] == t.0.rem_euclid(16) && w[1] == t.1.rem_euclid(16))
+            })
+            .count();
+        println!(
+            "control: our own try origins found in our own raw stream: {our_hits}/{}",
+            tries
+                .iter()
+                .filter(|t| {
+                    t.0 >= target.0 * 16
+                        && t.0 < target.0 * 16 + 16
+                        && t.1 >= target.1 * 16
+                        && t.1 < target.1 * 16 + 16
+                })
+                .count()
+        );
+        // Which filter leg refused each unmatched vanilla column.
+        for col in vanilla_cols.iter().take(24) {
+            if tries.contains(col) {
+                continue;
+            }
+            let floor = dec.height(HeightKind::OceanFloor, col.0, col.1);
+            let surface = dec.height(HeightKind::WorldSurface, col.0, col.1);
+            let biome = dec.biome_at(col.0, floor, col.1);
+            let name = dec
+                .plan
+                .steps
+                .iter()
+                .enumerate()
+                .find(|(_, s)| !s.is_empty())
+                .map(|_| biome.to_string())
+                .unwrap_or_default();
+            println!(
+                "  miss ({},{}): floor={floor} surface={surface} biome={biome} {name}",
+                col.0, col.1
+            );
+        }
+    }
+
+    /// Prints the spot values the chain test pins, after draw semantics
+    /// changes shift every stream.
+    #[test]
+    #[ignore = "prints regenerated spot values"]
+    fn print_decoration_spot_values() {
+        let mut rng = DecorRng::new();
+        println!("deco(42,16,32) = {}", rng.decoration_seed(42, 16, 32));
+        let mut rng = DecorRng::new();
+        println!("deco(42,16,0) = {}", rng.decoration_seed(42, 16, 0));
+        let mut rng = DecorRng::new();
+        println!("deco(42,0,16) = {}", rng.decoration_seed(42, 0, 16));
+
+        let deco = DecorRng::new().decoration_seed(42, 16, 32);
+        let mut rng = DecorRng::new();
+        rng.set_feature_seed(deco, 3, 9);
+        let draws: Vec<i32> = (0..4).map(|_| rng.next_int(16)).collect();
+        println!("feature(3,9) first 4 x16: {draws:?}");
+        println!("feature(3,9) then f32: {}", rng.next_f32());
+        let mut rng = DecorRng::new();
+        rng.set_feature_seed(deco, 4, 9);
+        println!(
+            "feature(4,9) first 2 x16: {:?}",
+            (0..2).map(|_| rng.next_int(16)).collect::<Vec<_>>()
+        );
+        let mut rng = DecorRng::new();
+        rng.set_feature_seed(deco, 3, 10);
+        println!(
+            "feature(3,10) first 2 x16: {:?}",
+            (0..2).map(|_| rng.next_int(16)).collect::<Vec<_>>()
+        );
+    }
+
+    /// Scores every (step, index) feature seed by its first in_square pair:
+    /// the opening two draws of the seeded stream are the first try's local
+    /// (x, z), so for the seed the reference run used that pair lands on a
+    /// vanilla trunk column in most chunks that carry trees. The whole
+    /// capture dump votes, one decoration-free stream per candidate per
+    /// chunk, and both decoration-seed input conventions run side by side.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_first_draw_alignment() {
+        let reg = registry();
+        let dump = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/vanilla/worldgen-capture");
+        type ChunkPairs = ((i32, i32), Vec<(i32, i32)>);
+        let mut chunks: Vec<ChunkPairs> = Vec::new();
+        for entry in std::fs::read_dir(&dump).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with('p') || !name.ends_with(".bin") {
+                continue;
+            }
+            let Ok(body) = std::fs::read(&path) else {
+                continue;
+            };
+            // The dump holds every packet body; non-chunk bodies decode as
+            // garbage, so the leading chunk coordinates gate the decode and
+            // a panic guard skips anything that still slips through.
+            let coords_ok = body.len() >= 8
+                && body[0..4]
+                    .try_into()
+                    .map(|b: [u8; 4]| i32::from_be_bytes(b).abs() <= 48)
+                    .unwrap_or(false)
+                && body[4..8]
+                    .try_into()
+                    .map(|b: [u8; 4]| i32::from_be_bytes(b).abs() <= 48)
+                    .unwrap_or(false);
+            if !coords_ok {
+                continue;
+            }
+            let cells = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let chunk = WireChunk::decode(&body).ok()?;
+                if chunk.sections.len() != SECTION_SPAN || chunk.heightmaps.len() > 8 {
+                    return None;
+                }
+                Some(((chunk.x, chunk.z), wire_cells(&chunk)))
+            }))
+            .ok()
+            .flatten();
+            let Some((pos, cells)) = cells else {
+                continue;
+            };
+            if chunks.iter().any(|(p, _)| *p == pos) {
+                continue;
+            }
+            let mut pairs: Vec<(i32, i32)> = Vec::new();
+            for lz in 0..16usize {
+                for lx in 0..16usize {
+                    let trunk = (0..LAYERS).any(|layer| {
+                        reg.state_of(cells[layer * COLUMNS + lz * 16 + lx])
+                            .is_some_and(|(n, _)| n.ends_with("_log"))
+                    });
+                    if trunk {
+                        pairs.push((lx as i32, lz as i32));
+                    }
+                }
+            }
+            chunks.push((pos, pairs));
+        }
+        chunks.sort_by_key(|(pos, _)| *pos);
+        chunks.dedup_by_key(|(pos, _)| *pos);
+        let forest: Vec<&ChunkPairs> = chunks
+            .iter()
+            .filter(|(_, pairs)| !pairs.is_empty())
+            .collect();
+        println!(
+            "dump: {} chunks, {} with trunk columns",
+            chunks.len(),
+            forest.len()
+        );
+
+        let widest = {
+            let table = BiomeTable::load(&pins()).unwrap();
+            let plan = FeaturePlan::build(&pins(), &table).unwrap();
+            plan.steps.iter().map(|s| s.len()).max().unwrap_or(0) as i32
+        };
+        let variants = [("block", EDGE), ("chunk", 1i32)];
+        let mut ranked: Vec<(usize, &'static str, i32, i32)> = Vec::new();
+        for (label, scale) in variants {
+            for step in 0..=10i32 {
+                for index in 0..=widest {
+                    let mut hits = 0usize;
+                    for ((cx, cz), pairs) in &forest {
+                        let mut probe = DecorRng::new();
+                        let deco = probe.decoration_seed(42, cx * scale, cz * scale);
+                        probe.set_feature_seed(deco, index, step);
+                        let pair = (probe.next_int(16), probe.next_int(16));
+                        if pairs.contains(&pair) {
+                            hits += 1;
+                        }
+                    }
+                    ranked.push((hits, label, step, index));
+                }
+            }
+        }
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        println!("top (chunk votes, seed inputs, step, index):");
+        for row in ranked.iter().take(12) {
+            println!("  {row:?}");
+        }
+        let chance = forest.iter().map(|(_, pairs)| pairs.len()).sum::<usize>() as f64
+            / 256.0
+            / forest.len() as f64;
+        println!(
+            "chance level {chance:.2} over {} voting chunks",
+            forest.len()
+        );
+    }
+
+    /// Locates every recorded try origin of the target chunk inside the
+    /// seeded word stream (each nextInt(16) consumes one word), so the
+    /// words spent per try body are visible and the word offset of the
+    /// reference run's own try sequence can be read off the same stream.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_word_offsets() {
+        let target = (-1i32, -3i32);
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let mut order: Vec<(i32, i32)> = hits.iter().map(|(_, pos, _)| *pos).collect();
+        order.dedup();
+        if order.len() != 9 {
+            order = (target.0 - 1..=target.0 + 1)
+                .flat_map(|x| (target.1 - 1..=target.1 + 1).map(move |z| (x, z)))
+                .collect();
+        }
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        dec.visits = Some(Vec::new());
+        dec.try_words = Some(Vec::new());
+        for &(cx, cz) in &order {
+            dec.decorate(cx, cz);
+        }
+        let feature = "dark_forest_vegetation";
+        let visits = dec.visits.take().unwrap_or_default();
+        let words = dec.try_words.take().unwrap_or_default();
+        let mut rows: Vec<(i32, i32, u64)> = Vec::new();
+        for (visit, word) in visits.iter().zip(words.iter()) {
+            let (n, x, _, z) = visit;
+            if n != feature {
+                continue;
+            }
+            let in_chunk = *x >= target.0 * 16
+                && *x < target.0 * 16 + 16
+                && *z >= target.1 * 16
+                && *z < target.1 * 16 + 16;
+            if in_chunk {
+                rows.push((*x, *z, *word));
+            }
+        }
+        let base = rows.first().map(|r| r.2).unwrap_or(0) as i64;
+        println!("{} tries in the target chunk", rows.len());
+        let mut prev: Option<i64> = None;
+        for (k, (x, z, word)) in rows.iter().enumerate() {
+            let word = *word as i64;
+            let body = prev.map(|p| word - p);
+            println!(
+                "try {k:2} ({},{}) pair words {}..{} (body {body:?})",
+                x - target.0 * 16,
+                z - target.1 * 16,
+                word - base - 2,
+                word - base - 1
+            );
+            prev = Some(word);
+        }
+        // The reference run drew its own tries from the same stream; the
+        // vanilla trunk bases mark where its try pairs landed.
+        let mut r = DecorRng::new();
+        let deco = r.decoration_seed(42, target.0 * EDGE, target.1 * EDGE);
+        r.set_feature_seed(deco, 20, 9);
+        let stream: Vec<i32> = (0..8192).map(|_| r.next_int(16)).collect();
+        let origins = [(2i32, 9i32), (6, 3), (0, 1), (14, 6)];
+        for pair in origins {
+            let mut hits = Vec::new();
+            for i in 0..stream.len() - 1 {
+                if stream[i] == pair.0 && stream[i + 1] == pair.1 {
+                    hits.push(i);
+                }
+            }
+            println!("origin {pair:?} pair words {hits:?}");
+        }
+    }
+
+    /// Sweeps the feature index (one step) by replaying the vegetation
+    /// feature over the target chunk per candidate seed and scoring the
+    /// try origins against the captured trunk columns: the index the
+    /// reference run seeded from lands whole trunk bases on its try list,
+    /// every other index stays at chance.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn probe_seed_sweep() {
+        let target = diag_target();
+        let reg = registry();
+        let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
+        let hits = scan_dump(target);
+        let vanilla = hits
+            .iter()
+            .find(|(_, pos, _)| *pos == target)
+            .map(|(_, _, chunk)| chunk)
+            .expect("target chunk in the capture dump")
+            .clone();
+        let cells = wire_cells(&vanilla);
+        let mut cols: Vec<(i32, i32)> = Vec::new();
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                for layer in 0..LAYERS {
+                    let state = cells[layer * COLUMNS + lz * 16 + lx];
+                    if reg
+                        .state_of(state)
+                        .is_some_and(|(n, _)| n.ends_with("_log"))
+                    {
+                        cols.push((target.0 * 16 + lx as i32, target.1 * 16 + lz as i32));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let feature = "dark_forest_vegetation";
+        let step = std::env::var("DIAG_STEP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(9);
+        let widest = {
+            let probe = Decorator::new(&terrain, &reg, 42).unwrap();
+            probe.plan.steps.iter().map(|s| s.len()).max().unwrap_or(0)
+        };
+        let key = {
+            let probe = Decorator::new(&terrain, &reg, 42).unwrap();
+            probe.key_of(feature).expect("plan key")
+        };
+        let mut scored: Vec<(usize, i32, usize)> = Vec::new();
+        for index in 0..=widest as i32 {
+            let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+            dec.seed_override = Some((key, index, step as i32));
+            dec.only_step = Some(step);
+            dec.visits = Some(Vec::new());
+            dec.decorate(target.0, target.1);
+            let tries: Vec<(i32, i32)> = dec
+                .visits
+                .take()
+                .unwrap_or_default()
+                .iter()
+                .filter(|(n, ..)| n == feature)
+                .map(|(_, x, _, z)| (*x, *z))
+                .collect();
+            let hit = tries.iter().filter(|t| cols.contains(t)).count();
+            scored.push((hit, index, tries.len()));
+        }
+        let mut ranked = scored.clone();
+        ranked.sort_by_key(|(hit, _, _)| std::cmp::Reverse(*hit));
+        println!("candidate (trunk-column hits, index, tries):");
+        for row in ranked.iter().take(10) {
+            println!("  {row:?}");
+        }
+        let own = Decorator::new(&terrain, &reg, 42)
+            .unwrap()
+            .plan
+            .positions
+            .get(&key)
+            .map(|(s, i)| (*s as i32, *i as i32));
+        println!("our plan slot: {own:?}");
+        // The top candidate's tries against the captured columns.
+        let best = ranked[0].1;
+        let mut dec = Decorator::new(&terrain, &reg, 42).unwrap();
+        dec.seed_override = Some((key, best, step as i32));
+        dec.only_step = Some(step);
+        dec.visits = Some(Vec::new());
+        dec.decorate(target.0, target.1);
+        let tries: Vec<(i32, i32)> = dec
+            .visits
+            .take()
+            .unwrap_or_default()
+            .iter()
+            .filter(|(n, ..)| n == feature)
+            .map(|(_, x, _, z)| (*x, *z))
+            .collect();
+        let hits_of: Vec<String> = tries
+            .iter()
+            .map(|t| {
+                if cols.contains(t) {
+                    format!("{t:?}*")
+                } else {
+                    format!("{t:?}")
+                }
+            })
+            .collect();
+        println!("best index {best} tries: {hits_of:?}");
+        println!("vanilla trunk columns: {cols:?}");
+    }
+
     /// The decoration seed folds the world seed with two odd scaling draws
     /// of the chunk origin; the per-feature reseed mixes the step and the
     /// index within the step. Spot values come from the reference chain:
@@ -2016,27 +4005,35 @@ mod tests {
         let mut rng = DecorRng::new();
         assert_eq!(rng.decoration_seed(42, 0, 0), 42);
         let mut rng = DecorRng::new();
-        assert_eq!(rng.decoration_seed(42, 16, 32), -6_221_029_433_860_675_718);
+        assert_eq!(rng.decoration_seed(42, 16, 32), -2_907_997_360_337_813_702);
         let mut rng = DecorRng::new();
-        assert_eq!(rng.decoration_seed(42, 16, 0), -1_348_197_764_963_659_302);
+        assert_eq!(rng.decoration_seed(42, 16, 0), -1_348_197_766_006_825_830);
         let mut rng = DecorRng::new();
-        assert_eq!(rng.decoration_seed(42, 0, 16), 6_786_956_202_406_267_546);
+        assert_eq!(rng.decoration_seed(42, 0, 16), 8_443_472_239_689_281_818);
 
         let mut rng = seeded();
-        rng.set_feature_seed(-6_221_029_433_860_675_718, 3, 9);
+        rng.set_feature_seed(-2_907_997_360_337_813_702, 3, 9);
         assert_eq!(
             (0..4).map(|_| rng.next_int(16)).collect::<Vec<_>>(),
-            [2, 7, 11, 8]
+            [8, 13, 5, 11]
         );
-        assert_eq!(rng.next_f32(), 0.7069545388221741f32);
+        assert_eq!(rng.next_f32(), 0.6658985f32);
 
         let mut rng = seeded();
-        rng.set_feature_seed(-6_221_029_433_860_675_718, 4, 9);
-        assert_eq!(rng.next_int(16), 4, "the step index moves the stream");
+        rng.set_feature_seed(-2_907_997_360_337_813_702, 4, 9);
+        assert_eq!(
+            (0..2).map(|_| rng.next_int(16)).collect::<Vec<_>>(),
+            [14, 3],
+            "the step index moves the stream"
+        );
 
         let mut rng = seeded();
-        rng.set_feature_seed(-6_221_029_433_860_675_718, 3, 10);
-        assert_eq!(rng.next_int(16), 11, "the step moves the stream");
+        rng.set_feature_seed(-2_907_997_360_337_813_702, 3, 10);
+        assert_eq!(
+            (0..2).map(|_| rng.next_int(16)).collect::<Vec<_>>(),
+            [14, 13],
+            "the step moves the stream"
+        );
     }
 
     /// Every draw shape consumes the stream exactly the way the reference
@@ -2304,21 +4301,31 @@ mod tests {
         let (bx, bz) = (tree_chunk.0 * 16, tree_chunk.1 * 16);
         let mut logs = 0;
         let mut leaves = 0;
+        let mut near_trunk = 0;
         for y in MIN_Y..MIN_Y + LAYERS as i32 {
             for x in bx..bx + 16 {
                 for z in bz..bz + 16 {
-                    let name = dec.block_name(dec.block(x, y, z));
+                    let state = dec.block(x, y, z);
+                    let name = dec.block_name(state);
                     if name.ends_with("_log") {
                         logs += 1;
                     }
                     if name.ends_with("_leaves") {
                         leaves += 1;
+                        let props = dec.registry().state_of(state).map_or("", |(_, p)| p);
+                        if BlockRegistry::prop_int(props, "distance").is_some_and(|v| v < 7) {
+                            near_trunk += 1;
+                        }
                     }
                 }
             }
         }
         assert!(logs > 0, "trees wrote logs");
         assert!(leaves > 0, "trees wrote leaves");
+        assert!(
+            near_trunk * 4 > leaves * 3 / 2,
+            "the leaf walk brought most leaves near a trunk: {near_trunk} of {leaves}"
+        );
 
         // The visit lists are a pure function of the chunk set: a fresh
         // region over the same terrain reproduces them exactly.

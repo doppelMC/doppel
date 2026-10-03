@@ -33,16 +33,17 @@ const MIN_CHUNKS: usize = 20;
 const MAX_MEDIAN_DELTA: f64 = 8.0;
 const MAX_P95_DELTA: f64 = 12.0;
 /// Shape alignment: Pearson correlation of the height fields.
-const MIN_CORRELATION: f64 = 0.68;
+const MIN_CORRELATION: f64 = 0.72;
 /// Material agreement: histogram overlap over block names.
 const MIN_OVERLAP: f64 = 0.5;
 /// Cell-level agreement (air-dominated, so a low bar that catches gross
-/// breakage like wrong world height or offset sections).
-const MIN_CELL_AGREEMENT: f64 = 0.7;
+/// breakage like wrong world height or offset sections). Ores and disks
+/// sit below this margin until the underground features land.
+const MIN_CELL_AGREEMENT: f64 = 0.8;
 /// Coastline agreement: the density surface matches vanilla block for
 /// block; the remaining disagreement columns carry vanilla ground cover
-/// (leaf litter, grass, tree canopies) the density engine does not place.
-const MIN_LANDMASK: f64 = 0.76;
+/// (leaf litter, grass, tree canopies) the tree stream desync moves.
+const MIN_LANDMASK: f64 = 0.9;
 
 pub fn run() -> Result<bool> {
     let pin = load_pin()?;
@@ -141,19 +142,41 @@ fn compare(
     let mut ours_biomes: HashMap<u32, u64> = HashMap::new();
     let mut cells_total = 0u64;
     let mut cells_equal = 0u64;
+    // Section-count disagreement would silently truncate the cell zip, so a
+    // mismatch fails the gate instead of comparing a prefix.
+    let mut structural_fail = false;
     // Per-chunk convergence probes: heightmap-1 outlier columns and the
     // block-name deltas that mark a mis-placed feature.
-    let mut per_chunk: Vec<((i32, i32), u64, u64, u64, u64, u64)> = Vec::new();
+    #[derive(Default)]
+    struct ChunkProbe {
+        pos: (i32, i32),
+        outliers: u64,
+        mismatched: u64,
+        leaf: u64,
+        log: u64,
+        total: u64,
+    }
+    let mut per_chunk: Vec<ChunkProbe> = Vec::new();
     let leaf_like = |name: &str| -> u64 {
         u64::from(name.ends_with("_leaves") || name == "minecraft:leaf_litter")
     };
     let log_like = |name: &str| -> u64 { u64::from(name.ends_with("_log")) };
 
     for v in captured {
-        let mine = decorator.emit(v.x, v.z);
+        let mine = decorator.emit(v.x, v.z).context("emitting our chunk")?;
         heights.add_chunk(v, &mine);
         let ours_cells = chunk_cells(&mine, registry);
         let vanilla_cells = chunk_cells(v, registry);
+        if mine.sections.len() != v.sections.len() {
+            println!(
+                "[worldgen] FAIL chunk ({},{}): {} sections ours vs {} vanilla",
+                v.x,
+                v.z,
+                mine.sections.len(),
+                v.sections.len()
+            );
+            structural_fail = true;
+        }
         let mut outlier_columns = 0u64;
         let mut mismatched = 0u64;
         let mut leaf_gap = 0i64;
@@ -185,14 +208,14 @@ fn compare(
             mismatched += u64::from(a != b);
             cells_equal += u64::from(a == b);
         }
-        per_chunk.push((
-            (v.x, v.z),
-            outlier_columns,
+        per_chunk.push(ChunkProbe {
+            pos: (v.x, v.z),
+            outliers: outlier_columns,
             mismatched,
-            leaf_gap.unsigned_abs(),
-            log_gap.unsigned_abs(),
-            leaf_gap.unsigned_abs() + log_gap.unsigned_abs(),
-        ));
+            leaf: leaf_gap.unsigned_abs(),
+            log: log_gap.unsigned_abs(),
+            total: leaf_gap.unsigned_abs() + log_gap.unsigned_abs(),
+        });
         for (id, count) in vanilla_cells.biomes {
             *biomes.entry(id).or_default() += count;
         }
@@ -200,10 +223,13 @@ fn compare(
             *ours_biomes.entry(id).or_default() += count;
         }
     }
-    per_chunk.sort_by_key(|c| std::cmp::Reverse(c.5));
+    per_chunk.sort_by_key(|c| std::cmp::Reverse(c.total));
     println!("[worldgen] worst chunks by leaf+log delta (chunk, hm outliers, cell mismatches, leaf delta, log delta):");
-    for (pos, out, mismatch, leaf, log, _) in per_chunk.iter().take(6) {
-        println!("[worldgen]   {pos:?}: {out}, {mismatch}, {leaf}, {log}");
+    for c in per_chunk.iter().take(6) {
+        println!(
+            "[worldgen]   {:?}: {}, {}, {}, {}",
+            c.pos, c.outliers, c.mismatched, c.leaf, c.log
+        );
     }
 
     println!("[worldgen] chunks compared: {}", captured.len());
@@ -215,6 +241,12 @@ fn compare(
         let Some(ty) = *ty else {
             continue;
         };
+        if d.is_empty() {
+            // A shared type with no compared columns would leave the
+            // zero-initialized worsts passing vacuously.
+            println!("[worldgen] FAIL heightmap {ty} compared no columns");
+            return Ok(false);
+        }
         let mut sorted = d.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         let n = sorted.len();
@@ -230,6 +262,10 @@ fn compare(
     }
     let mut worst_corr = 1f64;
     if heights.corr_type.is_some() {
+        if heights.pairs_a.is_empty() {
+            println!("[worldgen] FAIL correlation pair capture is empty");
+            return Ok(false);
+        }
         worst_corr = pearson(&heights.pairs_a, &heights.pairs_b);
         println!("[worldgen] height correlation: {worst_corr:.3}");
     }
@@ -293,7 +329,14 @@ fn compare(
             diffs.push((b as i64 - a as i64, name));
         }
     }
-    let overlap = overlap_lo as f64 / overlap_hi as f64;
+    // A zero denominator divides to NaN, which every threshold comparison
+    // treats as passing: empty histogram mass reads as zero overlap.
+    let overlap = if overlap_hi == 0 {
+        println!("[worldgen] FAIL block histograms carry no mass to compare");
+        0.0
+    } else {
+        overlap_lo as f64 / overlap_hi as f64
+    };
     println!("[worldgen] block histogram overlap: {overlap:.3}");
     diffs.sort_by_key(|(d, _)| d.abs());
     println!("[worldgen] largest material deltas (vanilla-ours):");
@@ -361,6 +404,17 @@ fn compare(
         // Without a shared heightmap type the delta and correlation metrics
         // above never ran; their zero-initialized worsts would pass vacuously.
         println!("[worldgen] FAIL no shared heightmap type between vanilla and generated chunks");
+        ok = false;
+    }
+    if structural_fail {
+        ok = false;
+    }
+    if masks.total == 0 {
+        println!("[worldgen] FAIL land mask compared no columns");
+        ok = false;
+    }
+    if cells_total == 0 {
+        println!("[worldgen] FAIL cell comparison covered no cells");
         ok = false;
     }
     if worst_median > MAX_MEDIAN_DELTA {

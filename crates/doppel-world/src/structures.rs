@@ -226,7 +226,7 @@ pub fn generate_chunk(
     world_seed: i64,
     cx: i32,
     cz: i32,
-) -> WireChunk {
+) -> Result<WireChunk> {
     let (mut blocks, _) = terrain.build_blocks(cx, cz);
     for volume in well_volumes_near(terrain, well, world_seed, cx, cz) {
         write_volume(&mut blocks, cx, cz, &volume);
@@ -382,8 +382,8 @@ mod tests {
         let reg = registry();
         let terrain = HeightmapGenerator::with_seed(42, &reg).unwrap();
         let well = WellBlocks::from_registry(&reg).unwrap();
-        let a = generate_chunk(&terrain, &well, 42, -347, 388);
-        let b = generate_chunk(&terrain, &well, 42, -346, 388);
+        let a = generate_chunk(&terrain, &well, 42, -347, 388).unwrap();
+        let b = generate_chunk(&terrain, &well, 42, -346, 388).unwrap();
 
         let sandstone = well.sandstone;
         let water = well.water;
@@ -424,18 +424,18 @@ mod tests {
             .collect();
         let forward: Vec<WireChunk> = area
             .iter()
-            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz))
+            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz).unwrap())
             .collect();
         let backward: Vec<WireChunk> = area
             .iter()
             .rev()
-            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz))
+            .map(|&(cx, cz)| generate_chunk(&terrain, &well, 42, cx, cz).unwrap())
             .collect();
         for (a, b) in forward.iter().zip(backward.iter().rev()) {
             assert_eq!(a, b);
         }
         // A lone chunk matches its in-context twin byte for byte.
-        let lone = generate_chunk(&terrain, &well, 42, 51, 15);
+        let lone = generate_chunk(&terrain, &well, 42, 51, 15).unwrap();
         let in_context = &forward[area.iter().position(|&c| c == (51, 15)).unwrap()];
         assert_eq!(&lone.encode(), &in_context.encode());
     }

@@ -7,6 +7,7 @@
 //! providers up front: an unsupported shape skips the feature before the
 //! stream moves, and everything the spawn set uses is supported.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use serde_json::Value;
@@ -191,18 +192,25 @@ impl StateProvider {
                         .into_iter()
                         .flatten()
                     {
-                        let weight =
-                            entry.get("weight").and_then(Value::as_i64).unwrap_or(0) as i32;
-                        match plain_state(d, entry.get("data").unwrap_or(&Value::Null)) {
-                            Some(state) => entries.push((weight, state)),
+                        let Some(weight) = entry.get("weight").and_then(Value::as_i64) else {
+                            return StateProvider::None;
+                        };
+                        let Some(data) = entry.get("data") else {
+                            return StateProvider::None;
+                        };
+                        match plain_state(d, data) {
+                            Some(state) => entries.push((weight as i32, state)),
                             None => return StateProvider::None,
                         }
                     }
-                    let total: i32 = entries.iter().map(|(w, _)| w).sum();
-                    if total <= 0 {
+                    let total: i64 = entries.iter().map(|(w, _)| *w as i64).sum();
+                    if total <= 0 || total > i32::MAX as i64 {
                         return StateProvider::None;
                     }
-                    StateProvider::Weighted { total, entries }
+                    StateProvider::Weighted {
+                        total: total as i32,
+                        entries,
+                    }
                 }
                 Some("minecraft:soil_beneath_tree") => StateProvider::Soil,
                 Some("minecraft:simple_state_provider") => match v.get("state") {
@@ -248,8 +256,85 @@ impl StateProvider {
 // Feature dispatch.
 // ---------------------------------------------------------------------------
 
+/// Feature kinds the pins carry but the engine places nothing for yet.
+/// Plan validation accepts exactly these and the dispatch arms; any other
+/// kind fails the plan load instead of skipping silently.
+pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 41] = [
+    "minecraft:ore",
+    "minecraft:overlay",
+    "minecraft:vegetation_patch",
+    "minecraft:spring_feature",
+    "minecraft:disk",
+    "minecraft:block_pile",
+    "minecraft:huge_fungus",
+    "minecraft:sequence",
+    "minecraft:bamboo",
+    "minecraft:netherrack_replace_blobs",
+    "minecraft:speleothem_cluster",
+    "minecraft:coral_claw",
+    "minecraft:coral_tree",
+    "minecraft:speleothem",
+    "minecraft:stepped_column_cluster",
+    "minecraft:end_gateway",
+    "minecraft:end_podium",
+    "minecraft:fossil",
+    "minecraft:iceberg",
+    "minecraft:random_boolean_selector",
+    "minecraft:scattered_ore",
+    "minecraft:root_system",
+    "minecraft:geode",
+    "minecraft:blue_ice",
+    "minecraft:bonus_chest",
+    "minecraft:chorus_plant",
+    "minecraft:waterlogged_vegetation_patch",
+    "minecraft:delta_feature",
+    "minecraft:end_island",
+    "minecraft:end_platform",
+    "minecraft:end_spike",
+    "minecraft:block_blob",
+    "minecraft:freeze_top_layer",
+    "minecraft:random_neighbor_spread",
+    "minecraft:spike",
+    "minecraft:lake",
+    "minecraft:large_dripstone",
+    "minecraft:monster_room",
+    "minecraft:underwater_magma",
+    "minecraft:vines",
+    "minecraft:void_start_platform",
+];
+
+/// Trunk placers, foliage placers, and tree decorators the tree parser
+/// does not model: a tree config carrying one accepts as unplaced (the
+/// runtime rejects it there), and plan validation accepts exactly these.
+pub(crate) const UNPLACED_TREE_SHAPES: [&str; 23] = [
+    "minecraft:cherry_trunk_placer",
+    "minecraft:forking_trunk_placer",
+    "minecraft:giant_trunk_placer",
+    "minecraft:mega_jungle_trunk_placer",
+    "minecraft:poplar_trunk_placer",
+    "minecraft:upwards_branching_trunk_placer",
+    "minecraft:acacia_foliage_placer",
+    "minecraft:bush_foliage_placer",
+    "minecraft:cherry_foliage_placer",
+    "minecraft:jungle_foliage_placer",
+    "minecraft:mega_pine_foliage_placer",
+    "minecraft:pine_foliage_placer",
+    "minecraft:poplar_foliage_placer",
+    "minecraft:random_spread_foliage_placer",
+    "minecraft:spruce_foliage_placer",
+    "minecraft:alter_ground",
+    "minecraft:attached_to_leaves",
+    "minecraft:cocoa",
+    "minecraft:creaking_heart",
+    "minecraft:leave_vine",
+    "minecraft:pale_moss",
+    "minecraft:shelf_mushroom",
+    "minecraft:trunk_vine",
+];
+
 /// Runs the feature config at a resolved position. A bare string names a
-/// registered config; unsupported types place nothing and draw nothing.
+/// registered config; unplaced kinds draw nothing, and plan validation has
+/// already rejected everything else.
 pub(crate) fn run_feature(
     d: &mut Decorator,
     v: &Value,
@@ -279,53 +364,66 @@ pub(crate) fn run_feature(
         "minecraft:random_selector" => {
             // One float per entry in list order; the first pass wins and
             // the default feature runs when none does.
-            if let Some(list) = v.get("features").and_then(Value::as_array) {
-                for entry in list {
-                    let chance = entry.get("chance").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-                    if rng.next_f32() < chance {
-                        run_placed_value(d, entry.get("feature"), rng, x, y, z);
-                        return;
-                    }
+            let Some(list) = v.get("features").and_then(Value::as_array) else {
+                debug_assert!(false, "selector without a features list");
+                return;
+            };
+            for entry in list {
+                let Some(chance) = entry.get("chance").and_then(Value::as_f64) else {
+                    debug_assert!(false, "selector entry without a chance");
+                    return;
+                };
+                if rng.next_f32() < chance as f32 {
+                    run_placed_value(d, entry.get("feature"), rng, x, y, z);
+                    return;
                 }
             }
             run_placed_value(d, v.get("default"), rng, x, y, z);
         }
         "minecraft:simple_random_selector" => {
-            if let Some(list) = v.get("features").and_then(Value::as_array) {
-                if !list.is_empty() {
-                    let pick = rng.next_int(list.len() as i32) as usize;
-                    run_placed_value(d, list.get(pick), rng, x, y, z);
-                }
+            let Some(list) = v.get("features").and_then(Value::as_array) else {
+                debug_assert!(false, "selector without a features list");
+                return;
+            };
+            if list.is_empty() {
+                debug_assert!(false, "selector without entries");
+                return;
             }
+            let pick = rng.next_int(list.len() as i32) as usize;
+            run_placed_value(d, list.get(pick), rng, x, y, z);
         }
         "minecraft:weighted_random_selector" => {
-            let entries: Vec<(i32, &Value)> = v
-                .get("features")
-                .and_then(Value::as_array)
-                .map(|list| {
-                    list.iter()
-                        .map(|entry| {
-                            (
-                                entry.get("weight").and_then(Value::as_i64).unwrap_or(0) as i32,
-                                entry.get("data").unwrap_or(&Value::Null),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let total: i32 = entries.iter().map(|(w, _)| w).sum();
-            if total > 0 && !entries.is_empty() {
-                let mut pick = rng.next_int(total);
-                let mut chosen = entries.len() - 1;
-                for (i, (weight, _)) in entries.iter().enumerate() {
-                    if pick < *weight {
-                        chosen = i;
-                        break;
-                    }
-                    pick -= weight;
-                }
-                run_placed_value(d, Some(entries[chosen].1), rng, x, y, z);
+            let Some(raw) = v.get("features").and_then(Value::as_array) else {
+                debug_assert!(false, "selector without a features list");
+                return;
+            };
+            let mut entries: Vec<(i32, &Value)> = Vec::with_capacity(raw.len());
+            for entry in raw {
+                let Some(weight) = entry.get("weight").and_then(Value::as_i64) else {
+                    debug_assert!(false, "weighted entry without a weight");
+                    return;
+                };
+                let Some(data) = entry.get("data") else {
+                    debug_assert!(false, "weighted entry without data");
+                    return;
+                };
+                entries.push((weight as i32, data));
             }
+            let total: i64 = entries.iter().map(|(w, _)| *w as i64).sum();
+            if total <= 0 || total > i32::MAX as i64 {
+                debug_assert!(false, "weighted total out of range");
+                return;
+            }
+            let mut pick = rng.next_int(total as i32);
+            let mut chosen = entries.len() - 1;
+            for (i, (weight, _)) in entries.iter().enumerate() {
+                if pick < *weight {
+                    chosen = i;
+                    break;
+                }
+                pick -= weight;
+            }
+            run_placed_value(d, Some(entries[chosen].1), rng, x, y, z);
         }
         "minecraft:simple_block" => run_simple_block(d, v, rng, x, y, z),
         "minecraft:tree" => run_tree(d, v, rng, x, y, z),
@@ -335,7 +433,12 @@ pub(crate) fn run_feature(
         }
         "minecraft:block_column" => run_block_column(d, v, rng, x, y, z),
         "minecraft:multiface_growth" => run_multiface(d, v, rng, x, y, z),
-        _ => {}
+        other => {
+            debug_assert!(
+                UNPLACED_FEATURE_KINDS.contains(&other),
+                "unvalidated feature kind {other}"
+            );
+        }
     }
 }
 
@@ -413,6 +516,7 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
         Predicate::AnyOf(list) => list.iter().any(|p| test_predicate(d, p, x, y, z)),
         Predicate::Not(inner) => !test_predicate(d, inner, x, y, z),
         Predicate::True => true,
+        Predicate::Unsupported => false,
     }
 }
 
@@ -663,7 +767,7 @@ enum TreeDecoratorCfg {
     },
 }
 
-struct TreeCfg {
+pub(crate) struct TreeCfg {
     trunk: StateProvider,
     leaves: StateProvider,
     below_trunk: StateProvider,
@@ -687,7 +791,7 @@ fn draw_field(v: &Value, key: &str) -> Option<IntDraw> {
 }
 
 /// Parses a tree config; None marks a shape this engine does not run.
-fn parse_tree(d: &Decorator, v: &Value) -> Option<TreeCfg> {
+pub(crate) fn parse_tree(d: &Decorator, v: &Value) -> Option<TreeCfg> {
     let trunk_placer = v.get("trunk_placer")?;
     let trunk_kind = match trunk_placer.get("type").and_then(Value::as_str)? {
         "minecraft:straight_trunk_placer" => TrunkKind::Straight,
@@ -866,6 +970,8 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
         FoliageKind::DarkOak => 4,
     };
     let leaf_radius = cfg.foliage.radius.sample(rng);
+    #[cfg(test)]
+    let stage_height = rng.words;
     if y < MIN_Y + 1 || y + tree_height + 1 > WORLD_TOP + 1 {
         return;
     }
@@ -880,12 +986,24 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
         TrunkKind::DarkOak => dark_oak_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
         TrunkKind::Fancy => fancy_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
     };
+    #[cfg(test)]
+    let stage_trunk = rng.words;
     for att in &attachments {
         create_foliage(d, &cfg, rng, att, foliage_height, leaf_radius, &mut leaves);
+    }
+    #[cfg(test)]
+    if let Some(log) = d.scatter_log.as_mut() {
+        log.push(format!(
+            "tree ({x},{y},{z}) h {tree_height} words height {stage_height} trunk {stage_trunk} foliage {} logs {} leaves {}",
+            rng.words,
+            logs.len(),
+            leaves.len()
+        ));
     }
     // The decorator context sorts the position sets by height.
     logs.sort_unstable_by_key(|p| p.1);
     leaves.sort_unstable_by_key(|p| p.1);
+    let mut decorations: Vec<(i32, i32, i32)> = Vec::new();
     for deco in &cfg.decorators {
         match *deco {
             TreeDecoratorCfg::PlaceOnGround {
@@ -893,9 +1011,191 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
                 radius,
                 height,
                 ref provider,
-            } => place_on_ground(d, rng, tries, radius, height, provider, &logs),
+            } => place_on_ground(
+                d,
+                rng,
+                tries,
+                radius,
+                height,
+                provider,
+                &logs,
+                &mut decorations,
+            ),
             TreeDecoratorCfg::Beehive { probability } => {
-                beehive(d, rng, probability, &logs, &leaves)
+                beehive(d, rng, probability, &logs, &leaves, &mut decorations)
+            }
+        }
+    }
+    update_leaf_distances(d, &logs, &leaves, &decorations);
+}
+
+/// The position hash the leaf walk orders pending cells by: the axes fold
+/// into one word.
+fn leaf_walk_hash(p: &(i32, i32, i32)) -> i32 {
+    (p.1.wrapping_add(p.2.wrapping_mul(31)))
+        .wrapping_mul(31)
+        .wrapping_add(p.0)
+}
+
+/// Trunk-family blocks count as distance zero in the leaf walk.
+fn trunk_like(name: &str) -> bool {
+    name.ends_with("_log")
+        || name.ends_with("_wood")
+        || name.ends_with("_stem")
+        || name.ends_with("_hyphae")
+}
+
+/// The leaf-distance walk: pending cells sit in buckets by distance, the
+/// trunk logs at zero, each step pops the first cell of the smallest
+/// non-empty bucket in spread-hash table order (insertion order within a
+/// table slot), and a popped cell takes its bucket as its distance
+/// property. A cell can enter two buckets; the later bucket's write wins.
+/// Expansion offers unwritten in-box neighbors carrying a distance
+/// property the minimum of their current value and the bucket plus one;
+/// trunk-family blocks count as distance zero. The walk stays inside the
+/// box the tree's own placements enclose and rewrites distance only, so
+/// the heightmaps stay untouched.
+fn update_leaf_distances(
+    d: &mut Decorator,
+    logs: &[(i32, i32, i32)],
+    leaves: &[(i32, i32, i32)],
+    decorations: &[(i32, i32, i32)],
+) {
+    if logs.is_empty() && leaves.is_empty() {
+        return;
+    }
+    // The walk never leaves the box enclosing everything the tree placed.
+    let (mut bx0, mut bx1, mut by0, mut by1, mut bz0, mut bz1) =
+        (i32::MAX, i32::MIN, i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for &(x, y, z) in logs.iter().chain(leaves).chain(decorations) {
+        bx0 = bx0.min(x);
+        bx1 = bx1.max(x);
+        by0 = by0.min(y);
+        by1 = by1.max(y);
+        bz0 = bz0.min(z);
+        bz1 = bz1.max(z);
+    }
+    // A pending cell plus its insertion sequence.
+    type WalkCell = ((i32, i32, i32), usize);
+    let mut buckets: Vec<Vec<WalkCell>> = vec![Vec::new(); 7];
+    // The table grows past load thresholds and never shrinks; a table slot
+    // holding eight cells under capacity sixty-four grows the table too.
+    let mut caps = [16u32; 7];
+    let mut slots: Vec<HashMap<u32, usize>> = vec![HashMap::new(); 7];
+    let slot_of = |caps: &u32, at: &(i32, i32, i32)| -> u32 {
+        let h = leaf_walk_hash(at) as u32;
+        (h ^ (h >> 16)) & (caps - 1)
+    };
+    let mut seq = 0usize;
+    for &at in logs {
+        buckets[0].push((at, seq));
+        seq += 1;
+    }
+    while buckets[0].len() > (caps[0] as usize * 3) / 4 {
+        caps[0] *= 2;
+    }
+    slots[0] = buckets[0].iter().fold(HashMap::new(), |mut m, &(at, _)| {
+        *m.entry(slot_of(&caps[0], &at)).or_default() += 1;
+        m
+    });
+    let mut seen: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
+    let mut smallest = 0usize;
+    loop {
+        while smallest < 7 && buckets[smallest].is_empty() {
+            smallest += 1;
+        }
+        if smallest >= 7 {
+            return;
+        }
+        let mask = caps[smallest] - 1;
+        let pick = buckets[smallest]
+            .iter()
+            .enumerate()
+            .min_by_key(|&(k, &(at, s))| {
+                let h = leaf_walk_hash(&at) as u32;
+                ((h ^ (h >> 16)) & mask, s, k)
+            })
+            .map(|(k, _)| k)
+            .expect("bucket nonempty above");
+        let (at @ (px, py, pz), _) = buckets[smallest][pick];
+        buckets[smallest].swap_remove(pick);
+        if smallest != 0 {
+            let state = d.block(px, py, pz);
+            let Some((name, props)) = d
+                .registry()
+                .state_of(state)
+                .map(|(n, p)| (n.to_string(), p.to_string()))
+            else {
+                seen.insert(at);
+                continue;
+            };
+            if BlockRegistry::prop_int(&props, "distance").is_some() {
+                let walked = BlockRegistry::with_prop(&props, "distance", &smallest.to_string());
+                if let Some(id) = d.state_id_of(&name, &walked) {
+                    d.set_block(px, py, pz, id);
+                }
+            }
+        }
+        seen.insert(at);
+        for (dx, dy, dz) in [
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            let next = (px + dx, py + dy, pz + dz);
+            if seen.contains(&next) {
+                continue;
+            }
+            if next.0 < bx0
+                || next.0 > bx1
+                || next.1 < by0
+                || next.1 > by1
+                || next.2 < bz0
+                || next.2 > bz1
+            {
+                continue;
+            }
+            let state = d.block(next.0, next.1, next.2);
+            let name = d.block_name(state).to_string();
+            let current = if trunk_like(&name) {
+                0
+            } else {
+                match d
+                    .registry()
+                    .state_of(state)
+                    .and_then(|(_, p)| BlockRegistry::prop_int(p, "distance"))
+                {
+                    Some(v) => v,
+                    None => continue,
+                }
+            };
+            let new_distance = current.min(smallest as i32 + 1);
+            if new_distance < 7 {
+                let bucket = &mut buckets[new_distance as usize];
+                if !bucket.iter().any(|&(b, _)| b == next) {
+                    bucket.push((next, seq));
+                    seq += 1;
+                    let idx = new_distance as usize;
+                    let slot = slot_of(&caps[idx], &next);
+                    let filled = {
+                        *slots[idx].entry(slot).or_default() += 1;
+                        slots[idx][&slot]
+                    };
+                    let mut grow = bucket.len() > (caps[idx] as usize * 3) / 4
+                        || filled >= 8 && caps[idx] < 64;
+                    while grow {
+                        caps[idx] *= 2;
+                        slots[idx] = bucket.iter().fold(HashMap::new(), |mut m, &(at, _)| {
+                            *m.entry(slot_of(&caps[idx], &at)).or_default() += 1;
+                            m
+                        });
+                        grow = bucket.len() > (caps[idx] as usize * 3) / 4;
+                    }
+                    smallest = smallest.min(idx);
+                }
             }
         }
     }
@@ -1377,6 +1677,7 @@ fn create_foliage(
 }
 
 /// Scatters ground cover around the lowest trunk row.
+#[allow(clippy::too_many_arguments)]
 fn place_on_ground(
     d: &mut Decorator,
     rng: &mut DecorRng,
@@ -1385,6 +1686,7 @@ fn place_on_ground(
     height: i32,
     provider: &StateProvider,
     logs: &[(i32, i32, i32)],
+    decorations: &mut Vec<(i32, i32, i32)>,
 ) {
     if logs.is_empty() {
         return;
@@ -1403,23 +1705,57 @@ fn place_on_ground(
     let (bx0, bx1) = (x0 - radius, x1 + radius);
     let (by0, by1) = (min_y - height, min_y + height);
     let (bz0, bz1) = (z0 - radius, z1 + radius);
+    #[cfg(test)]
+    if let Some(log) = d.scatter_log.as_mut() {
+        log.push(format!(
+            "pass {tries} {bx0} {bx1} {by0} {by1} {bz0} {bz1} w{}",
+            rng.words
+        ));
+    }
     for _ in 0..tries {
         let px = bx0 + rng.next_int(bx1 - bx0 + 1);
         let py = by0 + rng.next_int(by1 - by0 + 1);
         let pz = bz0 + rng.next_int(bz1 - bz0 + 1);
         let above = d.block_name(d.block(px, py + 1, pz)).to_string();
         if above != "minecraft:air" && above != "minecraft:vine" {
+            #[cfg(test)]
+            if let Some(log) = d.scatter_log.as_mut() {
+                log.push(format!("({px},{py},{pz}) above {above} skip"));
+            }
             continue;
         }
         let ground = d.block_name(d.block(px, py, pz)).to_string();
         if !d.tag_contains("blocks_motion_no_leaves", &ground) {
+            #[cfg(test)]
+            if let Some(log) = d.scatter_log.as_mut() {
+                log.push(format!("({px},{py},{pz}) above air ground {ground} skip"));
+            }
             continue;
         }
-        if d.height(HeightKind::MotionBlockingNoLeaves, px, pz) > py + 1 {
+        let h = d.height(HeightKind::MotionBlockingNoLeaves, px, pz);
+        if h > py + 1 {
+            #[cfg(test)]
+            if let Some(log) = d.scatter_log.as_mut() {
+                log.push(format!(
+                    "({px},{py},{pz}) above air ground {ground} h {h} skip"
+                ));
+            }
             continue;
         }
         if let Some(state) = provider.sample(d, rng, px, py + 1, pz) {
+            #[cfg(test)]
+            let placed_name = d
+                .registry()
+                .state_of(state)
+                .map_or(String::new(), |(n, _)| n.to_string());
+            #[cfg(test)]
+            if let Some(log) = d.scatter_log.as_mut() {
+                log.push(format!(
+                    "({px},{py},{pz}) above air ground {ground} h {h} place {placed_name}"
+                ));
+            }
             d.set_block(px, py + 1, pz, state);
+            decorations.push((px, py + 1, pz));
         }
     }
 }
@@ -1440,6 +1776,7 @@ fn beehive(
     probability: f32,
     logs: &[(i32, i32, i32)],
     leaves: &[(i32, i32, i32)],
+    decorations: &mut Vec<(i32, i32, i32)>,
 ) {
     if logs.is_empty() {
         return;
@@ -1473,6 +1810,7 @@ fn beehive(
             let facing = face.opposite().prop;
             if let Some(state) = state_with_prop(d, "minecraft:bee_nest", "facing", facing) {
                 d.set_block(px, py, pz, state);
+                decorations.push((px, py, pz));
             }
             let bees = 2 + rng.next_int(2);
             for _ in 0..bees {
@@ -1497,14 +1835,14 @@ enum FallenDecorator {
     },
 }
 
-struct FallenCfg {
+pub(crate) struct FallenCfg {
     trunk: StateProvider,
     log_length: IntDraw,
     stump_decorators: Vec<FallenDecorator>,
     log_decorators: Vec<FallenDecorator>,
 }
 
-fn parse_fallen(d: &Decorator, v: &Value) -> Option<FallenCfg> {
+pub(crate) fn parse_fallen(d: &Decorator, v: &Value) -> Option<FallenCfg> {
     let trunk = StateProvider::parse(d, v.get("trunk_provider")?);
     if matches!(trunk, StateProvider::None) {
         return None;
@@ -1693,7 +2031,7 @@ fn run_fallen_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: 
 // Huge mushrooms.
 // ---------------------------------------------------------------------------
 
-struct MushroomCfg {
+pub(crate) struct MushroomCfg {
     cap: StateProvider,
     stem: StateProvider,
     radius: i32,
@@ -1701,7 +2039,7 @@ struct MushroomCfg {
     red: bool,
 }
 
-fn parse_mushroom(d: &Decorator, v: &Value, red: bool) -> Option<MushroomCfg> {
+pub(crate) fn parse_mushroom(d: &Decorator, v: &Value, red: bool) -> Option<MushroomCfg> {
     let cap = StateProvider::parse(d, v.get("cap_provider")?);
     let stem = StateProvider::parse(d, v.get("stem_provider")?);
     if matches!(cap, StateProvider::None) || matches!(stem, StateProvider::None) {

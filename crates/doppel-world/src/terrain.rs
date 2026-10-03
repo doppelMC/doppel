@@ -22,9 +22,6 @@ const HEIGHTMAP_CELLS: usize = SECTION_EDGE * SECTION_EDGE;
 const HEIGHTMAP_BITS: usize = 9;
 const LIGHT_LAYER_SPAN: usize = SECTION_SPAN + 2;
 const WORLD_LAYERS: usize = SECTION_SPAN * SECTION_EDGE;
-/// The client-facing heightmaps in wire order: world surface (1),
-/// motion-blocking without leaves (5), motion-blocking (4).
-const CLIENT_HEIGHTMAPS: [u32; 3] = [1, 5, 4];
 
 /// Where the ocean surface sits (world y).
 pub const SEA_LEVEL: i32 = 63;
@@ -258,7 +255,13 @@ impl ChunkEmitter {
     /// Emits a wire chunk from a filled block buffer; heightmaps and light
     /// recompute from the buffer so structure overlays stay consistent.
     /// Biome cells override the default biome per section.
-    fn emit(&self, cx: i32, cz: i32, blocks: &[u32], biomes: Option<&SectionBiomes>) -> WireChunk {
+    fn emit(
+        &self,
+        cx: i32,
+        cz: i32,
+        blocks: &[u32],
+        biomes: Option<&SectionBiomes>,
+    ) -> Result<WireChunk> {
         debug_assert_eq!(blocks.len(), WORLD_LAYERS * HEIGHTMAP_CELLS);
         let mut sections = Vec::with_capacity(SECTION_SPAN);
         let mut ground: Option<(usize, usize)> = None;
@@ -283,26 +286,21 @@ impl ChunkEmitter {
                 .find(|&y| blocks[layer_index(y) * HEIGHTMAP_CELLS + column] != self.air);
             first_free[column] = top.map(|y| (y + 1 - MIN_Y) as usize).unwrap_or(0);
         }
-        // Each client map carries its own surface predicate; without the
-        // pinned tags the shared top-non-air scan stands in for all three.
-        let heightmaps: Vec<(u32, Vec<u64>)> =
-            match crate::decoration::wire_heightmaps(&self.registry, blocks) {
-                Ok(maps) => maps
-                    .map(|(ty, columns)| (ty, pack(&columns, HEIGHTMAP_BITS)))
-                    .to_vec(),
-                Err(_) => CLIENT_HEIGHTMAPS
-                    .map(|ty| (ty, pack(&first_free.map(|v| v as u16), HEIGHTMAP_BITS)))
-                    .to_vec(),
-            };
+        // Each client map carries its own surface predicate.
+        let maps = crate::decoration::wire_heightmaps(&self.registry, blocks)
+            .context("wire heightmaps")?;
+        let heightmaps: Vec<(u32, Vec<u64>)> = maps
+            .map(|(ty, columns)| (ty, pack(&columns, HEIGHTMAP_BITS)))
+            .to_vec();
 
-        WireChunk {
+        Ok(WireChunk {
             x: cx,
             z: cz,
             heightmaps,
             sections,
             block_entities: Vec::new(),
             light: self.light(ground, &first_free),
-        }
+        })
     }
 
     /// One wire section from its 4096 storage-order cells. The palette leads
@@ -536,7 +534,7 @@ impl HeightmapGenerator {
     }
 
     /// Generates the terrain-only chunk.
-    pub fn generate(&self, cx: i32, cz: i32) -> WireChunk {
+    pub fn generate(&self, cx: i32, cz: i32) -> Result<WireChunk> {
         let (blocks, _) = self.build_blocks(cx, cz);
         let biomes = self.section_biomes(cx, cz);
         self.emitter.emit(cx, cz, &blocks, biomes.as_ref())
@@ -551,7 +549,7 @@ impl HeightmapGenerator {
         cz: i32,
         blocks: &[u32],
         biomes: Option<&SectionBiomes>,
-    ) -> WireChunk {
+    ) -> Result<WireChunk> {
         self.emitter.emit(cx, cz, blocks, biomes)
     }
 }
@@ -687,7 +685,7 @@ mod tests {
     #[test]
     fn heightmaps_match_blocks() {
         let gen = generator();
-        let chunk = gen.generate(0, 0);
+        let chunk = gen.generate(0, 0).unwrap();
         let values = unpack(&chunk.heightmaps[0].1, HEIGHTMAP_BITS, HEIGHTMAP_CELLS);
         let section_cells: Vec<Vec<u32>> = (0..SECTION_SPAN)
             .map(|s| unpack_section(&chunk, s))
@@ -716,7 +714,7 @@ mod tests {
     fn sections_well_formed() {
         let gen = generator();
         // Chunk (3, 6) is fully ocean at this seed; its sections carry water.
-        let chunk = gen.generate(3, 6);
+        let chunk = gen.generate(3, 6).unwrap();
         assert_eq!(chunk.sections.len(), SECTION_SPAN);
         assert!(chunk.block_entities.is_empty());
         let states = resolve_states(&registry()).unwrap();
@@ -768,15 +766,15 @@ mod tests {
     #[test]
     fn determinism_and_seed_sensitivity() {
         let gen = generator();
-        let a = gen.generate(2, 2);
-        let b = gen.generate(2, 2);
+        let a = gen.generate(2, 2).unwrap();
+        let b = gen.generate(2, 2).unwrap();
         assert_eq!(a, b, "same seed regenerates identically");
         let other = HeightmapGenerator::fitted_with_seed(43, &registry()).unwrap();
-        let c = other.generate(2, 2);
+        let c = other.generate(2, 2).unwrap();
         assert_ne!(a, c, "different seed changes terrain");
         // Chunk-order independence: generating neighbors must not shift
         // any chunk's content.
-        let lone = generator().generate(2, 2);
+        let lone = generator().generate(2, 2).unwrap();
         assert_eq!(a, lone);
     }
 
@@ -784,7 +782,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let gen = generator();
         for (cx, cz) in [(0, 0), (-9, 12), (100, -100)] {
-            let chunk = gen.generate(cx, cz);
+            let chunk = gen.generate(cx, cz).unwrap();
             let bytes = chunk.encode();
             let decoded = WireChunk::decode(&bytes).expect("decode generated chunk");
             assert_eq!(decoded, chunk, "chunk ({cx},{cz})");
@@ -798,7 +796,7 @@ mod tests {
     #[test]
     fn density_engine_chunk() {
         let gen = HeightmapGenerator::with_seed(42, &registry()).expect("density generator");
-        let chunk = gen.generate(0, 0);
+        let chunk = gen.generate(0, 0).unwrap();
         assert_eq!(chunk.sections.len(), SECTION_SPAN);
         let values = unpack(&chunk.heightmaps[0].1, HEIGHTMAP_BITS, HEIGHTMAP_CELLS);
         let section_cells: Vec<Vec<u32>> = (0..SECTION_SPAN)
@@ -817,14 +815,15 @@ mod tests {
             }
             assert_eq!(values[column], expected, "column {column}");
         }
-        let again = gen.generate(0, 0);
+        let again = gen.generate(0, 0).unwrap();
         assert_eq!(again.encode(), chunk.encode(), "same seed refills");
         // Chunk-order independence: emitting a neighbor leaves this chunk
         // stable.
         let _ = HeightmapGenerator::with_seed(42, &registry())
             .unwrap()
-            .generate(1, 0);
-        assert_eq!(gen.generate(0, 0).encode(), chunk.encode());
+            .generate(1, 0)
+            .unwrap();
+        assert_eq!(gen.generate(0, 0).unwrap().encode(), chunk.encode());
     }
 
     /// Biome containers pack ids in first-appearance cell order and widen
@@ -888,7 +887,7 @@ mod tests {
     #[test]
     fn density_engine_emits_climate_biomes() {
         let gen = HeightmapGenerator::with_seed(42, &registry()).expect("density generator");
-        let chunk = gen.generate(0, 0);
+        let chunk = gen.generate(0, 0).unwrap();
         let bytes = chunk.encode();
         let decoded = WireChunk::decode(&bytes).expect("decode with biome palettes");
         assert_eq!(decoded, chunk);
@@ -910,7 +909,7 @@ mod tests {
             "expected a mixed-biome section somewhere"
         );
         assert_eq!(
-            gen.generate(0, 0).encode(),
+            gen.generate(0, 0).unwrap().encode(),
             bytes,
             "biome fill is deterministic"
         );
