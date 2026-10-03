@@ -835,29 +835,6 @@ impl Game {
         self.send(conn, 0x7c, &body);
     }
 
-    /// Applies a creative slot push. Vanilla only records these in
-    /// creative mode and never echoes a set_slot back: the client's own
-    /// prediction stands.
-    fn creative_slot(&mut self, conn: ConnId, set: crate::inventory::CreativeSlotSet) {
-        let Some(p) = self.players.get(&conn) else {
-            return;
-        };
-        if !p.inv.creative {
-            return;
-        }
-        if set.slot < 0 {
-            return;
-        }
-        let slot = set.slot as usize;
-        if slot >= 46 {
-            return;
-        }
-        let Some(p) = self.players.get_mut(&conn) else {
-            return;
-        };
-        crate::inventory::menu_slot_set(&mut p.inv.inventory, slot, set.stack);
-    }
-
     /// Logs a dropped world write, once per (chunk, reason).
     fn warn_dropped_write(&mut self, cx: i32, cz: i32, reason: &str) {
         if self.warned_writes.insert((cx, cz, reason.to_string())) {

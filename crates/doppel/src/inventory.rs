@@ -1488,6 +1488,26 @@ impl Game {
         }
     }
 
+    pub(crate) fn creative_slot(&mut self, conn: ConnId, set: CreativeSlotSet) {
+        let Some(p) = self.players.get(&conn) else {
+            return;
+        };
+        if !p.inv.creative {
+            return;
+        }
+        if set.slot < 0 {
+            return;
+        }
+        let slot = set.slot as usize;
+        if slot >= 46 {
+            return;
+        }
+        let Some(p) = self.players.get_mut(&conn) else {
+            return;
+        };
+        crate::inventory::menu_slot_set(&mut p.inv.inventory, slot, set.stack);
+    }
+
     /// Serverbound container_click against the always-open inventory menu.
     ///
     /// NOTE(inventory): the client's HashedStack predictions are decoded
