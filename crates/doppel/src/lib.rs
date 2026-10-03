@@ -411,6 +411,14 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     _ => {}
                 }
             }
+            // `time set <ticks>`: the game thread stores the day time
+            // and answers with a set_time broadcast plus the pacing
+            // reply.
+            if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
+                if let Ok(value) = parts[2].parse::<i64>() {
+                    return Some(game::Inbound::TimeSet { conn, value });
+                }
+            }
             // `gamemode <mode>` for the commanding player flips the
             // creative flag the inventory and placement paths read.
             if parts.len() == 2 && parts[0] == "gamemode" {

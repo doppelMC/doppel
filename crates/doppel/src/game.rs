@@ -124,6 +124,11 @@ pub enum Inbound {
         conn: ConnId,
         tick_speed: usize,
     },
+    /// `time set <ticks>`: stores the day time and pushes set_time.
+    TimeSet {
+        conn: ConnId,
+        value: i64,
+    },
     /// A spawner gamerule (`spawn_mobs` and kin): a no-op here, this
     /// build has no mob spawning.
     GameRuleNoop {
@@ -257,6 +262,8 @@ pub struct Game {
     flat: Option<doppel_world::worldgen::FlatGenerator>,
     /// Monotonic game tick.
     tick: u64,
+    /// Day time in ticks, set by `time set` and carried by set_time.
+    day_time: i64,
     /// Scheduled actions: fire at tick T with a behavior tag.
     scheduled: Vec<(u64, (i32, i32, i32), TickAction)>,
     /// Unified pending-transition guard: (pos, kind). Replaces the
@@ -403,6 +410,7 @@ impl Game {
                     .flatten()
             }),
             tick: 0,
+            day_time: 0,
             scheduled: Vec::new(),
             pending: std::collections::BTreeSet::new(),
             torch_queue: Vec::new(),
@@ -569,19 +577,22 @@ impl Game {
     }
 
     /// set_time (0x73): gameTime i64 + day counter, every 20 ticks.
-    /// Static world placeholder until time simulation lands.
     fn broadcast_time(&mut self) {
         if self.tick.is_multiple_of(20) {
-            // set_time (0x73): gameTime i64 + day counter. Static world
-            // placeholder until time simulation lands.
-            let mut body = Vec::with_capacity(18);
-            body.extend_from_slice(&0i64.to_be_bytes());
-            body.extend_from_slice(&0i64.to_be_bytes());
-            body.push(0);
-            let conns: Vec<ConnId> = self.players.keys().copied().collect();
-            for c in conns {
-                self.send(c, 0x73, &body);
-            }
+            self.send_set_time();
+        }
+    }
+
+    /// Sends set_time (0x73) with the stored day time. gameTime stays a
+    /// static placeholder until time simulation lands.
+    fn send_set_time(&mut self) {
+        let mut body = Vec::with_capacity(18);
+        body.extend_from_slice(&0i64.to_be_bytes());
+        body.extend_from_slice(&self.day_time.to_be_bytes());
+        body.push(0);
+        let conns: Vec<ConnId> = self.players.keys().copied().collect();
+        for c in conns {
+            self.send(c, 0x73, &body);
         }
     }
 
@@ -758,6 +769,11 @@ impl Game {
             // --- survival hooks (entities.rs) ---
             Inbound::GameRule { conn, tick_speed } => {
                 self.set_tick_speed(tick_speed);
+                self.send_command_feedback(conn);
+            }
+            Inbound::TimeSet { conn, value } => {
+                self.day_time = value;
+                self.send_set_time();
                 self.send_command_feedback(conn);
             }
             Inbound::GameRuleNoop { conn } => {
