@@ -807,7 +807,12 @@ impl Game {
             }
             Inbound::Tp { conn, x, y, z } => {
                 self.teleport_conn(conn, x, y, z);
-                self.send_command_feedback(conn);
+                let name = self
+                    .players
+                    .get(&conn)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
             }
             Inbound::TpNamed {
                 conn,
@@ -824,7 +829,13 @@ impl Game {
                 if let Some(target) = target {
                     self.teleport_conn(target, x, y, z);
                 }
-                self.send_command_feedback(conn);
+                let name = self
+                    .players
+                    .iter()
+                    .find(|(_, p)| p.name == name)
+                    .map(|(_, p)| p.name.clone())
+                    .unwrap_or_default();
+                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
             }
             Inbound::KeepAliveAnswer { conn, id } => {
                 if let Some(p) = self.players.get_mut(&conn) {
@@ -844,7 +855,7 @@ impl Game {
                 name,
             } => {
                 self.setblock(conn, x, y, z, name);
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
             }
             // --- inventory hooks (inventory.rs) ---
             Inbound::SetCarriedItem { conn, slot } => self.select_hotbar_slot(conn, slot),
@@ -853,19 +864,23 @@ impl Game {
                 if let Some(p) = self.players.get_mut(&conn) {
                     p.inv.creative = creative;
                 }
-                self.send_command_feedback(conn);
+                let mode = if creative { "Creative" } else { "Survival" };
+                self.send_command_feedback(conn, &format!("Set own game mode to {mode} Mode"));
             }
             Inbound::CreativeSlot { conn, set } => {
                 self.creative_slot(conn, set);
             }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, &format!("Gave {count} {item}"));
             }
             // --- survival hooks (entities.rs) ---
             Inbound::GameRule { conn, tick_speed } => {
                 self.set_tick_speed(tick_speed);
-                self.send_command_feedback(conn);
+                self.send_command_feedback(
+                    conn,
+                    &format!("Gamerule randomTickSpeed is now set to: {tick_speed}"),
+                );
             }
             Inbound::TimeSet { conn, value } => {
                 self.day_time = value;
@@ -874,10 +889,10 @@ impl Game {
                 self.spawning.day_time = value.rem_euclid(24000) as u64;
                 self.spawning.time_running = true;
                 self.send_set_time();
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, &format!("Set the time to {value}"));
             }
             Inbound::GameRuleNoop { conn } => {
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, "Gamerule updated");
             }
             // --- mob hooks (living.rs / spawning.rs) ---
             Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
@@ -907,7 +922,7 @@ impl Game {
             // --- containers hooks (containers.rs) ---
             Inbound::OpenContainer { conn, x, y, z } => {
                 self.open_container(conn, x, y, z);
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, "");
             }
             Inbound::ContainerClose { conn, container_id } => {
                 self.client_closed_container(conn, container_id)
@@ -940,11 +955,12 @@ impl Game {
                     self.game_tick();
                 }
                 self.flush_suspended = false;
-                self.send_command_feedback(conn);
+                self.send_command_feedback(conn, "");
             }
             Inbound::TickFreeze { conn, frozen } => {
                 self.frozen = frozen;
-                self.send_command_feedback(conn);
+                let what = if frozen { "frozen" } else { "resumed" };
+                self.send_command_feedback(conn, &format!("Tick {what}"));
             }
         }
     }
@@ -955,12 +971,14 @@ impl Game {
         match event {
             Inbound::SpawnMobs { conn, enabled } => {
                 self.spawning.spawn_mobs = enabled;
-                self.send_command_feedback(conn);
+                let what = if enabled { "enabled" } else { "disabled" };
+                self.send_command_feedback(conn, &format!("Mob spawning {what}"));
             }
 
             Inbound::SetDifficulty { conn, peaceful } => {
                 self.spawning.peaceful = peaceful;
-                self.send_command_feedback(conn);
+                let what = if peaceful { "Peaceful" } else { "Normal" };
+                self.send_command_feedback(conn, &format!("Set difficulty to {what}"));
             }
             _ => {}
         }
@@ -1082,10 +1100,17 @@ impl Game {
 
     /// Command feedback: an empty text component plus overlay=false.
     /// The reference answers every scripted command; the differential
-    /// harness paces itself on these replies. Body parity (the exact
-    /// component) is future work against a captured reference.
-    fn send_command_feedback(&mut self, conn: ConnId) {
-        let body = [0x00u8, 0x00];
+    /// system_chat (0x7c) carrying the command feedback: the component
+    /// travels as anonymous-root NBT (a literal text is a bare TAG_String)
+    /// followed by the overlay bool. The reply pacing of the oracle
+    /// harness rides on these frames.
+    fn send_command_feedback(&mut self, conn: ConnId, text: &str) {
+        let mut body = Vec::with_capacity(text.len() + 8);
+        body.push(0x08);
+        let n = text.len() as u16;
+        body.extend_from_slice(&n.to_be_bytes());
+        body.extend_from_slice(text.as_bytes());
+        body.push(0x00);
         self.send(conn, 0x7c, &body);
     }
 
