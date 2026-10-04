@@ -36,9 +36,11 @@ fn usage() -> ! {
                                        swamp) the bot teleports to
   doppel-oracle parity-survival     differential test: drops, pickup, grass
                                        decay/spread (break + random ticks)
-  doppel-oracle parity-mobs          differential test: zombie spawning at
-                                       midnight, pairing packets, and the
-                                       chase closing on the player
+  doppel-oracle parity-mobs          differential test: monster spawning at
+                                       midnight, pairing packets, the
+                                       chase closing on the player, and
+                                       the scripted skeleton, spider, and
+                                       creeper summons
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
                                       record vanilla's login transcript; with a
                                       blobs dir, dump byte-exact packet bodies
