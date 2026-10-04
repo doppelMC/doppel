@@ -65,6 +65,65 @@ fn build_chunk(world: Option<&SharedWorld>, reference: &WireChunk) -> Result<Wir
     }
 }
 
+/// Replays the captured join burst, rebuilding chunks from storage and
+/// rewriting the position and inventory packets with saved player state.
+/// Returns the absolute position the client ends up standing at.
+fn replay_join_burst(
+    conn: &mut Conn<TcpStream>,
+    blobs: Option<&Blobs>,
+    world: Option<&SharedWorld>,
+    name: &str,
+) -> Result<(f64, f64, f64)> {
+    let saved = world.and_then(|w| {
+        let w = w.lock().unwrap_or_else(|e| e.into_inner());
+        doppel_world::playerdata::load(&w.root, &blobs::offline_uuid(name))
+            .ok()
+            .flatten()
+    });
+    let saved_container: Vec<Option<inventory::ItemStack>> = saved
+        .as_ref()
+        .map(|data| saved_container_slots(&data.inventory))
+        .unwrap_or_default();
+    let mut join_pos = (0.0f64, 0.0f64, 0.0f64);
+    if let Some(b) = blobs {
+        for (id, body) in &b.play {
+            let body = if *id == 0x2e {
+                let chunk =
+                    doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
+                build_chunk(world, &chunk)?.encode()
+            } else if *id == 0x49 {
+                match &saved {
+                    Some(data) => rewrite_position(body, data.pos, data.yaw, data.pitch)
+                        .unwrap_or_else(|| body.clone()),
+                    None => body.clone(),
+                }
+            } else if *id == inventory::PACKET_CONTAINER_SET_CONTENT && saved.is_some() {
+                rewrite_set_content(body, &saved_container).unwrap_or_else(|| body.clone())
+            } else {
+                body.clone()
+            };
+            if *id == 0x49 {
+                let mut r = Reader::new(&body);
+                if r.read_varint().is_ok() {
+                    if let (Ok(x), Ok(y), Ok(z)) = (r.read_f64(), r.read_f64(), r.read_f64()) {
+                        let relative = r.read_f64().is_err()
+                            || r.read_f64().is_err()
+                            || r.read_f64().is_err()
+                            || r.read_f32().is_err()
+                            || r.read_f32().is_err()
+                            || !matches!(r.read_varint(), Ok(0));
+                        if !relative {
+                            join_pos = (x, y, z);
+                        }
+                    }
+                }
+            }
+            conn.write_packet(*id, &body)?;
+        }
+    }
+    Ok(join_pos)
+}
+
 /// Saved inventory slots in container-slot order; out-of-range slots are
 /// dropped.
 fn saved_container_slots(
@@ -293,53 +352,7 @@ fn handle_login(
     // first move or tp. Saved player state rewrites the burst's own
     // position and inventory packets, so the client joins directly on
     // the restored state instead of learning it afterwards.
-    let saved = world.as_ref().and_then(|w| {
-        let w = w.lock().unwrap_or_else(|e| e.into_inner());
-        doppel_world::playerdata::load(&w.root, &blobs::offline_uuid(&name))
-            .ok()
-            .flatten()
-    });
-    let saved_container: Vec<Option<inventory::ItemStack>> = saved
-        .as_ref()
-        .map(|data| saved_container_slots(&data.inventory))
-        .unwrap_or_default();
-    let mut join_pos = (0.0f64, 0.0f64, 0.0f64);
-    if let Some(b) = blobs {
-        for (id, body) in &b.play {
-            let body = if *id == 0x2e {
-                let chunk =
-                    doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
-                build_chunk(world, &chunk)?.encode()
-            } else if *id == 0x49 {
-                match &saved {
-                    Some(data) => rewrite_position(body, data.pos, data.yaw, data.pitch)
-                        .unwrap_or_else(|| body.clone()),
-                    None => body.clone(),
-                }
-            } else if *id == inventory::PACKET_CONTAINER_SET_CONTENT && saved.is_some() {
-                rewrite_set_content(body, &saved_container).unwrap_or_else(|| body.clone())
-            } else {
-                body.clone()
-            };
-            if *id == 0x49 {
-                let mut r = Reader::new(&body);
-                if r.read_varint().is_ok() {
-                    if let (Ok(x), Ok(y), Ok(z)) = (r.read_f64(), r.read_f64(), r.read_f64()) {
-                        let relative = r.read_f64().is_err()
-                            || r.read_f64().is_err()
-                            || r.read_f64().is_err()
-                            || r.read_f32().is_err()
-                            || r.read_f32().is_err()
-                            || !matches!(r.read_varint(), Ok(0));
-                        if !relative {
-                            join_pos = (x, y, z);
-                        }
-                    }
-                }
-            }
-            conn.write_packet(*id, &body)?;
-        }
-    }
+    let join_pos = replay_join_burst(&mut conn, blobs, world, &name)?;
 
     // Steady state: the connection becomes an IO actor. The reader loop
     // forwards Inbound events to the game thread; a writer thread drains
