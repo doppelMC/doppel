@@ -348,7 +348,7 @@ impl SurvivalState {
         lo + (hi - lo) * self.next_unit()
     }
 
-    fn next_uuid(&mut self) -> [u8; 16] {
+    pub(crate) fn next_uuid(&mut self) -> [u8; 16] {
         let a = Self::splitmix(&mut self.uuid_seed);
         let b = Self::splitmix(&mut self.uuid_seed);
         let mut uuid = [0u8; 16];
@@ -393,7 +393,7 @@ fn light_impermeable(name: &str) -> bool {
 }
 
 /// A solid cell for drop collision. Unloaded reads count as solid.
-fn block_solid(g: &Game, x: i32, y: i32, z: i32) -> bool {
+pub(crate) fn block_solid(g: &Game, x: i32, y: i32, z: i32) -> bool {
     match g.get_block(x, y, z) {
         None => true,
         Some((n, _)) => !passable(&n),
@@ -611,14 +611,14 @@ impl Game {
         }
     }
 
-    /// The per-tick entity pass: physics, merging, pickup, despawn.
-    /// Runs ahead of the dig pass so a break's drop ticks from the
-    /// following tick, like an entity added mid-tick.
+    /// The per-tick entity pass: physics, merging, pickup, despawn,
+    /// then the mob pass (living.rs).
     pub(crate) fn tick_entities(&mut self) {
         self.entity_physics();
         self.entity_merge();
         self.entity_pickup();
         self.entity_despawn();
+        self.tick_mobs();
     }
 
     /// Gravity, collision, friction, and the movement syncs.
@@ -1111,7 +1111,7 @@ impl Game {
     /// Sky exposure standing in for the brightness check: no
     /// light-blocking block in the column above. Exact under an open sky;
     /// the light engine is future work.
-    fn sky_exposed(&self, x: i32, y: i32, z: i32) -> bool {
+    pub(crate) fn sky_exposed(&self, x: i32, y: i32, z: i32) -> bool {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
         let Some(chunk) = self.chunks.get(&(cx, cz)) else {
@@ -1154,6 +1154,35 @@ impl Game {
             }
         }
         true
+    }
+
+    /// The topmost non-air cell of the column, top-down; None when the
+    /// chunk is missing or the column is empty. The surface the spawn
+    /// y draw bounds itself to.
+    pub(crate) fn column_surface(&self, x: i32, z: i32) -> Option<i32> {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        let chunk = self.chunks.get(&(cx, cz))?;
+        let lx = (x - cx * 16) as usize;
+        let lz = (z - cz * 16) as usize;
+        for (si, section) in chunk.wire.sections.iter().enumerate().rev() {
+            let base = (si as i32 - 4) * 16;
+            match &section.block_states {
+                Container::Single(0) => {}
+                Container::Single(_) => return Some(base + 15),
+                Container::Palette { .. } | Container::Global { .. } => {
+                    for ly in (0..16i32).rev() {
+                        let idx = ((ly << 8) | ((lz as i32) << 4) | lx as i32) as usize;
+                        if let Some(state) = get_section_cell(&chunk.wire, si, idx) {
+                            if state != 0 {
+                                return Some(base + ly);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

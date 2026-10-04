@@ -115,10 +115,26 @@ pub enum Inbound {
         conn: ConnId,
         tick_speed: usize,
     },
-    /// A spawner gamerule (`spawn_mobs` and kin): a no-op here, this
-    /// build has no mob spawning.
+    /// A spawner gamerule other than `spawn_mobs` (nothing to do yet;
+    /// the other categories have no entities).
     GameRuleNoop {
         conn: ConnId,
+    },
+    // --- mob hooks (living.rs / spawning.rs) ---
+    /// `gamerule spawn_mobs <bool>`: the natural-spawn gate.
+    SpawnMobs {
+        conn: ConnId,
+        enabled: bool,
+    },
+    /// `time set <ticks>`: move the day clock and start it.
+    TimeSet {
+        conn: ConnId,
+        ticks: u64,
+    },
+    /// `difficulty <word>`: peaceful removes monsters.
+    SetDifficulty {
+        conn: ConnId,
+        peaceful: bool,
     },
     // --- placement hooks (placement.rs) ---
     /// `move_player_rot`: view rotation without movement.
@@ -268,6 +284,11 @@ pub struct Game {
     // --- survival hooks (entities.rs) ---
     /// Live item entities and the random-tick bookkeeping.
     survival: entities::SurvivalState,
+    // --- mob hooks (living.rs / spawning.rs) ---
+    /// Live mobs and their per-tick sync state.
+    pub(crate) mobs: crate::living::MobState,
+    /// World time and the natural-spawn state.
+    pub(crate) spawning: crate::spawning::SpawnState,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -389,6 +410,8 @@ impl Game {
             containers: Default::default(),
             next_entity_id: 1,
             survival: Default::default(),
+            mobs: Default::default(),
+            spawning: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -437,13 +460,13 @@ impl Game {
         }
     }
 
-    /// One game tick (50ms): fire scheduled actions, then housekeeping.
     /// One game tick, phases in order. The order is load-bearing: a
     /// write lands in this tick's broadcast point (flush_dirty) or
     /// defers to the next depending on which phase makes it.
     ///
-    /// 1. tick counter advance
-    /// 2. tick_entities (entities.rs): item physics, merges, pickups
+    /// 1. tick counter advance (plus the day clock when it runs)
+    /// 2. tick_entities (entities.rs): item physics, merges, pickups,
+    ///    then mobs (living.rs)
     /// 3. advance_digs (dig.rs): the per-player dig clock, delayed
     ///    destroys, stage overlays
     /// 4. broadcast_pending_inventory (inventory.rs): non-click slot
@@ -452,18 +475,23 @@ impl Game {
     /// 6. fire_torches: queued torch transitions (1gt input delay)
     /// 7. run_scheduled_ticks: due redstone actions (neighbor and
     ///    shape updates, observer/repeater/comparator toggles)
-    /// 8. random_ticks (entities.rs): the chunk tick's grass pass
-    /// 9. flush_dirty: the broadcast point (0x08/0x56); edits after
-    ///    this defer to the next tick
-    /// 10. run_block_events: piston world mutations (same tick as
+    /// 8. natural_spawns (spawning.rs): the monster spawn pass
+    /// 9. random_ticks (entities.rs): the chunk tick's grass pass
+    /// 10. flush_dirty: the broadcast point (0x08/0x56); edits after
+    ///     this defer to the next tick
+    /// 11. run_block_events: piston world mutations (same tick as
     ///     queued)
-    /// 11. tick_containers (containers.rs): chest lids, menu range
+    /// 12. tick_containers (containers.rs): chest lids, menu range
     ///     checks, hoppers
-    /// 12. tick_moving_pistons: moving pistons advance and land
-    /// 13. flush_block_entities (containers.rs): block entity data
+    /// 13. tick_moving_pistons: moving pistons advance and land
+    /// 14. flush_block_entities (containers.rs): block entity data
     ///     syncs
     fn game_tick(&mut self) {
         self.tick += 1;
+        if self.spawning.time_running {
+            self.spawning.total_ticks += 1;
+            self.spawning.day_time = (self.spawning.day_time + 1) % 24000;
+        }
         // --- survival hooks (entities.rs) ---
         // The entity pass runs first: a drop spawned last tick moves
         // before this tick's breaks land.
@@ -480,6 +508,10 @@ impl Game {
 
         self.run_scheduled_ticks();
 
+        // --- spawning hooks (spawning.rs) ---
+        // Natural spawns run inside the chunk tick, before the random
+        // tick pass; new mobs pair on the next entity pass.
+        self.natural_spawns();
         // --- survival hooks (entities.rs) ---
         // Random ticks (the chunk tick's grass pass) land their writes in
         // this tick's flush.
@@ -504,20 +536,62 @@ impl Game {
     }
 
     /// set_time (0x73): gameTime i64 + day counter, every 20 ticks.
-    /// Static world placeholder until time simulation lands.
+    /// A world that never ran `time set` stays at the static 0/0 pair.
     fn broadcast_time(&mut self) {
         if self.tick.is_multiple_of(20) {
-            // set_time (0x73): gameTime i64 + day counter. Static world
-            // placeholder until time simulation lands.
+            let (game, day) = if self.spawning.time_running {
+                (self.spawning.total_ticks, self.spawning.day_time)
+            } else {
+                (0, 0)
+            };
             let mut body = Vec::with_capacity(18);
-            body.extend_from_slice(&0i64.to_be_bytes());
-            body.extend_from_slice(&0i64.to_be_bytes());
+            body.extend_from_slice(&game.to_be_bytes());
+            body.extend_from_slice(&day.to_be_bytes());
             body.push(0);
             let conns: Vec<ConnId> = self.players.keys().copied().collect();
             for c in conns {
                 self.send(c, 0x73, &body);
             }
         }
+    }
+
+    /// The chunk columns at least one player tracks.
+    pub(crate) fn viewed_chunks(&self) -> Vec<(i32, i32)> {
+        self.viewers
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(&c, _)| c)
+            .collect()
+    }
+
+    /// Whether at least one player tracks the chunk column.
+    pub(crate) fn chunk_viewed(&self, cx: i32, cz: i32) -> bool {
+        self.viewers.get(&(cx, cz)).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Loads a chunk into the cache on demand; true when it is present.
+    /// The join replay streams packets without populating the cache, so
+    /// passes that read column data pull their chunks in first.
+    pub(crate) fn ensure_chunk_loaded(&mut self, cx: i32, cz: i32) -> bool {
+        if self.chunks.contains_key(&(cx, cz)) {
+            return true;
+        }
+        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+            return false;
+        };
+        self.load_chunk(&world, &blobs, cx, cz).is_ok()
+    }
+
+    /// The next entity id from the shared counter.
+    pub(crate) fn alloc_entity_id(&mut self) -> i32 {
+        let id = self.next_entity_id;
+        self.next_entity_id += 1;
+        id
+    }
+
+    /// A fresh entity uuid from the survival stream.
+    pub(crate) fn next_uuid(&mut self) -> [u8; 16] {
+        self.survival.next_uuid()
     }
 
     /// Torch transitions fire 1gt after their input change; stale
@@ -692,6 +766,10 @@ impl Game {
             Inbound::GameRuleNoop { conn } => {
                 self.send_command_feedback(conn);
             }
+            // --- mob hooks (living.rs / spawning.rs) ---
+            Inbound::SpawnMobs { .. } | Inbound::TimeSet { .. } | Inbound::SetDifficulty { .. } => {
+                self.apply_mob_command(event);
+            }
             // --- placement hooks (placement.rs) ---
             Inbound::Rotated { conn, yaw, pitch } => {
                 if let Some(p) = self.players.get_mut(&conn) {
@@ -748,6 +826,27 @@ impl Game {
                 self.frozen = frozen;
                 self.send_command_feedback(conn);
             }
+        }
+    }
+
+    /// The mob-hook commands: apply the state, then acknowledge; the
+    /// three share one reply path and differ only in their writes.
+    fn apply_mob_command(&mut self, event: Inbound) {
+        match event {
+            Inbound::SpawnMobs { conn, enabled } => {
+                self.spawning.spawn_mobs = enabled;
+                self.send_command_feedback(conn);
+            }
+            Inbound::TimeSet { conn, ticks } => {
+                self.spawning.day_time = ticks % 24000;
+                self.spawning.time_running = true;
+                self.send_command_feedback(conn);
+            }
+            Inbound::SetDifficulty { conn, peaceful } => {
+                self.spawning.peaceful = peaceful;
+                self.send_command_feedback(conn);
+            }
+            _ => {}
         }
     }
 

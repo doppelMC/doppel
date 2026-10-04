@@ -173,6 +173,34 @@ impl CaptureOpts<'_> {
     }
 }
 
+/// A reactive chase probe: when the first add_entity of `entity_type`
+/// arrives (after the command volley), teleport to `stand` blocks from
+/// it along +x so hostile chase goals engage on a stationary player.
+#[derive(Clone, Copy)]
+pub struct ChaseFirst {
+    pub entity_type: i32,
+    pub stand: f64,
+}
+
+/// The chase probe's command for an add frame: `stand` blocks from the
+/// entity along +x, when the frame is an add_entity of the wanted type.
+fn chase_tp(chase: &ChaseFirst, body: &[u8]) -> Option<(String, Vec<u8>)> {
+    let mut r = Reader::new(body);
+    let _ = r.read_varint().ok()?;
+    let _ = r.read_bytes(16).ok()?;
+    let ty = r.read_varint().ok()?;
+    if ty != chase.entity_type {
+        return None;
+    }
+    let x = r.read_f64().ok()?;
+    let y = r.read_f64().ok()?;
+    let z = r.read_f64().ok()?;
+    let cmd = format!("tp @s {:.1} {:.1} {:.1}", x + chase.stand, y, z);
+    let mut cbody = Vec::new();
+    doppel_protocol::write_string(&mut cbody, &cmd);
+    Some((cmd, cbody))
+}
+
 /// Connects as an offline-mode login client and records every packet the
 /// server sends, driving the full confirmed choreography — login, ack,
 /// client information, known packs, finish configuration — into the PLAY
@@ -185,6 +213,29 @@ pub fn login_capture(
     protocol: i32,
     login_start_body: &[u8],
     opts: &CaptureOpts<'_>,
+) -> Result<Vec<CapturedPacket>> {
+    login_capture_inner(host, port, protocol, login_start_body, opts, None)
+}
+
+/// `login_capture` with the reactive chase probe armed.
+pub fn login_capture_chase(
+    host: &str,
+    port: u16,
+    protocol: i32,
+    login_start_body: &[u8],
+    opts: &CaptureOpts<'_>,
+    chase: ChaseFirst,
+) -> Result<Vec<CapturedPacket>> {
+    login_capture_inner(host, port, protocol, login_start_body, opts, Some(chase))
+}
+
+fn login_capture_inner(
+    host: &str,
+    port: u16,
+    protocol: i32,
+    login_start_body: &[u8],
+    opts: &CaptureOpts<'_>,
+    chase: Option<ChaseFirst>,
 ) -> Result<Vec<CapturedPacket>> {
     let idle_timeout = opts.idle_timeout();
     let max_packets = opts.max_packets();
@@ -222,6 +273,7 @@ pub fn login_capture(
     let raw_packets = opts.raw_packets;
     let mut raw_sent = false;
     let walk = opts.walk_chunks;
+    let mut chase_done = false;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
     let mut walk_base: Option<(f64, f64, f64)> = None;
@@ -376,6 +428,19 @@ pub fn login_capture(
                 steps_done += 1;
                 last_walk_at = std::time::Instant::now();
                 note = Some(format!("tp-walk step {steps_done}: x={x:.1}"));
+            }
+        }
+        // Chase probe: after the volley completes, teleport beside the
+        // first add_entity of the wanted type. The system_chat reply it
+        // provokes lands past the volley, where the pacing code only
+        // restores the idle timeout.
+        if !chase_done && play_started && !commands_pending && next_cmd >= commands.len() {
+            if let (Some(chase), 0x01) = (&chase, id) {
+                if let Some((cmd, cbody)) = chase_tp(chase, &body) {
+                    conn.write_packet(0x07, &cbody)?;
+                    note = Some(format!("chase: {cmd}"));
+                    chase_done = true;
+                }
             }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
