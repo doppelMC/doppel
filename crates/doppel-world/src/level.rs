@@ -34,12 +34,18 @@ impl Default for LevelMeta {
 
 #[derive(Serialize, Deserialize, Default)]
 struct SpawnNbt {
+    #[serde(default = "overworld")]
     dimension: String,
+    #[serde(default)]
     pos: Vec<i32>,
     #[serde(default)]
     yaw: f32,
     #[serde(default)]
     pitch: f32,
+}
+
+fn overworld() -> String {
+    "minecraft:overworld".into()
 }
 
 #[derive(Serialize, Deserialize, Default)]
