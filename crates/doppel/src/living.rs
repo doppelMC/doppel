@@ -1503,13 +1503,7 @@ impl Game {
         let mut blasts: Vec<(i32, f64, f64, f64, f64)> = Vec::new();
         for mob in mobs.iter_mut() {
             if let Some(radius) = mob.body.pending_blast.take() {
-                blasts.push((
-                    mob.body.id,
-                    mob.body.x,
-                    mob.body.y,
-                    mob.body.z,
-                    radius,
-                ));
+                blasts.push((mob.body.id, mob.body.x, mob.body.y, mob.body.z, radius));
             }
         }
         if removed.is_empty() {
