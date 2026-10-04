@@ -87,10 +87,14 @@ impl Face {
     }
 
     fn step(&self, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+        self.relative(x, y, z, 1)
+    }
+
+    fn relative(&self, x: i32, y: i32, z: i32, n: i32) -> (i32, i32, i32) {
         match *self {
-            UP => (x, y + 1, z),
-            DOWN => (x, y - 1, z),
-            other => (x + other.dx, y, z + other.dz),
+            UP => (x, y + n, z),
+            DOWN => (x, y - n, z),
+            other => (x + other.dx * n, y, z + other.dz * n),
         }
     }
 
@@ -103,6 +107,21 @@ impl Face {
             "east" => WEST,
             _ => EAST,
         }
+    }
+
+    /// The next face clockwise as seen from above.
+    fn clockwise(&self) -> Face {
+        match self.prop {
+            "north" => EAST,
+            "east" => SOUTH,
+            "south" => WEST,
+            _ => NORTH,
+        }
+    }
+
+    /// Whether the face steps toward positive coordinates on its axis.
+    fn positive(&self) -> bool {
+        self.dx > 0 || self.dz > 0
     }
 
     /// The pillar axis name a log lying along this face takes.
@@ -352,26 +371,21 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 33] = [
 /// Trunk placers, foliage placers, and tree decorators the tree parser
 /// does not model: a tree config carrying one accepts as unplaced (the
 /// runtime rejects it there), and plan validation accepts exactly these.
-pub(crate) const UNPLACED_TREE_SHAPES: [&str; 22] = [
-    "minecraft:cherry_trunk_placer",
+pub(crate) const UNPLACED_TREE_SHAPES: [&str; 17] = [
     "minecraft:forking_trunk_placer",
     "minecraft:giant_trunk_placer",
     "minecraft:mega_jungle_trunk_placer",
     "minecraft:poplar_trunk_placer",
-    "minecraft:upwards_branching_trunk_placer",
     "minecraft:acacia_foliage_placer",
     "minecraft:bush_foliage_placer",
-    "minecraft:cherry_foliage_placer",
     "minecraft:jungle_foliage_placer",
     "minecraft:mega_pine_foliage_placer",
     "minecraft:pine_foliage_placer",
     "minecraft:poplar_foliage_placer",
     "minecraft:spruce_foliage_placer",
     "minecraft:alter_ground",
-    "minecraft:attached_to_leaves",
     "minecraft:cocoa",
     "minecraft:creaking_heart",
-    "minecraft:leave_vine",
     "minecraft:pale_moss",
     "minecraft:shelf_mushroom",
     "minecraft:trunk_vine",
@@ -623,7 +637,7 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
 }
 
 /// Blocks that survive on the vegetation substrate.
-const VEGETATION: [&str; 26] = [
+const VEGETATION: [&str; 28] = [
     "minecraft:short_grass",
     "minecraft:fern",
     "minecraft:tall_grass",
@@ -650,6 +664,8 @@ const VEGETATION: [&str; 26] = [
     "minecraft:oak_sapling",
     "minecraft:birch_sapling",
     "minecraft:dark_oak_sapling",
+    "minecraft:cherry_sapling",
+    "minecraft:pink_petals",
 ];
 
 /// Blocks that survive on the dry substrate.
@@ -689,6 +705,8 @@ fn can_survive(d: &mut Decorator, state: u32, x: i32, y: i32, z: i32) -> bool {
             })
         }
         "minecraft:leaf_litter" => d.tag_contains("blocks_motion_no_leaves", &below),
+        // The propagule stands on the vegetation substrate or clay.
+        "minecraft:mangrove_propagule" => d.tag_contains("supports_mangrove_propagule", &below),
         // The blossom hangs: a full center face above and dry air at the
         // cell itself.
         "minecraft:spore_blossom" => {
@@ -815,6 +833,7 @@ enum FoliageKind {
     Fancy,
     DarkOak,
     RandomSpread,
+    Cherry,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -823,6 +842,8 @@ enum TrunkKind {
     DarkOak,
     Fancy,
     Bending,
+    Cherry,
+    Upwards,
 }
 
 #[derive(Clone)]
@@ -831,10 +852,15 @@ struct FoliageCfg {
     radius: IntDraw,
     offset: IntDraw,
     height: i32,
-    /// The scattered canopy's height provider; the other kinds read the
-    /// plain height field.
+    /// The scattered and cherry canopies draw their height; the other
+    /// kinds read the plain height field.
     spread_height: IntDraw,
     attempts: i32,
+    /// The cherry canopy's hole and hanging draws.
+    corner_hole: f32,
+    wide_bottom_hole: f32,
+    hanging: f32,
+    hanging_extend: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -903,6 +929,31 @@ enum TreeDecoratorCfg {
     Beehive {
         probability: f32,
     },
+    LeaveVine {
+        probability: f32,
+    },
+    AttachedToLeaves {
+        probability: f32,
+        provider: StateProvider,
+        directions: Vec<Face>,
+        exclusion_xz: i32,
+        exclusion_y: i32,
+        required_empty: i32,
+    },
+}
+
+/// The mangrove root placer: where the trunk lifts off from and how the
+/// stilt roots spread, soak, and cap themselves.
+struct RootCfg {
+    trunk_offset_y: IntDraw,
+    grow_through: String,
+    max_length: i32,
+    max_width: i32,
+    skew: f32,
+    muddy_in: Vec<String>,
+    muddy: StateProvider,
+    root: StateProvider,
+    above: Option<(f32, StateProvider)>,
 }
 
 pub(crate) struct TreeCfg {
@@ -915,6 +966,21 @@ pub(crate) struct TreeCfg {
     rand_b: i32,
     bend_length: IntDraw,
     min_height_for_leaves: i32,
+    /// The cherry trunk's branch draws; the second start offset narrows
+    /// the first draw's span by one from the top.
+    branch_count: IntDraw,
+    branch_length: IntDraw,
+    branch_start: IntDraw,
+    branch_start_second: IntDraw,
+    branch_end: IntDraw,
+    /// The upwards trunk's branch draws and the tag its logs grow
+    /// through; only that trunk kind reads them.
+    branch_prob: f32,
+    extra_steps: IntDraw,
+    extra_length: IntDraw,
+    grow_through: Option<String>,
+    ignore_vines: bool,
+    roots: Option<RootCfg>,
     foliage: FoliageCfg,
     size: SizeCfg,
     decorators: Vec<TreeDecoratorCfg>,
@@ -930,6 +996,13 @@ fn draw_field(v: &Value, key: &str) -> Option<IntDraw> {
     IntDraw::parse(v.get(key)?).ok()
 }
 
+/// A tag reference field (the leading "#minecraft:" stripped).
+fn tag_field(v: &Value, key: &str) -> Option<String> {
+    let raw = v.get(key)?.as_str()?;
+    let tag = raw.strip_prefix("#minecraft:").unwrap_or(raw);
+    Some(tag.to_string())
+}
+
 /// Parses a tree config; None marks a shape this engine does not run.
 pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
     let trunk_placer = v.get("trunk_placer")?;
@@ -938,6 +1011,8 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         "minecraft:dark_oak_trunk_placer" => TrunkKind::DarkOak,
         "minecraft:fancy_trunk_placer" => TrunkKind::Fancy,
         "minecraft:bending_trunk_placer" => TrunkKind::Bending,
+        "minecraft:cherry_trunk_placer" => TrunkKind::Cherry,
+        "minecraft:upwards_branching_trunk_placer" => TrunkKind::Upwards,
         _ => return None,
     };
     let (bend_length, min_height_for_leaves) = match trunk_kind {
@@ -947,12 +1022,48 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         ),
         _ => (IntDraw::Constant(1), 0),
     };
+    let (branch_prob, extra_steps, extra_length, grow_through) = match trunk_kind {
+        TrunkKind::Upwards => (
+            trunk_placer
+                .get("place_branch_per_log_probability")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32,
+            draw_field(trunk_placer, "extra_branch_steps")?,
+            draw_field(trunk_placer, "extra_branch_length")?,
+            Some(tag_field(trunk_placer, "can_grow_through")?),
+        ),
+        _ => (0.0, IntDraw::Constant(0), IntDraw::Constant(0), None),
+    };
+    let (branch_count, branch_length, branch_start, branch_start_second, branch_end) =
+        match trunk_kind {
+            TrunkKind::Cherry => {
+                let start = draw_field(trunk_placer, "branch_start_offset_from_top")?;
+                let IntDraw::Uniform { min, max } = start else {
+                    return None;
+                };
+                (
+                    draw_field(trunk_placer, "branch_count")?,
+                    draw_field(trunk_placer, "branch_horizontal_length")?,
+                    start,
+                    IntDraw::Uniform { min, max: max - 1 },
+                    draw_field(trunk_placer, "branch_end_offset_from_top")?,
+                )
+            }
+            _ => (
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+            ),
+        };
     let foliage_json = v.get("foliage_placer")?;
     let kind = match foliage_json.get("type").and_then(Value::as_str)? {
         "minecraft:blob_foliage_placer" => FoliageKind::Blob,
         "minecraft:fancy_foliage_placer" => FoliageKind::Fancy,
         "minecraft:dark_oak_foliage_placer" => FoliageKind::DarkOak,
         "minecraft:random_spread_foliage_placer" => FoliageKind::RandomSpread,
+        "minecraft:cherry_foliage_placer" => FoliageKind::Cherry,
         _ => return None,
     };
     let (spread_height, attempts) = match kind {
@@ -960,8 +1071,11 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
             draw_field(foliage_json, "foliage_height")?,
             int_field(foliage_json, "leaf_placement_attempts", 0),
         ),
+        FoliageKind::Cherry => (draw_field(foliage_json, "height")?, 0),
         _ => (IntDraw::Constant(0), 0),
     };
+    let float_field =
+        |key: &str| -> f32 { foliage_json.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32 };
     let foliage = FoliageCfg {
         kind,
         radius: draw_field(foliage_json, "radius")?,
@@ -969,6 +1083,10 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         height: int_field(foliage_json, "height", 0),
         spread_height,
         attempts,
+        corner_hole: float_field("corner_hole_chance"),
+        wide_bottom_hole: float_field("wide_bottom_layer_hole_chance"),
+        hanging: float_field("hanging_leaves_chance"),
+        hanging_extend: float_field("hanging_leaves_extension_chance"),
     };
     let size_json = v.get("minimum_size")?;
     let min_clipped = size_json
@@ -989,6 +1107,58 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
             upper: int_field(size_json, "upper_size", 1),
         },
         _ => return None,
+    };
+    let roots = match v.get("root_placer") {
+        None => None,
+        Some(rp) => {
+            if rp.get("type").and_then(Value::as_str) != Some("minecraft:mangrove_root_placer") {
+                return None;
+            }
+            let placement = rp.get("mangrove_root_placement")?;
+            let muddy_in: Vec<String> = placement
+                .get("muddy_roots_in")?
+                .as_array()?
+                .iter()
+                .filter_map(|e| e.as_str().map(String::from))
+                .collect();
+            let muddy = StateProvider::parse(d, placement.get("muddy_roots_provider")?);
+            let root = StateProvider::parse(d, rp.get("root_provider")?);
+            if matches!(muddy, StateProvider::None) || matches!(root, StateProvider::None) {
+                return None;
+            }
+            let above = match rp.get("above_root_placement") {
+                Some(a) => {
+                    let provider = StateProvider::parse(
+                        d,
+                        a.get("above_root_provider").unwrap_or(&Value::Null),
+                    );
+                    if matches!(provider, StateProvider::None) {
+                        return None;
+                    }
+                    Some((
+                        a.get("above_root_placement_chance")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.0) as f32,
+                        provider,
+                    ))
+                }
+                None => None,
+            };
+            Some(RootCfg {
+                trunk_offset_y: draw_field(rp, "trunk_offset_y")?,
+                grow_through: tag_field(placement, "can_grow_through")?,
+                max_length: int_field(placement, "max_root_length", 15),
+                max_width: int_field(placement, "max_root_width", 8),
+                skew: placement
+                    .get("random_skew_chance")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0) as f32,
+                muddy_in,
+                muddy,
+                root,
+                above,
+            })
+        }
     };
     let mut decorators = Vec::new();
     for deco in v
@@ -1021,6 +1191,44 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
                         .unwrap_or(0.0) as f32,
                 });
             }
+            Some("minecraft:leave_vine") => {
+                decorators.push(TreeDecoratorCfg::LeaveVine {
+                    probability: deco
+                        .get("probability")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                });
+            }
+            Some("minecraft:attached_to_leaves") => {
+                let provider =
+                    StateProvider::parse(d, deco.get("block_provider").unwrap_or(&Value::Null));
+                if matches!(provider, StateProvider::None) {
+                    return None;
+                }
+                let mut directions = Vec::new();
+                for name in deco
+                    .get("directions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    directions.push(Face::parse(name.as_str()?)?);
+                }
+                if directions.is_empty() {
+                    return None;
+                }
+                decorators.push(TreeDecoratorCfg::AttachedToLeaves {
+                    probability: deco
+                        .get("probability")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0) as f32,
+                    provider,
+                    directions,
+                    exclusion_xz: int_field(deco, "exclusion_radius_xz", 0),
+                    exclusion_y: int_field(deco, "exclusion_radius_y", 0),
+                    required_empty: int_field(deco, "required_empty_blocks", 1),
+                });
+            }
             _ => return None,
         }
     }
@@ -1043,6 +1251,20 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         rand_b: int_field(trunk_placer, "height_rand_b", 0),
         bend_length,
         min_height_for_leaves,
+        branch_count,
+        branch_length,
+        branch_start,
+        branch_start_second,
+        branch_end,
+        branch_prob,
+        extra_steps,
+        extra_length,
+        grow_through,
+        ignore_vines: v
+            .get("ignore_vines")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        roots,
         foliage,
         size: SizeCfg { kind, min_clipped },
         decorators,
@@ -1067,12 +1289,29 @@ fn valid_tree_pos(d: &mut Decorator, x: i32, y: i32, z: i32) -> bool {
     d.tag_contains("replaceable_by_trees", &name)
 }
 
-fn is_free(d: &mut Decorator, x: i32, y: i32, z: i32) -> bool {
-    if valid_tree_pos(d, x, y, z) {
+/// Whether a cell carries one of a grow-through tag's blocks.
+fn grows_through(d: &mut Decorator, tag: Option<&str>, x: i32, y: i32, z: i32) -> bool {
+    match tag {
+        Some(tag) => {
+            let name = d.block_name(d.block(x, y, z)).to_string();
+            d.tag_contains(tag, &name)
+        }
+        None => false,
+    }
+}
+
+fn is_free(d: &mut Decorator, grow: Option<&str>, x: i32, y: i32, z: i32) -> bool {
+    if valid_tree_pos(d, x, y, z) || grows_through(d, grow, x, y, z) {
         return true;
     }
     let name = d.block_name(d.block(x, y, z)).to_string();
     d.tag_contains("logs", &name)
+}
+
+/// Whether the trunk family's clip walk stops at a vine; only trees that
+/// keep vines refuse to grow through one.
+fn is_vine(d: &mut Decorator, x: i32, y: i32, z: i32) -> bool {
+    d.block_name(d.block(x, y, z)) == "minecraft:vine"
 }
 
 fn is_air_or_leaves(d: &mut Decorator, x: i32, y: i32, z: i32) -> bool {
@@ -1084,7 +1323,8 @@ fn is_air_or_leaves(d: &mut Decorator, x: i32, y: i32, z: i32) -> bool {
     d.tag_contains("leaves", &name)
 }
 
-/// Places one log if the position accepts it; records the write.
+/// Places one log if the position accepts it; records the write. The
+/// upwards trunk also accepts cells its grow-through tag lists.
 fn place_log(
     d: &mut Decorator,
     cfg: &TreeCfg,
@@ -1094,7 +1334,8 @@ fn place_log(
     z: i32,
     logs: &mut Vec<(i32, i32, i32)>,
 ) -> bool {
-    if !valid_tree_pos(d, x, y, z) {
+    let grow = cfg.grow_through.as_deref();
+    if !valid_tree_pos(d, x, y, z) && !grows_through(d, grow, x, y, z) {
         return false;
     }
     if let Some(state) = cfg.trunk.sample(d, rng, x, y, z) {
@@ -1102,6 +1343,41 @@ fn place_log(
         logs.push((x, y, z));
     }
     true
+}
+
+/// Places one log with an optional forced pillar axis: branch logs lie
+/// along their branch while the climbing steps stay vertical.
+#[allow(clippy::too_many_arguments)]
+fn place_log_axis(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    axis: Option<&str>,
+    logs: &mut Vec<(i32, i32, i32)>,
+) {
+    let grow = cfg.grow_through.as_deref();
+    if !valid_tree_pos(d, x, y, z) && !grows_through(d, grow, x, y, z) {
+        return;
+    }
+    if let Some(state) = cfg.trunk.sample(d, rng, x, y, z) {
+        let state = match axis {
+            Some(axis) => {
+                let (name, props) = d.registry().state_of(state).unwrap_or(("", ""));
+                if props.contains("axis") {
+                    d.state_id_of(name, &BlockRegistry::with_prop(props, "axis", axis))
+                        .unwrap_or(state)
+                } else {
+                    state
+                }
+            }
+            None => state,
+        };
+        d.set_block(x, y, z, state);
+        logs.push((x, y, z));
+    }
 }
 
 /// Places the soil block under a trunk cell when the provider yields one.
@@ -1128,25 +1404,50 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
     let foliage_height = match cfg.foliage.kind {
         FoliageKind::Blob | FoliageKind::Fancy => cfg.foliage.height,
         FoliageKind::DarkOak => 4,
-        FoliageKind::RandomSpread => cfg.foliage.spread_height.sample(rng),
+        FoliageKind::RandomSpread | FoliageKind::Cherry => cfg.foliage.spread_height.sample(rng),
     };
     let leaf_radius = cfg.foliage.radius.sample(rng);
     #[cfg(test)]
     let stage_height = rng.words;
-    if y < MIN_Y + 1 || y + tree_height + 1 > WORLD_TOP + 1 {
+    // A root placer lifts the trunk onto stilts; the bounds and the clip
+    // both anchor at the lifted origin.
+    let ty = match &cfg.roots {
+        Some(roots) => y + roots.trunk_offset_y.sample(rng),
+        None => y,
+    };
+    let lo = y.min(ty);
+    let hi = y.max(ty) + tree_height + 1;
+    if lo < MIN_Y + 1 || hi > WORLD_TOP + 1 {
         return false;
     }
-    let clipped = max_free_tree_height(d, &cfg.size, tree_height, x, y, z);
+    let clipped = max_free_tree_height(
+        d,
+        &cfg.size,
+        cfg.grow_through.as_deref(),
+        cfg.ignore_vines,
+        tree_height,
+        x,
+        ty,
+        z,
+    );
     if clipped < tree_height && cfg.size.min_clipped.is_none_or(|m| clipped < m) {
         return false;
+    }
+    let mut roots: Vec<(i32, i32, i32)> = Vec::new();
+    if let Some(root_cfg) = &cfg.roots {
+        if !place_roots(d, root_cfg, rng, x, y, z, ty, &mut roots) {
+            return false;
+        }
     }
     let mut logs: Vec<(i32, i32, i32)> = Vec::new();
     let mut leaves: Vec<(i32, i32, i32)> = Vec::new();
     let attachments = match cfg.trunk_kind {
-        TrunkKind::Straight => straight_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
-        TrunkKind::DarkOak => dark_oak_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
-        TrunkKind::Fancy => fancy_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
-        TrunkKind::Bending => bending_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
+        TrunkKind::Straight => straight_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
+        TrunkKind::DarkOak => dark_oak_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
+        TrunkKind::Fancy => fancy_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
+        TrunkKind::Bending => bending_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
+        TrunkKind::Cherry => cherry_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
+        TrunkKind::Upwards => upwards_trunk(d, &cfg, rng, x, ty, z, clipped, &mut logs),
     };
     #[cfg(test)]
     let stage_trunk = rng.words;
@@ -1186,8 +1487,33 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
             TreeDecoratorCfg::Beehive { probability } => {
                 beehive(d, rng, probability, &logs, &leaves, &mut decorations)
             }
+            TreeDecoratorCfg::LeaveVine { probability } => {
+                leave_vine(d, rng, probability, &leaves, &mut decorations)
+            }
+            TreeDecoratorCfg::AttachedToLeaves {
+                probability,
+                ref provider,
+                ref directions,
+                exclusion_xz,
+                exclusion_y,
+                required_empty,
+            } => attached_to_leaves(
+                d,
+                rng,
+                probability,
+                provider,
+                directions,
+                exclusion_xz,
+                exclusion_y,
+                required_empty,
+                &leaves,
+                &mut decorations,
+            ),
         }
     }
+    // The leaf walk's bounding box spans everything the tree placed,
+    // roots included.
+    decorations.extend(roots);
     update_leaf_distances(d, &logs, &leaves, &decorations);
     !logs.is_empty() || !leaves.is_empty()
 }
@@ -1365,10 +1691,14 @@ fn update_leaf_distances(
 }
 
 /// The height the tree reaches before clipping against unreplaceable
-/// blocks, per the minimum-size radius profile.
+/// blocks, per the minimum-size radius profile. A tree that keeps vines
+/// also refuses to climb one.
+#[allow(clippy::too_many_arguments)]
 fn max_free_tree_height(
     d: &mut Decorator,
     size: &SizeCfg,
+    grow: Option<&str>,
+    ignore_vines: bool,
     max_tree_height: i32,
     x: i32,
     y: i32,
@@ -1378,7 +1708,9 @@ fn max_free_tree_height(
         let r = size.size_at(max_tree_height, yo);
         for dx in -r..=r {
             for dz in -r..=r {
-                if !is_free(d, x + dx, y + yo, z + dz) {
+                let blocked = !is_free(d, grow, x + dx, y + yo, z + dz)
+                    || (!ignore_vines && is_vine(d, x + dx, y + yo, z + dz));
+                if blocked {
                     return yo - 2;
                 }
             }
@@ -1439,6 +1771,250 @@ fn bending_trunk(
     attachments
 }
 
+/// The cherry trunk: a full column or a stump when only side branches
+/// remain, then one or two branches that step sideways and bend toward
+/// their tips; the middle anchor sits above the column only when the
+/// branch-count draw takes the tallest shape.
+#[allow(clippy::too_many_arguments)]
+fn cherry_trunk(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    tree_height: i32,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Vec<Attachment> {
+    place_below_trunk(d, cfg, rng, x, y - 1, z, logs);
+    let first = 0.max(tree_height - 1 + cfg.branch_start.sample(rng));
+    let second = 0.max(tree_height - 1 + cfg.branch_start_second.sample(rng));
+    let second = if second >= first { second + 1 } else { second };
+    let branch_count = cfg.branch_count.sample(rng);
+    let has_middle = branch_count == 3;
+    let has_both = branch_count >= 2;
+    let trunk_height = if has_middle {
+        tree_height
+    } else if has_both {
+        first.max(second) + 1
+    } else {
+        first + 1
+    };
+    for dy in 0..trunk_height {
+        place_log(d, cfg, rng, x, y + dy, z, logs);
+    }
+    let mut attachments = Vec::new();
+    if has_middle {
+        attachments.push(Attachment {
+            x,
+            y: y + trunk_height,
+            z,
+            double: false,
+        });
+    }
+    let direction = HORIZONTAL[rng.next_int(4) as usize];
+    let axis = direction.axis();
+    attachments.push(cherry_branch(
+        d,
+        cfg,
+        rng,
+        tree_height,
+        x,
+        y,
+        z,
+        direction,
+        first,
+        first < trunk_height - 1,
+        axis,
+        logs,
+    ));
+    if has_both {
+        attachments.push(cherry_branch(
+            d,
+            cfg,
+            rng,
+            tree_height,
+            x,
+            y,
+            z,
+            direction.opposite(),
+            second,
+            second < trunk_height - 1,
+            axis,
+            logs,
+        ));
+    }
+    attachments
+}
+
+/// One cherry branch: two or one sideways logs out of the trunk, then a
+/// walk that mixes sideways and vertical steps until it reaches the
+/// branch end; both branches of a tree share the trunk direction's axis.
+#[allow(clippy::too_many_arguments)]
+fn cherry_branch(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    tree_height: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    direction: Face,
+    offset_from_origin: i32,
+    middle_continues_up: bool,
+    axis: &'static str,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Attachment {
+    let (mut px, mut py, mut pz) = (x, y + offset_from_origin, z);
+    let end_offset = tree_height - 1 + cfg.branch_end.sample(rng);
+    let extend = middle_continues_up || end_offset < offset_from_origin;
+    let distance = cfg.branch_length.sample(rng) + i32::from(extend);
+    let (ex, ey, ez) = (
+        x + direction.dx * distance,
+        y + end_offset,
+        z + direction.dz * distance,
+    );
+    let sideways = if extend { 2 } else { 1 };
+    for _ in 0..sideways {
+        px += direction.dx;
+        pz += direction.dz;
+        place_log_axis(d, cfg, rng, px, py, pz, Some(axis), logs);
+    }
+    // The vertical step points toward the branch end; equal heights pin
+    // it down, where the zero chance keeps the walk sideways.
+    let vertical_up = ey > py;
+    loop {
+        let left = (px - ex).abs() + (py - ey).abs() + (pz - ez).abs();
+        if left == 0 {
+            break;
+        }
+        let chance = ((ey - py).abs() as f32) / (left as f32);
+        if rng.next_f32() < chance {
+            py += if vertical_up { 1 } else { -1 };
+            place_log_axis(d, cfg, rng, px, py, pz, None, logs);
+        } else {
+            px += direction.dx;
+            pz += direction.dz;
+            place_log_axis(d, cfg, rng, px, py, pz, Some(axis), logs);
+        }
+    }
+    Attachment {
+        x: ex,
+        y: ey + 1,
+        z: ez,
+        double: false,
+    }
+}
+
+/// The upwards trunk: a column that may sprout a climbing side branch at
+/// every log below the top, and always anchors foliage one past the last
+/// log.
+#[allow(clippy::too_many_arguments)]
+fn upwards_trunk(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    tree_height: i32,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Vec<Attachment> {
+    let mut attachments = Vec::new();
+    for height_pos in 0..tree_height {
+        let current_height = y + height_pos;
+        let placed = place_log(d, cfg, rng, x, current_height, z, logs);
+        if placed && height_pos < tree_height - 1 && rng.next_f32() < cfg.branch_prob {
+            let direction = HORIZONTAL[rng.next_int(4) as usize];
+            let length = cfg.extra_length.sample(rng);
+            let branch_pos = (length - cfg.extra_length.sample(rng) - 1).max(0);
+            let branch_steps = cfg.extra_steps.sample(rng);
+            upwards_branch(
+                d,
+                cfg,
+                rng,
+                tree_height,
+                &mut attachments,
+                x,
+                current_height,
+                z,
+                direction,
+                branch_pos,
+                branch_steps,
+                logs,
+            );
+        }
+        if height_pos == tree_height - 1 {
+            attachments.push(Attachment {
+                x,
+                y: current_height + 1,
+                z,
+                double: false,
+            });
+        }
+    }
+    attachments
+}
+
+/// One climbing branch: logs step sideways and up the trunk, skipping
+/// placements below the branch's start height while still spending their
+/// steps. A branch that clears its base height by two anchors two more
+/// foliage clusters at its tip.
+#[allow(clippy::too_many_arguments)]
+fn upwards_branch(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    tree_height: i32,
+    attachments: &mut Vec<Attachment>,
+    x: i32,
+    current_height: i32,
+    z: i32,
+    direction: Face,
+    branch_pos: i32,
+    branch_steps: i32,
+    logs: &mut Vec<(i32, i32, i32)>,
+) {
+    let mut height_along = current_height + branch_pos;
+    let mut lx = x;
+    let mut lz = z;
+    let mut index = branch_pos;
+    let mut steps = branch_steps;
+    while index < tree_height && steps > 0 {
+        if index >= 1 {
+            let placement_height = current_height + index;
+            height_along = placement_height;
+            lx += direction.dx;
+            lz += direction.dz;
+            if place_log(d, cfg, rng, lx, placement_height, lz, logs) {
+                height_along += 1;
+            }
+            attachments.push(Attachment {
+                x: lx,
+                y: placement_height,
+                z: lz,
+                double: false,
+            });
+        }
+        index += 1;
+        steps -= 1;
+    }
+    if height_along - current_height > 1 {
+        attachments.push(Attachment {
+            x: lx,
+            y: height_along,
+            z: lz,
+            double: false,
+        });
+        attachments.push(Attachment {
+            x: lx,
+            y: height_along - 2,
+            z: lz,
+            double: false,
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn straight_trunk(
     d: &mut Decorator,
@@ -1460,6 +2036,158 @@ fn straight_trunk(
         z,
         double: false,
     }]
+}
+
+// ---------------------------------------------------------------------------
+// Mangrove roots.
+// ---------------------------------------------------------------------------
+
+/// Whether a root accepts a cell: the plain tree-valid set plus the
+/// root's own grow-through tag.
+fn can_place_root(d: &mut Decorator, grow: &str, x: i32, y: i32, z: i32) -> bool {
+    if valid_tree_pos(d, x, y, z) {
+        return true;
+    }
+    let name = d.block_name(d.block(x, y, z)).to_string();
+    d.tag_contains(grow, &name)
+}
+
+/// Places the stilt roots: the column under the lifted trunk must hold,
+/// then each horizontal direction grows a root tree that must fully
+/// place, and only then do any roots write. A failed simulation fails
+/// the whole tree with no root writes.
+#[allow(clippy::too_many_arguments)]
+fn place_roots(
+    d: &mut Decorator,
+    cfg: &RootCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    ty: i32,
+    out: &mut Vec<(i32, i32, i32)>,
+) -> bool {
+    let mut column_y = y;
+    while column_y < ty {
+        if !can_place_root(d, &cfg.grow_through, x, column_y, z) {
+            return false;
+        }
+        column_y += 1;
+    }
+    let mut positions = vec![(x, ty - 1, z)];
+    for direction in HORIZONTAL {
+        let mut spread = Vec::new();
+        let start = (x + direction.dx, ty, z + direction.dz);
+        if !simulate_roots(d, cfg, rng, start, direction, (x, ty, z), &mut spread, 0) {
+            return false;
+        }
+        positions.extend(spread);
+        positions.push(start);
+    }
+    for &pos in &positions {
+        place_root(d, cfg, rng, pos, out);
+    }
+    true
+}
+
+/// Grows one root downward: every placeable candidate extends the root
+/// and recurses; one dead end fails the whole direction.
+#[allow(clippy::too_many_arguments)]
+fn simulate_roots(
+    d: &mut Decorator,
+    cfg: &RootCfg,
+    rng: &mut DecorRng,
+    pos: (i32, i32, i32),
+    direction: Face,
+    origin: (i32, i32, i32),
+    acc: &mut Vec<(i32, i32, i32)>,
+    layer: i32,
+) -> bool {
+    if layer == cfg.max_length || acc.len() as i32 > cfg.max_length {
+        return false;
+    }
+    for candidate in potential_roots(rng, cfg, pos, direction, origin) {
+        if !can_place_root(d, &cfg.grow_through, candidate.0, candidate.1, candidate.2) {
+            continue;
+        }
+        acc.push(candidate);
+        if !simulate_roots(d, cfg, rng, candidate, direction, origin, acc, layer + 1) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The candidates for one root cell: near the width limit the roots
+/// skew straight down, inside it they may run sideways, and past it only
+/// down remains.
+fn potential_roots(
+    rng: &mut DecorRng,
+    cfg: &RootCfg,
+    pos: (i32, i32, i32),
+    direction: Face,
+    origin: (i32, i32, i32),
+) -> Vec<(i32, i32, i32)> {
+    let below = (pos.0, pos.1 - 1, pos.2);
+    let next_to = (pos.0 + direction.dx, pos.1, pos.2 + direction.dz);
+    let width = (pos.0 - origin.0).abs() + (pos.1 - origin.1).abs() + (pos.2 - origin.2).abs();
+    if width <= cfg.max_width {
+        if width > cfg.max_width - 3 {
+            // Near the width limit the roots skew straight down.
+            if rng.next_f32() < cfg.skew {
+                vec![below, (next_to.0, next_to.1 - 1, next_to.2)]
+            } else {
+                vec![below]
+            }
+        } else if rng.next_f32() < cfg.skew || !rng.next_bool() {
+            vec![below]
+        } else {
+            vec![next_to]
+        }
+    } else {
+        vec![below]
+    }
+}
+
+/// Writes one root: a cell in the muddy set takes muddy roots outright;
+/// otherwise the cell must accept a root, which may then cap itself.
+fn place_root(
+    d: &mut Decorator,
+    cfg: &RootCfg,
+    rng: &mut DecorRng,
+    pos: (i32, i32, i32),
+    out: &mut Vec<(i32, i32, i32)>,
+) {
+    let (x, y, z) = pos;
+    let here = d.block_name(d.block(x, y, z)).to_string();
+    if cfg.muddy_in.contains(&here) {
+        if let Some(state) = cfg.muddy.sample(d, rng, x, y, z) {
+            let state = waterlogged_state(d, state, x, y, z);
+            d.set_block(x, y, z, state);
+            out.push(pos);
+        }
+        return;
+    }
+    if !can_place_root(d, &cfg.grow_through, x, y, z) {
+        return;
+    }
+    if let Some(state) = cfg.root.sample(d, rng, x, y, z) {
+        let state = waterlogged_state(d, state, x, y, z);
+        d.set_block(x, y, z, state);
+        out.push(pos);
+        if let Some((chance, provider)) = &cfg.above {
+            if rng.next_f32() < *chance {
+                let above_name = d.block_name(d.block(x, y + 1, z)).to_string();
+                if above_name == "minecraft:air" {
+                    if let Some(state) = provider.sample(d, rng, x, y + 1, z) {
+                        let state = waterlogged_state(d, state, x, y + 1, z);
+                        d.set_block(x, y + 1, z, state);
+                        out.push((x, y + 1, z));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1604,7 +2332,7 @@ fn make_limb(
                 d.set_block(pos.0, pos.1, pos.2, state);
                 logs.push(pos);
             }
-        } else if !is_free(d, pos.0, pos.1, pos.2) {
+        } else if !is_free(d, cfg.grow_through.as_deref(), pos.0, pos.1, pos.2) {
             return false;
         }
     }
@@ -1693,16 +2421,18 @@ fn fancy_trunk(
 }
 
 /// Whether a row cell drops out: corner dither for blobs, a circular
-/// mask for fancy canopies, corner cuts for the dark oak.
+/// mask for fancy canopies, corner cuts for the dark oak, and the
+/// cherry's staged hole draws.
 fn should_skip(
     rng: &mut DecorRng,
-    kind: FoliageKind,
+    foliage: &FoliageCfg,
     dx: i32,
     dz: i32,
     y: i32,
     radius: i32,
     double: bool,
 ) -> bool {
+    let kind = foliage.kind;
     if kind == FoliageKind::DarkOak && y == 0 && double {
         let open_x = dx != -radius && dx < radius;
         let open_z = dz != -radius && dz < radius;
@@ -1724,6 +2454,23 @@ fn should_skip(
         }
         // The scattered canopy places per attempt, never in rows.
         FoliageKind::RandomSpread => false,
+        FoliageKind::Cherry => {
+            // The wide bottom row thins its outer arms before the corner
+            // draw, and the corner draw itself only runs once the layer
+            // shape asks for it.
+            if y == -1
+                && (mdx == radius || mdz == radius)
+                && rng.next_f32() < foliage.wide_bottom_hole
+            {
+                return true;
+            }
+            let corner = mdx == radius && mdz == radius;
+            if radius > 2 {
+                corner || (mdx + mdz > radius * 2 - 2 && rng.next_f32() < foliage.corner_hole)
+            } else {
+                corner && rng.next_f32() < foliage.corner_hole
+            }
+        }
         FoliageKind::DarkOak => {
             if y == -1 && !double {
                 return mdx == radius && mdz == radius;
@@ -1748,13 +2495,12 @@ fn place_leaves_row(
     radius: i32,
     y: i32,
     double: bool,
-    kind: FoliageKind,
     leaves: &mut Vec<(i32, i32, i32)>,
 ) {
     let ext = i32::from(double);
     for dx in -radius..=radius + ext {
         for dz in -radius..=radius + ext {
-            if should_skip(rng, kind, dx, dz, y, radius, double) {
+            if should_skip(rng, &cfg.foliage, dx, dz, y, radius, double) {
                 continue;
             }
             let (lx, ly, lz) = (ax + dx, ay + y, az + dz);
@@ -1762,7 +2508,7 @@ fn place_leaves_row(
                 continue;
             }
             if let Some(state) = cfg.leaves.sample(d, rng, lx, ly, lz) {
-                let state = waterlogged_leaf(d, state, lx, ly, lz);
+                let state = waterlogged_state(d, state, lx, ly, lz);
                 d.set_block(lx, ly, lz, state);
                 leaves.push((lx, ly, lz));
             }
@@ -1770,9 +2516,95 @@ fn place_leaves_row(
     }
 }
 
-/// Places one scattered leaf: a persistent leaf already at the cell
-/// refuses the write, the cell must accept tree placement, and the
-/// provider draws only then.
+/// Places one row of leaves, then walks the row's underside edges: a
+/// cell with a leaf above may hang one, and a hung cell may extend one
+/// further down. Each edge runs clockwise from its side.
+#[allow(clippy::too_many_arguments)]
+fn place_leaves_row_hanging(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    ax: i32,
+    ay: i32,
+    az: i32,
+    radius: i32,
+    y: i32,
+    double: bool,
+    leaves: &mut Vec<(i32, i32, i32)>,
+) {
+    place_leaves_row(d, cfg, rng, ax, ay, az, radius, y, double, leaves);
+    let ext = i32::from(double);
+    let log_pos = (ax, ay - 1, az);
+    for along_edge in HORIZONTAL {
+        let to_edge = along_edge.clockwise();
+        let offset_to_edge = if to_edge.positive() {
+            radius + ext
+        } else {
+            radius
+        };
+        let py = ay + y - 1;
+        let mut px = ax + to_edge.dx * offset_to_edge + along_edge.dx * -radius;
+        let mut pz = az + to_edge.dz * offset_to_edge + along_edge.dz * -radius;
+        for _ in -radius..radius + ext {
+            let above = leaves.contains(&(px, py + 1, pz));
+            if above
+                && try_place_extension(
+                    d,
+                    cfg,
+                    rng,
+                    px,
+                    py,
+                    pz,
+                    cfg.foliage.hanging,
+                    log_pos,
+                    leaves,
+                )
+            {
+                try_place_extension(
+                    d,
+                    cfg,
+                    rng,
+                    px,
+                    py - 1,
+                    pz,
+                    cfg.foliage.hanging_extend,
+                    log_pos,
+                    leaves,
+                );
+            }
+            px += along_edge.dx;
+            pz += along_edge.dz;
+        }
+    }
+}
+
+/// Hangs one leaf cell under the canopy edge: the distance gate comes
+/// before the chance draw, and only a placed cell counts as extended.
+#[allow(clippy::too_many_arguments)]
+fn try_place_extension(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    chance: f32,
+    log_pos: (i32, i32, i32),
+    leaves: &mut Vec<(i32, i32, i32)>,
+) -> bool {
+    if (x - log_pos.0).abs() + (y - log_pos.1).abs() + (z - log_pos.2).abs() >= 7 {
+        return false;
+    }
+    if rng.next_f32() > chance {
+        return false;
+    }
+    try_place_leaf(d, cfg, rng, x, y, z, leaves)
+}
+
+/// Places one scattered or hanging leaf: a persistent leaf already at
+/// the cell refuses the write, the cell must accept tree placement, and
+/// the provider draws only then. The result reports whether the cell
+/// took the leaf.
 fn try_place_leaf(
     d: &mut Decorator,
     cfg: &TreeCfg,
@@ -1781,23 +2613,25 @@ fn try_place_leaf(
     y: i32,
     z: i32,
     leaves: &mut Vec<(i32, i32, i32)>,
-) {
+) -> bool {
     let persistent = d
         .registry()
         .state_of(d.block(x, y, z))
         .is_some_and(|(_, props)| props.split(',').any(|pair| pair == "persistent=true"));
     if persistent || !valid_tree_pos(d, x, y, z) {
-        return;
+        return false;
     }
     if let Some(state) = cfg.leaves.sample(d, rng, x, y, z) {
-        let state = waterlogged_leaf(d, state, x, y, z);
+        let state = waterlogged_state(d, state, x, y, z);
         d.set_block(x, y, z, state);
         leaves.push((x, y, z));
+        return true;
     }
+    false
 }
 
-/// A leaf state inside water logs itself.
-fn waterlogged_leaf(d: &mut Decorator, state: u32, x: i32, y: i32, z: i32) -> u32 {
+/// A waterloggable state placed inside water logs itself.
+fn waterlogged_state(d: &mut Decorator, state: u32, x: i32, y: i32, z: i32) -> u32 {
     let (name, props) = d.registry().state_of(state).unwrap_or(("", ""));
     if !props.contains("waterlogged") {
         return state;
@@ -1823,8 +2657,7 @@ fn create_foliage(
     leaves: &mut Vec<(i32, i32, i32)>,
 ) {
     let offset = cfg.foliage.offset.sample(rng);
-    let kind = cfg.foliage.kind;
-    match kind {
+    match cfg.foliage.kind {
         // The scattered canopy: each attempt draws its own offset, three
         // doubled draws around the anchor.
         FoliageKind::RandomSpread => {
@@ -1838,92 +2671,78 @@ fn create_foliage(
         FoliageKind::Blob => {
             for yo in ((offset - foliage_height)..=offset).rev() {
                 let r = (leaf_radius - 1 - yo / 2).max(0);
-                place_leaves_row(
-                    d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, kind, leaves,
-                );
+                place_leaves_row(d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, leaves);
             }
         }
         FoliageKind::Fancy => {
             for yo in ((offset - foliage_height)..=offset).rev() {
                 let r = leaf_radius + i32::from(yo != offset && yo != offset - foliage_height);
+                place_leaves_row(d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, leaves);
+            }
+        }
+        // The cherry canopy: two shoulder rows, the main body, and two
+        // hanging rows under it.
+        FoliageKind::Cherry => {
+            let py = att.y + offset;
+            let radius = leaf_radius - 1;
+            place_leaves_row(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 2,
+                foliage_height - 3,
+                att.double,
+                leaves,
+            );
+            place_leaves_row(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 1,
+                foliage_height - 4,
+                att.double,
+                leaves,
+            );
+            for yo in (0..=foliage_height - 5).rev() {
                 place_leaves_row(
-                    d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, kind, leaves,
+                    d, cfg, rng, att.x, py, att.z, radius, yo, att.double, leaves,
                 );
             }
+            place_leaves_row_hanging(
+                d, cfg, rng, att.x, py, att.z, radius, -1, att.double, leaves,
+            );
+            place_leaves_row_hanging(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 1,
+                -2,
+                att.double,
+                leaves,
+            );
         }
         FoliageKind::DarkOak => {
             let py = att.y + offset;
             let (ax, az) = (att.x, att.z);
             if att.double {
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    -1,
-                    true,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 3,
-                    0,
-                    true,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    1,
-                    true,
-                    kind,
-                    leaves,
-                );
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, -1, true, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 3, 0, true, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, 1, true, leaves);
                 if rng.next_bool() {
-                    place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius, 2, true, kind, leaves);
+                    place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius, 2, true, leaves);
                 }
             } else {
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    -1,
-                    false,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 1,
-                    0,
-                    false,
-                    kind,
-                    leaves,
-                );
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, -1, false, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 1, 0, false, leaves);
             }
         }
     }
@@ -2021,8 +2840,10 @@ fn shuffle<T>(items: &mut [T], rng: &mut DecorRng) {
     }
 }
 
-/// Rarely hangs a nest on the trunk; the resident draws stay even though
-/// the residents themselves are not entities here.
+/// Rarely hangs a nest on the trunk: candidates sit east, south, and
+/// west of a trunk log, the nest faces south, and the cell south of the
+/// candidate must be air. The resident draws stay even though the
+/// residents themselves are not entities here.
 fn beehive(
     d: &mut Decorator,
     rng: &mut DecorRng,
@@ -2042,26 +2863,25 @@ fn beehive(
     } else {
         (logs[0].1 + 1 + rng.next_int(3)).min(logs[logs.len() - 1].1)
     };
-    let mut placements: Vec<((i32, i32, i32), Face)> = Vec::new();
+    let mut placements: Vec<(i32, i32, i32)> = Vec::new();
     for &(lx, ly, lz) in logs {
         if ly != hive_y {
             continue;
         }
         for face in [EAST, SOUTH, WEST] {
-            placements.push((face.step(lx, ly, lz), face));
+            placements.push(face.step(lx, ly, lz));
         }
     }
     if placements.is_empty() {
         return;
     }
     shuffle(&mut placements, rng);
-    for &((px, py, pz), face) in &placements {
+    for &(px, py, pz) in &placements {
         let here = d.block_name(d.block(px, py, pz)) == "minecraft:air";
-        let (ox, oy, oz) = face.step(px, py, pz);
+        let (ox, oy, oz) = SOUTH.step(px, py, pz);
         let outward = d.block_name(d.block(ox, oy, oz)) == "minecraft:air";
         if here && outward {
-            let facing = face.opposite().prop;
-            if let Some(state) = state_with_prop(d, "minecraft:bee_nest", "facing", facing) {
+            if let Some(state) = state_with_prop(d, "minecraft:bee_nest", "facing", "south") {
                 d.set_block(px, py, pz, state);
                 decorations.push((px, py, pz));
             }
@@ -2070,6 +2890,109 @@ fn beehive(
                 rng.next_int(599);
             }
             return;
+        }
+    }
+}
+
+/// Writes one vine cell carrying the face it hangs from.
+fn place_vine(
+    d: &mut Decorator,
+    x: i32,
+    y: i32,
+    z: i32,
+    attach: &str,
+    decorations: &mut Vec<(i32, i32, i32)>,
+) {
+    if let Some(state) = state_with_prop(d, "minecraft:vine", attach, "true") {
+        d.set_block(x, y, z, state);
+        decorations.push((x, y, z));
+    }
+}
+
+/// Hangs vines off leaf clusters: each leaf draws once per side, and a
+/// vine that starts hangs up to four cells further while air stays
+/// below it.
+fn leave_vine(
+    d: &mut Decorator,
+    rng: &mut DecorRng,
+    probability: f32,
+    leaves: &[(i32, i32, i32)],
+    decorations: &mut Vec<(i32, i32, i32)>,
+) {
+    for &(lx, ly, lz) in leaves {
+        for (face, attach) in [
+            (WEST, "east"),
+            (EAST, "west"),
+            (NORTH, "south"),
+            (SOUTH, "north"),
+        ] {
+            if rng.next_f32() >= probability {
+                continue;
+            }
+            let (vx, vy, vz) = face.step(lx, ly, lz);
+            if d.block_name(d.block(vx, vy, vz)) != "minecraft:air" {
+                continue;
+            }
+            place_vine(d, vx, vy, vz, attach, decorations);
+            let mut below_y = vy - 1;
+            let mut left = 4;
+            while left > 0 && d.block_name(d.block(vx, below_y, vz)) == "minecraft:air" {
+                place_vine(d, vx, below_y, vz, attach, decorations);
+                below_y -= 1;
+                left -= 1;
+            }
+        }
+    }
+}
+
+/// Sprouts blocks off leaf clusters: the leaves shuffle, each draws a
+/// direction then a chance, the cells it needs must be empty, and each
+/// sprout blacklists its neighborhood.
+#[allow(clippy::too_many_arguments)]
+fn attached_to_leaves(
+    d: &mut Decorator,
+    rng: &mut DecorRng,
+    probability: f32,
+    provider: &StateProvider,
+    directions: &[Face],
+    exclusion_xz: i32,
+    exclusion_y: i32,
+    required_empty: i32,
+    leaves: &[(i32, i32, i32)],
+    decorations: &mut Vec<(i32, i32, i32)>,
+) {
+    let mut blacklist: std::collections::HashSet<(i32, i32, i32)> =
+        std::collections::HashSet::new();
+    let mut order: Vec<(i32, i32, i32)> = leaves.to_vec();
+    shuffle(&mut order, rng);
+    for (lx, ly, lz) in order {
+        let direction = directions[rng.next_int(directions.len() as i32) as usize];
+        let (px, py, pz) = direction.step(lx, ly, lz);
+        if blacklist.contains(&(px, py, pz)) || rng.next_f32() >= probability {
+            continue;
+        }
+        let mut empty = true;
+        for i in 1..=required_empty {
+            let (ex, ey, ez) = direction.relative(lx, ly, lz, i);
+            let name = d.block_name(d.block(ex, ey, ez)).to_string();
+            if !crate::lush::is_air_name(&name) {
+                empty = false;
+                break;
+            }
+        }
+        if !empty {
+            continue;
+        }
+        for bx in (px - exclusion_xz)..=(px + exclusion_xz) {
+            for by in (py - exclusion_y)..=(py + exclusion_y) {
+                for bz in (pz - exclusion_xz)..=(pz + exclusion_xz) {
+                    blacklist.insert((bx, by, bz));
+                }
+            }
+        }
+        if let Some(state) = provider.sample(d, rng, px, py, pz) {
+            d.set_block(px, py, pz, state);
+            decorations.push((px, py, pz));
         }
     }
 }
@@ -2861,6 +3784,105 @@ mod tests {
             }
         }
         assert!(leaves > 20, "the dark crown wrote leaves");
+    }
+
+    /// The cherry tree writes the soil swap, a vertical trunk, sideways
+    /// branch logs on the branch axis, and a leaf canopy.
+    #[test]
+    fn cherry_tree_writes_branches_and_canopy() {
+        let mut d = region();
+        let cfg = feature_value("cherry");
+        let base = surface(&mut d, 8, 8);
+        let placed = run_feature(&mut d, &cfg, &mut test_rng(), 8, base, 8);
+        assert!(placed, "the cherry tree placed");
+        assert_eq!(name_at(&d, 8, base, 8), "minecraft:cherry_log");
+        assert_eq!(
+            name_at(&d, 8, base - 1, 8),
+            "minecraft:dirt",
+            "grass under the trunk swaps to dirt"
+        );
+        let mut sideways = 0;
+        let mut leaves = 0;
+        let mut top = base;
+        for dy in -1..14i32 {
+            for dx in -10..=10 {
+                for dz in -10..=10 {
+                    let (x, y, z) = (8 + dx, base + dy, 8 + dz);
+                    if name_at(&d, x, y, z) == "minecraft:cherry_log" {
+                        top = top.max(y);
+                        let (_, props) = d.registry().state_of(d.block(x, y, z)).unwrap();
+                        if !props.contains("axis=y") {
+                            sideways += 1;
+                        }
+                    }
+                    if name_at(&d, x, y, z) == "minecraft:cherry_leaves" {
+                        leaves += 1;
+                    }
+                }
+            }
+        }
+        assert!(sideways > 0, "a branch log lies on its side");
+        assert!(leaves > 20, "the canopy wrote leaves");
+        assert!(top > base, "the tree reached above its origin");
+    }
+
+    /// The mangrove tree lifts its trunk onto stilt roots, writes muddy
+    /// roots where the descent meets mud, and crowns with scattered
+    /// leaves.
+    #[test]
+    fn mangrove_tree_writes_trunk_roots_and_leaves() {
+        let mut d = region();
+        let mud = d.state_id_of("minecraft:mud", "").expect("mud");
+        let stone = d.state_id_of("minecraft:stone", "").expect("stone");
+        let base = surface(&mut d, 8, 8);
+        // A mud shelf over a stone floor: roots soak the shelf and stop
+        // at the stone instead of wading into the open water that fills
+        // the nearby shoreline.
+        for dx in -9..=9 {
+            for dz in -9..=9 {
+                d.set_block(8 + dx, base - 1, 8 + dz, mud);
+                d.set_block(8 + dx, base - 2, 8 + dz, mud);
+                d.set_block(8 + dx, base - 3, 8 + dz, stone);
+            }
+        }
+        let cfg = feature_value("mangrove");
+        assert!(
+            parse_tree(&mut d, &cfg).is_some(),
+            "the mangrove config parses"
+        );
+        // A root spread that wanders past its length limit fails the tree
+        // outright, so probe feature seeds until one settles.
+        let mut placed = false;
+        for probe in 0..16 {
+            let mut rng = DecorRng::new();
+            rng.set_feature_seed(7 + probe, 0, 9);
+            if run_feature(&mut d, &cfg, &mut rng, 8, base, 8) {
+                placed = true;
+                break;
+            }
+        }
+        assert!(placed, "the mangrove tree placed");
+        let mut logs = 0;
+        let mut roots = 0;
+        let mut muddy = 0;
+        let mut leaves = 0;
+        for dy in -4..16i32 {
+            for dx in -12..=12 {
+                for dz in -12..=12 {
+                    match name_at(&d, 8 + dx, base + dy, 8 + dz).as_str() {
+                        "minecraft:mangrove_log" => logs += 1,
+                        "minecraft:mangrove_roots" => roots += 1,
+                        "minecraft:muddy_mangrove_roots" => muddy += 1,
+                        "minecraft:mangrove_leaves" => leaves += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(logs >= 2, "the trunk column wrote {logs} logs");
+        assert!(roots >= 1, "the stilts wrote {roots} root blocks");
+        assert!(muddy >= 1, "roots meeting mud wrote {muddy} muddy roots");
+        assert!(leaves > 20, "the canopy wrote {leaves} leaves");
     }
 
     /// Glow lichen hugs the first placeable face: a stone ceiling above
