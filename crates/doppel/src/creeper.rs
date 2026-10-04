@@ -68,8 +68,12 @@ impl Goal for FuseGoal {
             return false;
         };
         match ctx.player_pos(conn) {
-            Some((x, _, z)) => {
-                let d2 = (x - ctx.body.x) * (x - ctx.body.x) + (z - ctx.body.z) * (z - ctx.body.z);
+            Some((x, y, z)) => {
+                // The swell window reads the full 3D distance, the way
+                // the reference measures its targets.
+                let d2 = (x - ctx.body.x) * (x - ctx.body.x)
+                    + (y - ctx.body.y) * (y - ctx.body.y)
+                    + (z - ctx.body.z) * (z - ctx.body.z);
                 d2 < SWELL_SQ
             }
             None => false,
@@ -98,7 +102,9 @@ impl Goal for FuseGoal {
             ctx.body.swell_dir = -1;
             return;
         };
-        let d2 = (x - ctx.body.x) * (x - ctx.body.x) + (z - ctx.body.z) * (z - ctx.body.z);
+        let d2 = (x - ctx.body.x) * (x - ctx.body.x)
+            + (y - ctx.body.y) * (y - ctx.body.y)
+            + (z - ctx.body.z) * (z - ctx.body.z);
         if d2 > CANCEL_SQ {
             ctx.body.swell_dir = -1;
             return;
