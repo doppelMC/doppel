@@ -158,6 +158,11 @@ impl BlockRegistry {
         self.by_id.get(&id).map(|(n, p)| (n.as_str(), p.as_str()))
     }
 
+    /// Every block name with its default state id.
+    pub fn defaults(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.defaults.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
     /// Reads one integer property from a props string.
     pub fn prop_int(props: &str, name: &str) -> Option<i32> {
         for pair in props.split(',') {

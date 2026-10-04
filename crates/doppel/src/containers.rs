@@ -663,6 +663,8 @@ impl Game {
             chunk.wire.block_entities.push(e);
         }
         chunk.version += 1;
+        // --- persistence hooks (persistence.rs) ---
+        self.mark_chunk_dirty(cx, cz);
     }
 
     /// The double-chest pairing: LEFT connects clockwise of the facing,

@@ -89,6 +89,18 @@ impl PaletteBootstrap {
         }
     }
 
+    /// Seeds the maps with the registry's default states so worlds save
+    /// and load before any capture has learned names; learned entries
+    /// keep precedence.
+    pub fn seed_defaults(&mut self, registry: &crate::registry::BlockRegistry) {
+        for (name, id) in registry.defaults() {
+            self.blocks.entry(name.to_string()).or_insert(id);
+        }
+        self.biomes
+            .entry("minecraft:plains".to_string())
+            .or_insert(crate::worldgen::PLAINS_BIOME_ID);
+    }
+
     /// Learns mappings from one (wire, anvil) chunk pair. Sections are
     /// paired by Y — Anvil section lists may be unordered, carry extra
     /// light-only sections, or omit empty ones, so positional zip would
@@ -561,16 +573,10 @@ pub struct WorldDir {
 
 impl WorldDir {
     pub fn open(path: &Path) -> Result<WorldDir> {
-        // Modern versions keep overworld regions under
-        // dimensions/minecraft/overworld; older layouts use the root.
-        let candidates = [
-            path.join("dimensions/minecraft/overworld/region"),
-            path.join("region"),
-        ];
-        let root = candidates
-            .into_iter()
-            .find(|p| p.is_dir())
-            .with_context(|| format!("no region dir under {}", path.display()))?;
+        let root = crate::anvil_write::region_dir(path);
+        if !root.is_dir() {
+            return Err(anyhow::anyhow!("no region dir under {}", path.display()));
+        }
         Ok(WorldDir {
             root,
             regions: HashMap::new(),

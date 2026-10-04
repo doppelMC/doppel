@@ -208,7 +208,7 @@ pub enum Outbound {
 /// Per-connection player state. `pub(crate)` + the `inv` field exist for
 /// the inventory module's `impl Game` hooks (inventory.rs).
 pub(crate) struct Player {
-    name: String,
+    pub(crate) name: String,
     pub(crate) x: f64,
     pub(crate) y: f64,
     pub(crate) z: f64,
@@ -246,7 +246,7 @@ pub struct CachedChunk {
 }
 
 pub struct Game {
-    chunks: std::collections::BTreeMap<(i32, i32), CachedChunk>,
+    pub(crate) chunks: std::collections::BTreeMap<(i32, i32), CachedChunk>,
     // pub(crate) for the inventory module's Game hooks (inventory.rs).
     pub(crate) players: std::collections::BTreeMap<ConnId, Player>,
     /// Inverse index: chunk column -> connections tracking it.
@@ -259,13 +259,13 @@ pub struct Game {
     /// flush after the batch (the reference flushes once per server
     /// cycle, and a step batch is one cycle).
     flush_suspended: bool,
-    world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
+    pub(crate) world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
     blobs: Option<std::sync::Arc<Blobs>>,
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
     /// (localPos, state) changes awaiting the tick-end broadcast.
     dirty: std::collections::BTreeMap<(i32, i32, i32), Vec<(u64, u32)>>,
     /// Block-state registry (name+props -> id), loaded from pins/blocks.json.
-    registry: Option<doppel_world::registry::BlockRegistry>,
+    pub(crate) registry: Option<doppel_world::registry::BlockRegistry>,
     /// Dedup guard for dropped-world-write warnings: (cx, cz, reason).
     warned_writes: std::collections::BTreeSet<(i32, i32, String)>,
     /// `/tick freeze`: wall-clock ticks suspend; steps still run.
@@ -276,7 +276,7 @@ pub struct Game {
     /// Monotonic game tick.
     tick: u64,
     /// Day time in ticks, set by `time set` and carried by set_time.
-    day_time: i64,
+    pub(crate) day_time: i64,
     /// Scheduled actions: fire at tick T with a behavior tag.
     scheduled: Vec<(u64, (i32, i32, i32), TickAction)>,
     /// Unified pending-transition guard: (pos, kind). Replaces the
@@ -302,7 +302,7 @@ pub struct Game {
     next_entity_id: i32,
     // --- survival hooks (entities.rs) ---
     /// Live item entities and the random-tick bookkeeping.
-    survival: entities::SurvivalState,
+    pub(crate) survival: entities::SurvivalState,
     // --- tracker hooks (tracker.rs) ---
     /// Per-entity sync state and per-player pairing.
     tracking: tracker::EntityTrackers, // --- mob hooks (living.rs / spawning.rs) ---
@@ -310,6 +310,9 @@ pub struct Game {
     pub(crate) mobs: crate::living::MobState,
     /// World time and the natural-spawn state.
     pub(crate) spawning: crate::spawning::SpawnState,
+    // --- persistence hooks (persistence.rs) ---
+    /// Dirty-chunk tracking and the autosave cadence.
+    pub(crate) persistence: crate::persistence::Persistence,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -396,6 +399,25 @@ pub(crate) mod tracker;
 
 pub(crate) const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// player_position (0x49): the absolute position sync.
+pub(crate) const PACKET_PLAYER_POSITION: i32 = 0x49;
+
+/// The player_position (0x49) body: teleport id, position, zero deltas,
+/// rotation, absolute flags.
+fn position_sync_body(teleport_id: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(42);
+    doppel_protocol::write_varint(&mut body, teleport_id);
+    body.extend_from_slice(&x.to_be_bytes());
+    body.extend_from_slice(&y.to_be_bytes());
+    body.extend_from_slice(&z.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&yaw.to_be_bytes());
+    body.extend_from_slice(&pitch.to_be_bytes());
+    body.extend_from_slice(&0i32.to_be_bytes());
+    body
+}
 
 impl Game {
     pub fn new(
@@ -441,6 +463,7 @@ impl Game {
             tracking: Default::default(),
             mobs: Default::default(),
             spawning: Default::default(),
+            persistence: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -448,6 +471,14 @@ impl Game {
                 .inspect_err(|e| eprintln!("[game] flat generator: {e:#}"))
                 .ok()
         });
+        game.boot_from_level();
+        // --- persistence hooks (persistence.rs) ---
+        // Default-state names resolve without a capture; learned entries
+        // keep precedence over the seeds.
+        if let (Some(world), Some(registry)) = (&game.world, &game.registry) {
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            w.boot.seed_defaults(registry);
+        }
         game
     }
 
@@ -472,7 +503,11 @@ impl Game {
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // --- persistence hooks (persistence.rs) ---
+                    self.flush_all();
+                    return;
+                }
             }
             if std::time::Instant::now() >= next_tick {
                 // The flush happens inside game_tick at the broadcast
@@ -560,6 +595,10 @@ impl Game {
     /// 13. tick_moving_pistons: moving pistons advance and land
     /// 14. flush_block_entities (containers.rs): block entity data
     ///     syncs
+    /// 15. persistence_tick (persistence.rs): the save phase. The
+    ///     autosave interval (6000 ticks) arms a sweep of at most
+    ///     SAVE_BUDGET_PER_TICK chunks per tick under a wall-clock
+    ///     deadline; leftover chunks drain on later ticks.
     ///
     /// Reference loop slots with no implementation yet, in order: the
     /// world border tick; weather advance; the sleep wake check; game
@@ -611,6 +650,10 @@ impl Game {
         // Connection flush: one wire drain per tick, after all world
         // work (the reference's post-tick flushQueue).
         self.flush_connections();
+        // --- persistence hooks (persistence.rs) ---
+        // The save phase: the autosave cadence arms a bounded sweep that
+        // drains the dirty set across ticks.
+        self.persistence_tick();
     }
 
     /// set_time (0x73): gameTime i64 + a map of changed clocks, every 20
@@ -674,10 +717,10 @@ impl Game {
         if self.chunks.contains_key(&(cx, cz)) {
             return true;
         }
-        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+        let (Some(world), blobs) = (self.world.clone(), self.blobs.clone()) else {
             return false;
         };
-        self.load_chunk(&world, &blobs, cx, cz).is_ok()
+        self.load_chunk(&world, blobs.as_ref(), cx, cz).is_ok()
     }
 
     /// The next entity id from the shared counter.
@@ -745,40 +788,7 @@ impl Game {
                 z,
                 sent,
                 tx,
-            } => {
-                self.outbounds.insert(conn, tx);
-                // Register the viewer index for chunks the join burst
-                // already delivered — without this, block broadcasts skip
-                // players who never triggered movement streaming.
-                for chunk in &sent {
-                    self.viewers.entry(*chunk).or_default().push(conn);
-                }
-                let entity_id = self.next_entity_id;
-                self.next_entity_id += 1;
-                self.players.insert(
-                    conn,
-                    Player {
-                        name,
-                        x,
-                        y,
-                        z,
-                        yaw: 0.0,
-                        pitch: 0.0,
-                        center: None,
-                        sent: sent.into_iter().collect(),
-                        teleport_id: 1,
-                        pending_keep_alive: None,
-                        keep_alive_idle: Instant::now(),
-                        inv: Default::default(),
-                        menu: Default::default(),
-                        entity_id,
-                        dig: Default::default(),
-                    },
-                );
-                // --- tracker hooks (tracker.rs) ---
-                // The newcomer pairs with every entity already in range.
-                self.track_player_view(conn);
-            }
+            } => self.handle_joined(conn, name, x, y, z, sent, tx),
             Inbound::Moved {
                 conn,
                 x,
@@ -865,22 +875,8 @@ impl Game {
             Inbound::ContainerClose { conn, container_id } => {
                 self.client_closed_container(conn, container_id)
             }
-            Inbound::Left { conn } => {
-                // --- containers hooks (containers.rs) ---
-                // The carried stack of an open menu drops with the player.
-                self.close_menu(conn, false, true);
-                // --- tracker hooks (tracker.rs) ---
-                self.track_player_left(conn);
-                let Some(p) = self.players.remove(&conn) else {
-                    return;
-                };
-                self.outbounds.remove(&conn);
-                for chunk in p.sent {
-                    if let Some(v) = self.viewers.get_mut(&chunk) {
-                        v.retain(|c| *c != conn);
-                    }
-                }
-            }
+            Inbound::Left { conn } => self.handle_left(conn),
+            _ => {}
         }
     }
 
@@ -981,6 +977,98 @@ impl Game {
                 self.send_command_feedback(conn, &format!("Tick {what}"));
             }
             _ => {}
+        }
+    }
+
+    /// The join event: register the connection, restore saved player
+    /// state when the store has it, and pair the newcomer with every
+    /// tracked entity.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_joined(
+        &mut self,
+        conn: ConnId,
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        sent: Vec<(i32, i32)>,
+        tx: Sender<Outbound>,
+    ) {
+        self.outbounds.insert(conn, tx);
+        // Register the viewer index for chunks the join burst
+        // already delivered - without this, block broadcasts skip
+        // players who never triggered movement streaming.
+        for chunk in &sent {
+            self.viewers.entry(*chunk).or_default().push(conn);
+        }
+        // --- persistence hooks (persistence.rs) ---
+        // Saved player state restores before any join state goes
+        // out: position, rotation, game mode, inventory.
+        let saved = self.load_saved_player(&name);
+        let (x, y, z, yaw, pitch) = match &saved {
+            Some(data) => (data.pos[0], data.pos[1], data.pos[2], data.yaw, data.pitch),
+            None => (x, y, z, 0.0, 0.0),
+        };
+        let entity_id = self.next_entity_id;
+        self.next_entity_id += 1;
+        self.players.insert(
+            conn,
+            Player {
+                name,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                center: None,
+                sent: sent.into_iter().collect(),
+                teleport_id: 1,
+                pending_keep_alive: None,
+                keep_alive_idle: Instant::now(),
+                inv: Default::default(),
+                menu: Default::default(),
+                entity_id,
+                dig: Default::default(),
+            },
+        );
+        if let Some(data) = saved {
+            if let Some(p) = self.players.get_mut(&conn) {
+                p.inv.creative = data.game_mode == 1;
+                for slot in data.inventory {
+                    // The connection thread already rewrote the join
+                    // burst's position and inventory packets; this keeps
+                    // the engine's own state on the same values.
+                    if slot.slot >= 0 && (slot.slot as usize) < crate::inventory::TOTAL_SLOTS {
+                        if let Some(stack) = crate::persistence::saved_to_stack(&slot) {
+                            p.inv.inventory.set(slot.slot as usize, Some(stack));
+                        }
+                    }
+                }
+            }
+        }
+        // --- tracker hooks (tracker.rs) ---
+        // The newcomer pairs with every entity already in range.
+        self.track_player_view(conn);
+    }
+
+    /// The disconnect event: drop the menu, untrack, save the player's
+    /// state, and forget the viewer index.
+    fn handle_left(&mut self, conn: ConnId) {
+        // --- containers hooks (containers.rs) ---
+        // The carried stack of an open menu drops with the player.
+        self.close_menu(conn, false, true);
+        // --- tracker hooks (tracker.rs) ---
+        self.track_player_left(conn);
+        // --- persistence hooks (persistence.rs) ---
+        self.save_player_data(conn);
+        let Some(p) = self.players.remove(&conn) else {
+            return;
+        };
+        self.outbounds.remove(&conn);
+        for chunk in p.sent {
+            if let Some(v) = self.viewers.get_mut(&chunk) {
+                v.retain(|c| *c != conn);
+            }
         }
     }
 
@@ -1146,19 +1234,9 @@ impl Game {
         p.x = x;
         p.y = y;
         p.z = z;
-        let mut sync = Vec::with_capacity(64);
-        doppel_protocol::write_varint(&mut sync, p.teleport_id);
-        sync.extend_from_slice(&x.to_be_bytes());
-        sync.extend_from_slice(&y.to_be_bytes());
-        sync.extend_from_slice(&z.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&p.yaw.to_be_bytes());
-        sync.extend_from_slice(&p.pitch.to_be_bytes());
-        sync.extend_from_slice(&0i32.to_be_bytes());
+        let sync = position_sync_body(p.teleport_id, x, y, z, p.yaw, p.pitch);
         p.teleport_id += 1;
-        self.send(conn, 0x49, &sync);
+        self.send(conn, PACKET_PLAYER_POSITION, &sync);
         // --- tracker hooks (tracker.rs) ---
         // The pairing pass reads the old view: entities in the fresh
         // surroundings wait for the player's next move, like the
@@ -1186,11 +1264,11 @@ impl Game {
             return;
         }
         if !self.chunks.contains_key(&(cx, cz)) {
-            let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+            let (Some(world), blobs) = (self.world.clone(), self.blobs.clone()) else {
                 self.warn_dropped_write(cx, cz, "no world or blobs configured");
                 return;
             };
-            if let Err(e) = self.load_chunk(&world, &blobs, cx, cz) {
+            if let Err(e) = self.load_chunk(&world, blobs.as_ref(), cx, cz) {
                 self.warn_dropped_write(cx, cz, &format!("chunk load failed: {e:#}"));
                 return;
             }
@@ -1205,6 +1283,8 @@ impl Game {
             return;
         }
         chunk.version += 1;
+        // --- persistence hooks (persistence.rs) ---
+        self.mark_chunk_dirty(cx, cz);
         // --- survival hooks (entities.rs) ---
         // A write re-arms the section's random-tick scan.
         self.invalidate_section_ticks(cx, cz, y.div_euclid(16) + 4);
@@ -2245,7 +2325,7 @@ impl Game {
         sends.push((0x0c, Vec::new()));
 
         // Load chunks (may lock the world), then emit everything.
-        let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
+        let (Some(world), blobs) = (self.world.clone(), self.blobs.clone()) else {
             for (id, body) in sends {
                 self.send(conn, id, &body);
             }
@@ -2253,7 +2333,7 @@ impl Game {
         };
         let mut loaded: Vec<((i32, i32), Vec<u8>)> = Vec::new();
         for (x, z) in &entering {
-            match self.load_chunk(&world, &blobs, *x, *z) {
+            match self.load_chunk(&world, blobs.as_ref(), *x, *z) {
                 Ok(chunk) => loaded.push(((*x, *z), chunk.wire.encode())),
                 Err(e) => eprintln!("[game] chunk ({x},{z}) skipped: {e:#}"),
             }
@@ -2279,7 +2359,7 @@ impl Game {
     fn load_chunk(
         &mut self,
         world: &std::sync::Arc<std::sync::Mutex<crate::WorldState>>,
-        blobs: &std::sync::Arc<Blobs>,
+        blobs: Option<&std::sync::Arc<Blobs>>,
         cx: i32,
         cz: i32,
     ) -> anyhow::Result<&CachedChunk> {
@@ -2296,13 +2376,15 @@ impl Game {
                 slot.insert(CachedChunk { wire, version: 0 });
                 return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
             };
-            let reference = blobs.play.iter().find_map(|(id, body)| {
-                if *id != 0x2e {
-                    return None;
-                }
-                WireChunk::decode(body)
-                    .ok()
-                    .filter(|c| c.x == cx && c.z == cz)
+            let reference = blobs.and_then(|blobs| {
+                blobs.play.iter().find_map(|(id, body)| {
+                    if *id != 0x2e {
+                        return None;
+                    }
+                    WireChunk::decode(body)
+                        .ok()
+                        .filter(|c| c.x == cx && c.z == cz)
+                })
             });
             let wire = match reference {
                 Some(reference) => {

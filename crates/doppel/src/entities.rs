@@ -1278,6 +1278,11 @@ impl Game {
         self.survival.tick_speed = speed;
     }
 
+    /// The configured random-tick rate.
+    pub(crate) fn tick_speed(&self) -> usize {
+        self.survival.tick_speed
+    }
+
     /// Sky exposure standing in for the brightness check: no
     /// light-blocking block in the column above. Exact under an open sky;
     /// the light engine is future work.
