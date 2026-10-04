@@ -234,28 +234,30 @@ fn analyze(pkts: &[bot::CapturedPacket]) -> Obs {
                     }
                 }
             }
-            // set_entity_data: id, then entries; only the leading entry
-            // decodes (it leads the list on both servers). INT entries
-            // widen to f32 for the value slot.
+            // set_entity_data: id, then entries until the 0xff
+            // terminator. INT values ride as varints; FLOAT as be4.
+            // Entries batch (the creeper's swell follows its flags),
+            // so every entry decodes, not just the leading one.
             P_SET_ENTITY_DATA => {
                 if let Some(id) = rd_varint(&raw, &mut o) {
-                    if let Some(&accessor) = raw.get(o) {
-                        o += 1;
-                        if let Some(ser) = rd_varint(&raw, &mut o) {
-                            let value = match ser {
-                                3 => rd_f32(&raw, &mut o),
-                                1 => raw
-                                    .get(o..o + 4)
-                                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
-                                    .map(i32::from_be_bytes)
-                                    .map(|v| {
-                                        o += 4;
-                                        v as f32
-                                    }),
-                                _ => None,
-                            };
-                            obs.data.push((id, accessor, ser, value));
+                    while let Some(&accessor) = raw.get(o) {
+                        if accessor == 0xff {
+                            break;
                         }
+                        o += 1;
+                        let Some(ser) = rd_varint(&raw, &mut o) else {
+                            break;
+                        };
+                        let value = match ser {
+                            3 => rd_f32(&raw, &mut o),
+                            1 => rd_varint(&raw, &mut o).map(|v| v as f32),
+                            0 | 10 => raw.get(o).map(|v| {
+                                o += 1;
+                                f32::from(*v)
+                            }),
+                            _ => None,
+                        };
+                        obs.data.push((id, accessor, ser, value));
                     }
                 }
             }
@@ -432,27 +434,27 @@ fn run_session(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
 /// spider second (an open chase), the creeper last (the blast closes
 /// the session).
 fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
-    // The tick loop freezes first: stepping only advances a frozen
-    // clock, so each barrier lands its commands on distinct game
-    // ticks and the creeper's blast happens inside the last step.
+    // One stance, three summons, one long step: the bot never moves
+    // mid-scenario (teleports race the tracker and the pairing), and
+    // the frozen clock lets a single step carry every leg - the
+    // skeleton's draw, the spider's chase, the creeper's fuse.
     let commands: Vec<String> = vec![
         "gamerule spawn_mobs false".into(),
         "tick freeze".into(),
         "tp @s 100.5 -60 100.5".into(),
         "time set midnight".into(),
-        "summon minecraft:skeleton 108.5 -60 100.5".into(),
-        "tick step 180".into(),
-        "tp @s 160.5 -60 100.5".into(),
-        "tick step 20".into(),
-        "summon minecraft:spider 160.5 -60 108.5".into(),
-        "tick step 90".into(),
-        "tp @s 100.5 -60 160.5".into(),
-        "tick step 20".into(),
-        "summon minecraft:creeper 104.5 -60 160.5".into(),
-        "tick step 140".into(),
+        "summon minecraft:skeleton 105.5 -60 100.5".into(),
+        "summon minecraft:spider 100.5 -60 106.5".into(),
+        "summon minecraft:creeper 96.5 -60 96.5".into(),
+        "tick step 700".into(),
         "tick unfreeze".into(),
     ];
     let login = capture::login_start_c("Doppel");
+    // MOBS_DUMP=<dir> writes every scenario-two packet body for local
+    // diagnosis; unset in CI.
+    let dump = std::env::var("MOBS_DUMP")
+        .ok()
+        .map(std::path::PathBuf::from);
     bot::login_capture(
         "127.0.0.1",
         port,
@@ -461,7 +463,7 @@ fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
         &bot::CaptureOpts {
             idle_timeout: Some(Duration::from_secs(60)),
             max_packets: Some(20000),
-            dump_dir: None,
+            dump_dir: dump.as_deref(),
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
@@ -779,8 +781,11 @@ fn check_scenario_two(who: &str, s: &Obs, failures: &mut Vec<String>) {
                     track.len()
                 ));
             } else {
+                // The bot stands at one stance the whole scenario;
+                // its last teleport bounds the anchor.
+                let anchor = bot_pos_at(s, ai).unwrap_or((100.5, -60.0, 100.5));
                 let dist = |p: &(f64, f64, f64)| {
-                    let (dx, dz) = (p.0 - 160.5, p.2 - 100.5);
+                    let (dx, dz) = (p.0 - anchor.0, p.2 - anchor.2);
                     (dx * dx + dz * dz).sqrt()
                 };
                 let closest = track.iter().map(dist).fold(f64::INFINITY, f64::min);

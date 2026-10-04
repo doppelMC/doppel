@@ -681,6 +681,64 @@ mod tests {
         (rd(i), rd(i + 8), rd(i + 16), ty)
     }
 
+    /// Reads the streamed-world chunk under the scenario-two summons,
+    /// when a local vanilla capture exists. The flat fallback and the
+    /// uncaptured-anvil path must both read a solid floor.
+    #[test]
+    fn streamed_chunks_hold_the_floor() {
+        let root = doppel_protocol::find_repo_root().expect("repo root");
+        let pristine = root
+            .join("target")
+            .join("vanilla")
+            .join("pristine-world-mobs");
+        let blobs_dir = root.join("target").join("vanilla").join("blobs-mobs");
+        if !pristine.is_dir() || !blobs_dir.is_dir() {
+            return;
+        }
+        let (_tx, rx) = mpsc::channel::<Inbound>();
+        let mut world = crate::WorldState {
+            dir: doppel_world::WorldDir::open(&pristine).expect("world dir"),
+            boot: Default::default(),
+        };
+        let blobs = crate::blobs::load(&blobs_dir).expect("blobs");
+        // The join replay's learning, replayed here: every captured
+        // chunk that exists on disk teaches the palette map.
+        let mut learned = 0usize;
+        for (id, body) in blobs.play.iter() {
+            if *id != 0x2e {
+                continue;
+            }
+            if let Ok(chunk) = doppel_world::WireChunk::decode(body) {
+                if let Ok(Some(anvil)) = world.dir.chunk(chunk.x, chunk.z) {
+                    world.boot.learn(&chunk, &anvil);
+                    learned += 1;
+                }
+            }
+        }
+        eprintln!("[probe] learned {learned} reference chunks");
+        let mut g = Game::new(
+            rx,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(world))),
+            Some(std::sync::Arc::new(blobs)),
+        );
+        assert!(g.registry_for_test());
+        for &(x, z) in &[(100i32, 100i32), (160, 100), (100, 160), (96, 96)] {
+            let cx = x.div_euclid(16);
+            let cz = z.div_euclid(16);
+            assert!(g.ensure_chunk_loaded(cx, cz), "chunk ({cx},{cz}) loads");
+            let label = g.block_label_for_test(x, -61, z);
+            eprintln!("[probe] ({x},{z}) floor label: {label}");
+            assert!(
+                label.starts_with("minecraft:grass") || label.starts_with("minecraft:dirt"),
+                "floor at ({x},-61,{z}) reads {label}"
+            );
+            assert!(
+                crate::game::entities::block_solid(&g, x, -61, z),
+                "floor at ({x},-61,{z}) reads solid"
+            );
+        }
+    }
+
     #[test]
     fn midnight_spawns_all_four_kinds() {
         use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};

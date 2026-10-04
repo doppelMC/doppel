@@ -160,13 +160,14 @@ pub fn encode_float_data(entity_id: i32, accessor: u8, value: f32) -> Vec<u8> {
 /// Entity-data serializer ids (registration order): BOOLEAN.
 pub const SER_BOOLEAN: i32 = 10;
 
-/// `set_entity_data` for an int entry (the swell direction).
+/// `set_entity_data` for an int entry (the swell direction). Int
+/// values ride the entity-data channel as varints.
 pub fn encode_int_data(entity_id: i32, accessor: u8, value: i32) -> Vec<u8> {
     let mut body = Vec::with_capacity(10);
     write_varint(&mut body, entity_id);
     body.push(accessor);
     write_varint(&mut body, SER_INT);
-    body.extend_from_slice(&value.to_be_bytes());
+    write_varint(&mut body, value);
     body.push(0xff);
     body
 }

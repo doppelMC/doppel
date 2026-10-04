@@ -810,6 +810,9 @@ fn login_capture_legs_chase(
                 let name = format!("p{:03}.bin", packets.len());
                 std::fs::write(dir.join(&name), &body)
                     .with_context(|| format!("dumping {name}"))?;
+                let id_name = format!("p{:03}.id", packets.len());
+                std::fs::write(dir.join(&id_name), format!("{id:#04x}"))
+                    .with_context(|| format!("dumping {id_name}"))?;
                 file = Some(name);
             }
         }

@@ -682,7 +682,13 @@ impl Game {
         let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone()) else {
             return false;
         };
-        self.load_chunk(&world, &blobs, cx, cz).is_ok()
+        match self.load_chunk(&world, &blobs, cx, cz) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[game] chunk ({cx},{cz}) load failed: {e:#}");
+                false
+            }
+        }
     }
 
     /// The next entity id from the shared counter.
@@ -2267,16 +2273,28 @@ impl Game {
     ) -> anyhow::Result<&CachedChunk> {
         if let std::collections::btree_map::Entry::Vacant(slot) = self.chunks.entry((cx, cz)) {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(anvil) = w.dir.chunk(cx, cz)? else {
-                // No stored chunk: fall back to flat generation so
-                // streaming extends past whatever the world has saved.
-                let Some(flat) = &self.flat else {
-                    anyhow::bail!("chunk not generated and flat fallback unavailable");
-                };
-                let wire = flat.generate(cx, cz);
-                drop(w);
-                slot.insert(CachedChunk { wire, version: 0 });
-                return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
+            let stored = w.dir.chunk(cx, cz)?;
+            // Stored chunks below the full status are worldgen stubs
+            // with no terrain; a live server would finish generating
+            // them on demand, so the flat generator stands in.
+            let anvil = match stored {
+                Some(chunk)
+                    if chunk
+                        .status
+                        .trim_start_matches("minecraft:")
+                        .eq_ignore_ascii_case("full") =>
+                {
+                    chunk
+                }
+                _ => {
+                    let Some(flat) = &self.flat else {
+                        anyhow::bail!("chunk not generated and flat fallback unavailable");
+                    };
+                    let wire = flat.generate(cx, cz);
+                    drop(w);
+                    slot.insert(CachedChunk { wire, version: 0 });
+                    return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
+                }
             };
             let reference = blobs.play.iter().find_map(|(id, body)| {
                 if *id != 0x2e {
