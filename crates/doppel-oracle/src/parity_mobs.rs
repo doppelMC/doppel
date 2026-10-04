@@ -444,7 +444,7 @@ fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
         "tp @s 100.5 -60 100.5".into(),
         "time set midnight".into(),
         "summon minecraft:skeleton 105.5 -60 100.5".into(),
-        "summon minecraft:spider 100.5 -60 106.5".into(),
+        "summon minecraft:spider 100.5 -60 104.5".into(),
         "summon minecraft:creeper 96.5 -60 96.5".into(),
         "tick step 700".into(),
         "tick unfreeze".into(),
