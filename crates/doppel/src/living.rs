@@ -111,8 +111,6 @@ const V_MIN: f64 = 0.003;
 const JUMP_POWER: f64 = 0.42;
 /// Ticks between jump control firings.
 const JUMP_DELAY: i32 = 10;
-/// Forward input per unit speed modifier at the default attribute.
-const BASE_SPEED: f64 = 0.23;
 /// Mob tracking range: clientTrackingRange 8 chunks.
 pub const MOB_TRACK_RANGE: f64 = 128.0;
 /// Movement sync cadence: the tracker updateInterval for mob types.
@@ -662,10 +660,7 @@ impl Goal for LookAtPlayerGoal {
         self.remaining -= 1;
         if let Some(conn) = self.conn {
             if let Some(pos) = ctx.player_pos(conn) {
-                ctx.body.look = Some(look_angles(
-                    eye_of(ctx.body),
-                    eye_at(PLAYER_EYE, pos),
-                ));
+                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, pos)));
             }
         }
     }
@@ -1261,11 +1256,18 @@ pub struct OutFrame {
 /// One ground movement step: input accel along the body yaw, axis-
 /// separated collision with a 1-block step-up and jump, gravity,
 /// friction, and the small-vector clamp.
-fn step_mob(world: &Game, body: &mut MobBody, half: f64, height: f64, forward: f64) {
+fn step_mob(
+    world: &Game,
+    body: &mut MobBody,
+    half: f64,
+    height: f64,
+    base_speed: f64,
+    forward: f64,
+) {
     body.horiz_collided = false;
     if forward > 0.0 {
-        let speed = forward * BASE_SPEED;
-        let accel = speed * BASE_SPEED;
+        let speed = forward * base_speed;
+        let accel = speed * base_speed;
         let yaw = body.yaw.to_radians() as f64;
         body.vx += -yaw.sin() * accel;
         body.vz += yaw.cos() * accel;
@@ -1633,13 +1635,17 @@ impl Game {
         // A bow shot the goal queued: the skeleton module aims and
         // spawns the arrow.
         if let Some((conn, power)) = mob.body.pending_shot.take() {
-            let (x, y, z, eye, zid) = (mob.body.x, mob.body.y, mob.body.z, mob.body.eye, mob.body.id);
+            let (x, y, z, eye, zid) = (
+                mob.body.x,
+                mob.body.y,
+                mob.body.z,
+                mob.body.eye,
+                mob.body.id,
+            );
             let target = self.players.get(&conn).map(|p| (p.x, p.y, p.z));
             if let Some(target) = target {
                 let mut seed = mob.rand;
-                crate::skeleton::fire_shot(
-                    self, x, y, z, eye, zid, target, power, &mut seed,
-                );
+                crate::skeleton::fire_shot(self, x, y, z, eye, zid, target, power, &mut seed);
                 mob.rand = seed;
             }
         }
@@ -1682,15 +1688,10 @@ impl Game {
         }
         // Move control: run the navigation housekeeping, face the
         // wanted waypoint, walk forward.
-        let (bx, by, bz, bground) = (
-            mob.body.x,
-            mob.body.y,
-            mob.body.z,
-            mob.body.on_ground,
-        );
-        mob.body.nav.nav_tick(bx, by, bz, bground, &|x, y, z| {
-            block_solid(self, x, y, z)
-        });
+        let (bx, by, bz, bground) = (mob.body.x, mob.body.y, mob.body.z, mob.body.on_ground);
+        mob.body
+            .nav
+            .nav_tick(bx, by, bz, bground, &|x, y, z| block_solid(self, x, y, z));
         let mut forward = 0.0f64;
         if let Some((tx, tz, modifier)) = mob.body.nav.wanted() {
             mob.body.yaw = rotate_towards(
@@ -1705,7 +1706,8 @@ impl Game {
         }
         let half = mob.kind.half_width();
         let height = mob.kind.height();
-        step_mob(self, &mut mob.body, half, height, forward);
+        let base_speed = mob.kind.base_speed();
+        step_mob(self, &mut mob.body, half, height, base_speed, forward);
         // The wall-crawl rule: pressed into a wall, the body rises.
         if mob.kind.can_climb() {
             mob.body.climbing = mob.body.horiz_collided && mob.body.nav.in_progress();
@@ -2152,7 +2154,7 @@ mod tests {
         // Face +x, straight at the shelf edge.
         b.yaw = -90.0;
         for _ in 0..40 {
-            step_mob(&g, &mut b, 0.3, 1.95, 1.0);
+            step_mob(&g, &mut b, 0.3, 1.95, 0.23, 1.0);
         }
         assert!(b.x > 6.9, "onto the shelf, x = {}", b.x);
         assert!((b.y - 101.0).abs() < 0.01, "on the shelf top, y = {}", b.y);
@@ -2163,7 +2165,7 @@ mod tests {
         let (g, _rx) = harness(false);
         let mut b = MobBody::new(5, 5.5, 110.0, 8.5, 20.0);
         for _ in 0..40 {
-            step_mob(&g, &mut b, 0.3, 1.95, 0.0);
+            step_mob(&g, &mut b, 0.3, 1.95, 0.23, 0.0);
         }
         assert!(b.on_ground);
         assert!((b.y - 100.0).abs() < 0.01, "feet on the grass, y = {}", b.y);

@@ -142,7 +142,9 @@ impl Game {
         let id = self.alloc_entity_id();
         let uuid = self.next_uuid();
         let yaw = facing_yaw(velocity.0, velocity.2);
-        let pitch = velocity.1.atan2((velocity.0 * velocity.0 + velocity.2 * velocity.2).sqrt())
+        let pitch = velocity
+            .1
+            .atan2((velocity.0 * velocity.0 + velocity.2 * velocity.2).sqrt())
             .to_degrees() as f32;
         let body = encode_add_entity(
             id,
@@ -216,7 +218,12 @@ impl Game {
                 'seg: for s in 1..=steps {
                     let t = s as f64 / steps as f64;
                     let (px, py, pz) = (a.x + a.vx * t, a.y + a.vy * t, a.z + a.vz * t);
-                    if block_solid(self, px.floor() as i32, py.floor() as i32, pz.floor() as i32) {
+                    if block_solid(
+                        self,
+                        px.floor() as i32,
+                        py.floor() as i32,
+                        pz.floor() as i32,
+                    ) {
                         stop = Some((
                             px - PULLBACK * a.vx.signum(),
                             py - PULLBACK * a.vy.signum(),
@@ -279,10 +286,7 @@ impl Game {
             let fits = i16::MIN as i64..=i16::MAX as i64;
             let delta_fits = fits.contains(&dx) && fits.contains(&dy) && fits.contains(&dz);
             let yaw = facing_yaw(a.vx, a.vz);
-            let pitch = a
-                .vy
-                .atan2((a.vx * a.vx + a.vz * a.vz).sqrt())
-                .to_degrees() as f32;
+            let pitch = a.vy.atan2((a.vx * a.vx + a.vz * a.vz).sqrt()).to_degrees() as f32;
             if (dx, dy, dz) == (0, 0, 0) {
                 // No move this tick.
             } else if !delta_fits || a.sync_phase % SYNC_INTERVAL == 0 || a.in_ground {
@@ -490,9 +494,8 @@ mod tests {
         g.flush_connections();
         let frames = drain(&rx);
         assert!(
-            frames
-                .iter()
-                .any(|(id, b)| *id == PACKET_SET_ENTITY_DATA && b == &in_ground_data(g.projectiles.arrows[0].id)),
+            frames.iter().any(|(id, b)| *id == PACKET_SET_ENTITY_DATA
+                && b == &in_ground_data(g.projectiles.arrows[0].id)),
             "the in-ground datum goes out"
         );
         // The stuck arrow despawns at the lifetime.
@@ -531,7 +534,10 @@ mod tests {
             frames.iter().any(|(id, _)| *id == PACKET_HURT_ANIMATION),
             "the hit sends the hurt animation"
         );
-        assert!((g.mobs.player_damage[&0] - 4.0).abs() < 0.5, "speed-scaled damage");
+        assert!(
+            (g.mobs.player_damage[&0] - 4.0).abs() < 0.5,
+            "speed-scaled damage"
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! player, strolls and looks around while idle, and burns in daylight.
 
 use crate::living::{
-    brightness, MeleeAttackGoal, NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal,
-    LookAtPlayerGoal, GoalCtx, GoalSelector, MobKind, FIRE_IGNITE_TICKS,
+    brightness, GoalCtx, GoalSelector, LookAtPlayerGoal, MeleeAttackGoal, MobKind,
+    NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal, FIRE_IGNITE_TICKS,
 };
 use crate::spawning::monsters_burn;
 
@@ -86,26 +86,36 @@ impl MobKind for Zombie {
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
         goals.add(3, Box::new(MeleeAttackGoal::new(REACH, FOLLOW_RANGE, true)));
-        goals.add(7, Box::new(RandomStrollGoal::new(
-            STROLL_RANGE,
-            STROLL_CHANCE,
-            STROLL_GIVE_UP,
-            1.0,
-        )));
+        goals.add(
+            7,
+            Box::new(RandomStrollGoal::new(
+                STROLL_RANGE,
+                STROLL_CHANCE,
+                STROLL_GIVE_UP,
+                1.0,
+            )),
+        );
         goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
         goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
-        targets.add(2, Box::new(NearestPlayerTargetGoal::new(
-            TARGET_SCAN_EVERY,
-            UNSEEN_LIMIT,
-            FOLLOW_RANGE,
-            None,
-        )));
+        targets.add(
+            2,
+            Box::new(NearestPlayerTargetGoal::new(
+                TARGET_SCAN_EVERY,
+                UNSEEN_LIMIT,
+                FOLLOW_RANGE,
+                None,
+            )),
+        );
     }
 
     fn kind_tick(&mut self, ctx: &mut GoalCtx) {
         let day = ctx.world.spawning.day_time;
         // Bright locations hasten the despawn clock.
-        let bright = if ctx.body.exposed { brightness(ctx.world, ctx.body) } else { 0.0 };
+        let bright = if ctx.body.exposed {
+            brightness(ctx.world, ctx.body)
+        } else {
+            0.0
+        };
         if bright > 0.5 {
             ctx.body.no_action_time += 2;
         }
@@ -339,7 +349,10 @@ mod tests {
             g.tick_once_for_test();
         }
         let end = dist(&g);
-        assert!(end < start - 8.0, "the chase crossed the gap: {start} -> {end}");
+        assert!(
+            end < start - 8.0,
+            "the chase crossed the gap: {start} -> {end}"
+        );
     }
 
     #[test]

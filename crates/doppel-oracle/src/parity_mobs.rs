@@ -23,6 +23,11 @@ const DOPPEL_PORT: u16 = 25565;
 /// minecraft:zombie in the entity-type registry (registration order 155,
 /// 0-based). The gate asserts both servers' zombie adds carry it.
 const ZOMBIE_TYPE: i32 = 154;
+/// The wave-2 mob types (the same registration-order counting).
+const SKELETON_TYPE: i32 = 118;
+const CREEPER_TYPE: i32 = 32;
+const SPIDER_TYPE: i32 = 127;
+const ARROW_TYPE: i32 = 6;
 /// Where the chase probe plants the bot: past the 24-block spawn
 /// exclusion, inside the zombie's follow range (35).
 const CHASE_STAND: f64 = 26.0;
@@ -34,7 +39,12 @@ const CHASE_CLOSE: f64 = 2.0;
 // Clientbound play packet ids (registration order minus one; the set is
 // anchored by the survival gate's verified 0x01/0x23/0x36/0x37/0x4e/0x65).
 const P_ADD_ENTITY: i32 = 0x01;
+const PACKET_REMOVE_ENTITIES_LOCAL: i32 = 0x4e;
+const P_BLOCK_UPDATE: i32 = 0x08;
+const P_SECTION_BLOCKS_UPDATE: i32 = 0x56;
 const P_DAMAGE_EVENT: i32 = 0x19;
+const P_EXPLODE: i32 = 0x24;
+const P_SET_EQUIPMENT: i32 = 0x68;
 const P_PLAYER_POSITION: i32 = 0x49;
 const P_ENTITY_POSITION_SYNC: i32 = 0x23;
 const P_MOVE_ENTITY_POS: i32 = 0x36;
@@ -131,6 +141,14 @@ struct Obs {
     damage: Vec<(usize, i32)>,
     /// rotate_head frames: packet indices.
     head_rots: Vec<usize>,
+    /// set_equipment leading entries: (entity id, slot byte).
+    equipment: Vec<(i32, u8)>,
+    /// explode packets: (packet index, center x, y, z).
+    explodes: Vec<(usize, f64, f64, f64)>,
+    /// block_update plus section_blocks_update frame count.
+    block_updates: usize,
+    /// remove_entities payloads: (packet index, ids).
+    removes: Vec<(usize, Vec<i32>)>,
     /// The chase probe's note, resolved after the loop: (packet index,
     /// entity id, bot x, y, z).
     chase: Option<(usize, i32, f64, f64, f64)>,
@@ -200,13 +218,25 @@ fn analyze(pkts: &[bot::CapturedPacket]) -> Obs {
                 }
             }
             // set_entity_data: id, then entries; only the leading entry
-            // decodes (it leads the list on both servers).
+            // decodes (it leads the list on both servers). INT entries
+            // widen to f32 for the value slot.
             P_SET_ENTITY_DATA => {
                 if let Some(id) = rd_varint(&raw, &mut o) {
                     if let Some(&accessor) = raw.get(o) {
                         o += 1;
                         if let Some(ser) = rd_varint(&raw, &mut o) {
-                            let value = (ser == 3).then(|| rd_f32(&raw, &mut o)).flatten();
+                            let value = match ser {
+                                3 => rd_f32(&raw, &mut o),
+                                1 => raw
+                                    .get(o..o + 4)
+                                    .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                                    .map(i32::from_be_bytes)
+                                    .map(|v| {
+                                        o += 4;
+                                        v as f32
+                                    }),
+                                _ => None,
+                            };
                             obs.data.push((id, accessor, ser, value));
                         }
                     }
@@ -259,6 +289,40 @@ fn analyze(pkts: &[bot::CapturedPacket]) -> Obs {
             }
             P_ROTATE_HEAD => {
                 obs.head_rots.push(i);
+            }
+            // set_equipment: id, then the first slot byte.
+            P_SET_EQUIPMENT => {
+                if let Some(id) = rd_varint(&raw, &mut o) {
+                    if let Some(&slot) = raw.get(o) {
+                        obs.equipment.push((id, slot));
+                    }
+                }
+            }
+            // explode: center doubles lead the body.
+            P_EXPLODE => {
+                if let (Some(x), Some(y), Some(z)) = (
+                    rd_f64(&raw, &mut o),
+                    rd_f64(&raw, &mut o),
+                    rd_f64(&raw, &mut o),
+                ) {
+                    obs.explodes.push((i, x, y, z));
+                }
+            }
+            P_BLOCK_UPDATE | P_SECTION_BLOCKS_UPDATE => {
+                obs.block_updates += 1;
+            }
+            // remove_entities: count then ids.
+            PACKET_REMOVE_ENTITIES_LOCAL => {
+                let mut ids = Vec::new();
+                if let Some(count) = rd_varint(&raw, &mut o) {
+                    for _ in 0..count.max(0) {
+                        match rd_varint(&raw, &mut o) {
+                            Some(id) => ids.push(id),
+                            None => break,
+                        }
+                    }
+                }
+                obs.removes.push((i, ids));
             }
             _ => {}
         }
@@ -346,6 +410,43 @@ fn run_session(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
     )
 }
 
+/// The scripted summon session: the three wave-2 mobs near a moving
+/// opped bot. Skeleton first (the bow engages at eight blocks), the
+/// spider second (an open chase), the creeper last (the blast closes
+/// the session).
+fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
+    let commands: Vec<String> = vec![
+        "gamerule spawn_mobs false".into(),
+        "tp @s 100.5 -60 100.5".into(),
+        "time set midnight".into(),
+        "summon minecraft:skeleton 108.5 -60 100.5".into(),
+        "tick step 180".into(),
+        "tp @s 160.5 -60 100.5".into(),
+        "tick step 20".into(),
+        "summon minecraft:spider 160.5 -60 108.5".into(),
+        "tick step 90".into(),
+        "tp @s 100.5 -60 160.5".into(),
+        "tick step 20".into(),
+        "summon minecraft:creeper 104.5 -60 160.5".into(),
+        "tick step 140".into(),
+    ];
+    let login = capture::login_start_c("Doppel");
+    bot::login_capture(
+        "127.0.0.1",
+        port,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(60)),
+            max_packets: Some(20000),
+            dump_dir: None,
+            commands: &commands,
+            walk_chunks: None,
+            raw_packets: &[],
+        },
+    )
+}
+
 /// The differential mobs test.
 pub fn parity_mobs() -> Result<bool> {
     let pin = load_pin()?;
@@ -365,16 +466,21 @@ pub fn parity_mobs() -> Result<bool> {
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
-    // Vanilla reference session. The default difficulty boots easy; the
-    // command volley opens spawning and sets midnight.
+    // Vanilla reference sessions. The default difficulty boots easy;
+    // scenario one opens spawning at midnight, scenario two runs the
+    // scripted summons.
     let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
-    let vworker = std::thread::spawn(move || run_session(VANILLA_PORT, protocol));
-    let vdeadline = std::time::Instant::now() + Duration::from_secs(150);
+    let vworker = std::thread::spawn(move || -> Result<_> {
+        let one = run_session(VANILLA_PORT, protocol)?;
+        let two = run_session2(VANILLA_PORT, protocol)?;
+        Ok((one, two))
+    });
+    let vdeadline = std::time::Instant::now() + Duration::from_secs(280);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
         std::thread::sleep(Duration::from_millis(500));
     }
     drop(server);
-    let v_pkts = vworker
+    let (v_pkts, v2_pkts) = vworker
         .join()
         .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
 
@@ -392,20 +498,27 @@ pub fn parity_mobs() -> Result<bool> {
         .with_context(|| format!("spawning {}", bin.display()))?;
     wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
-    let worker = std::thread::spawn(move || run_session(DOPPEL_PORT, protocol));
-    let deadline = std::time::Instant::now() + Duration::from_secs(150);
+    let worker = std::thread::spawn(move || -> Result<_> {
+        let one = run_session(DOPPEL_PORT, protocol)?;
+        let two = run_session2(DOPPEL_PORT, protocol)?;
+        Ok((one, two))
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(280);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
     }
     let _ = child.kill();
     let _ = child.wait();
-    let d_pkts = worker
+    let (d_pkts, d2_pkts) = worker
         .join()
         .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
 
     let v = analyze(&v_pkts);
     let d = analyze(&d_pkts);
+    let v2 = analyze(&v2_pkts);
+    let d2 = analyze(&d2_pkts);
     report(&[("vanilla", &v_pkts, &v), ("doppel", &d_pkts, &d)]);
+    report(&[("vanilla-s2", &v2_pkts, &v2), ("doppel-s2", &d2_pkts, &d2)]);
 
     let mut failures = Vec::new();
 
@@ -479,6 +592,11 @@ pub fn parity_mobs() -> Result<bool> {
         }
     }
 
+    // Scenario two: the scripted summons on both servers.
+    for (who, s) in [("vanilla", &v2), ("doppel", &d2)] {
+        check_scenario_two(who, s, &mut failures);
+    }
+
     if failures.is_empty() {
         println!("PASS: mobs parity");
         Ok(true)
@@ -488,6 +606,123 @@ pub fn parity_mobs() -> Result<bool> {
             println!("  {f}");
         }
         Ok(false)
+    }
+}
+
+/// Scenario two's structural checks: the three summons pair with their
+/// types and metadata, the skeleton fires an arrow, the creeper swells
+/// and detonates, and the spider closes on the bot.
+fn check_scenario_two(who: &str, s: &Obs, failures: &mut Vec<String>) {
+    // The three summons appear with their registry types.
+    for (ty, name) in [
+        (SKELETON_TYPE, "skeleton"),
+        (CREEPER_TYPE, "creeper"),
+        (SPIDER_TYPE, "spider"),
+    ] {
+        if !s.adds.iter().any(|(_, _, t, ..)| *t == ty) {
+            failures.push(format!("{who}: no {name} add (type {ty})"));
+        }
+    }
+    // The skeleton pairs with a main-hand equipment entry.
+    let skel_id = s
+        .adds
+        .iter()
+        .find(|(_, _, t, ..)| *t == SKELETON_TYPE)
+        .map(|(_, id, ..)| *id);
+    if let Some(id) = skel_id {
+        if !s
+            .equipment
+            .iter()
+            .any(|(eid, slot)| *eid == id && *slot == 0)
+        {
+            failures.push(format!(
+                "{who}: skeleton {id} pairs with no main-hand equipment"
+            ));
+        }
+    } else {
+        failures.push(format!("{who}: no skeleton to equip"));
+    }
+    // The arrow: an add typed 6, then movement or a landed hit.
+    match s.adds.iter().find(|(_, _, t, ..)| *t == ARROW_TYPE) {
+        Some((ai, aid, ..)) => {
+            let moved = s.syncs.iter().any(|(i, id, ..)| i > ai && *id == *aid)
+                || s.deltas.iter().any(|(i, id, ..)| i > ai && *id == *aid);
+            let landed = s.damage.iter().any(|(i, _)| i > ai);
+            if !moved && !landed {
+                failures.push(format!("{who}: arrow {aid} neither moves nor lands"));
+            }
+        }
+        None => failures.push(format!("{who}: no arrow add after the skeleton engages")),
+    }
+    // The creeper: the swell datum flips positive, the explosion lands
+    // near its last position, and it leaves without a corpse.
+    let creeper = s
+        .adds
+        .iter()
+        .find(|(_, _, t, ..)| *t == CREEPER_TYPE)
+        .map(|(ai, id, _, x, y, z, _)| (*ai, *id, (x, y, z)));
+    match creeper {
+        Some((_, cid, _)) => {
+            let swelled = s.data.iter().any(|(id, acc, ser, val)| {
+                *id == cid && *acc == 16 && *ser == 1 && val.is_some_and(|v| v > 0.0)
+            });
+            if !swelled {
+                failures.push(format!(
+                    "{who}: creeper {cid} never swells (accessor 16 INT)"
+                ));
+            }
+            let removed = s.removes.iter().any(|(_, ids)| ids.contains(&cid));
+            if !removed {
+                failures.push(format!("{who}: creeper {cid} never removed"));
+            }
+            let near_blast = s.explodes.iter().any(|(_, x, y, z)| {
+                let track = movement_track(s, cid, 0);
+                track.last().is_some_and(|p| {
+                    let (dx, dy, dz) = (p.0 - x, p.1 - y, p.2 - z);
+                    (dx * dx + dy * dy + dz * dz).sqrt() < 8.0
+                })
+            });
+            if s.explodes.is_empty() {
+                failures.push(format!("{who}: no explosion packet"));
+            } else if !near_blast {
+                failures.push(format!(
+                    "{who}: the explosion center sits away from the creeper"
+                ));
+            }
+            if s.block_updates == 0 {
+                failures.push(format!("{who}: no block updates after the blast"));
+            }
+        }
+        None => failures.push(format!("{who}: no creeper to swell")),
+    }
+    // The spider closes on the bot's stance during its leg.
+    let spider = s
+        .adds
+        .iter()
+        .find(|(_, _, t, ..)| *t == SPIDER_TYPE)
+        .map(|(ai, id, ..)| (*ai, *id));
+    match spider {
+        Some((ai, sid)) => {
+            let track = movement_track(s, sid, ai);
+            if track.len() < 3 {
+                failures.push(format!(
+                    "{who}: spider produced {} movement samples, want >= 3",
+                    track.len()
+                ));
+            } else {
+                let dist = |p: &(f64, f64, f64)| {
+                    let (dx, dz) = (p.0 - 160.5, p.2 - 100.5);
+                    (dx * dx + dz * dz).sqrt()
+                };
+                let closest = track.iter().map(dist).fold(f64::INFINITY, f64::min);
+                if closest > 5.0 {
+                    failures.push(format!(
+                        "{who}: spider chase closes only to {closest:.1}, want < 5"
+                    ));
+                }
+            }
+        }
+        None => failures.push(format!("{who}: no spider to chase")),
     }
 }
 

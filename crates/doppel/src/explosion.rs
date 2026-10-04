@@ -49,7 +49,12 @@ pub fn ray_directions() -> Vec<(f64, f64, f64)> {
     for xx in 0..GRID {
         for yy in 0..GRID {
             for zz in 0..GRID {
-                if xx != 0 && xx != GRID - 1 && yy != 0 && yy != GRID - 1 && zz != 0 && zz != GRID - 1
+                if xx != 0
+                    && xx != GRID - 1
+                    && yy != 0
+                    && yy != GRID - 1
+                    && zz != 0
+                    && zz != GRID - 1
                 {
                     continue;
                 }
@@ -111,17 +116,22 @@ fn encode_explode(
 /// The seen-percent exposure: a 2-per-block sample grid over the
 /// entity box, counting samples whose clip to the center hits no
 /// collider.
-fn exposure(g: &Game, center: (f64, f64, f64), bmin: (f64, f64, f64), bmax: (f64, f64, f64)) -> f64 {
+fn exposure(
+    g: &Game,
+    center: (f64, f64, f64),
+    bmin: (f64, f64, f64),
+    bmax: (f64, f64, f64),
+) -> f64 {
     let span = |lo: f64, hi: f64| 1.0 / ((hi - lo) * 2.0 + 1.0);
-    let (xs, ys, zs) = (span(bmin.0, bmax.0), span(bmin.1, bmax.1), span(bmin.2, bmax.2));
+    let (xs, ys, zs) = (
+        span(bmin.0, bmax.0),
+        span(bmin.1, bmax.1),
+        span(bmin.2, bmax.2),
+    );
     let x_off = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
     let z_off = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
     let clip_clear = |from: (f64, f64, f64)| -> bool {
-        let (dx, dy, dz) = (
-            center.0 - from.0,
-            center.1 - from.1,
-            center.2 - from.2,
-        );
+        let (dx, dy, dz) = (center.0 - from.0, center.1 - from.1, center.2 - from.2);
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
         let steps = (dist * 2.0).ceil() as i32;
         for s in 1..steps {
@@ -168,6 +178,15 @@ fn exposure(g: &Game, center: (f64, f64, f64), bmin: (f64, f64, f64), bmax: (f64
     }
 }
 
+/// One struck player: the connection, its entity id, the damage, and
+/// the knockback vector.
+struct Struck {
+    conn: ConnId,
+    player_id: i32,
+    damage: f32,
+    knock: (f64, f64, f64),
+}
+
 impl Game {
     /// One explosion at a position: the ray grid carves the destroyed
     /// set, entities inside the doubled radius take exposure-scaled
@@ -185,11 +204,7 @@ impl Game {
                 if power <= 0.0 {
                     break;
                 }
-                let cell = (
-                    px.floor() as i32,
-                    py.floor() as i32,
-                    pz.floor() as i32,
-                );
+                let cell = (px.floor() as i32, py.floor() as i32, pz.floor() as i32);
                 let solid = self
                     .get_block(cell.0, cell.1, cell.2)
                     .is_some_and(|(name, _)| name != "minecraft:air");
@@ -208,7 +223,7 @@ impl Game {
         let count = destroyed.len();
         // 2. Entity damage and knockback.
         let double_radius = radius * 2.0;
-        let mut struck: Vec<(ConnId, i32, f32, (f64, f64, f64))> = Vec::new();
+        let mut struck: Vec<Struck> = Vec::new();
         for (&conn, p) in self.players.iter() {
             let (dist, exposure) = {
                 let (ddx, ddy, ddz) = (p.x - x, p.y + 0.9 - y, p.z - z);
@@ -229,21 +244,21 @@ impl Game {
             let (ddx, ddz) = (p.x - x, p.z - z);
             let dl = (ddx * ddx + ddz * ddz).sqrt().max(1.0e-4);
             let knock = (1.0 - dist) * exposure;
-            struck.push((
+            struck.push(Struck {
                 conn,
-                p.entity_id,
+                player_id: p.entity_id,
                 damage,
-                (ddx / dl * knock, 0.0, ddz / dl * knock),
-            ));
+                knock: (ddx / dl * knock, 0.0, ddz / dl * knock),
+            });
         }
-        for (conn, pid, damage, _) in &struck {
+        for hit in &struck {
             self.send_within(
                 x,
                 y,
                 z,
                 BROADCAST,
                 PACKET_HURT_ANIMATION,
-                &encode_hurt_animation(*pid, 0.0),
+                &encode_hurt_animation(hit.player_id, 0.0),
             );
             self.send_within(
                 x,
@@ -251,9 +266,9 @@ impl Game {
                 z,
                 BROADCAST,
                 PACKET_DAMAGE_EVENT,
-                &encode_damage_event(*pid, DAMAGE_TYPE_EXPLOSION, source_id, source_id),
+                &encode_damage_event(hit.player_id, DAMAGE_TYPE_EXPLOSION, source_id, source_id),
             );
-            *self.mobs.player_damage.entry(*conn).or_insert(0.0) += *damage;
+            *self.mobs.player_damage.entry(hit.conn).or_insert(0.0) += hit.damage;
         }
         // Mobs take the same shape (the source is excluded).
         let mob_hits: Vec<(usize, f32, (f64, f64, f64))> = self
@@ -296,10 +311,8 @@ impl Game {
         }
         // 4. The packet, per player, with the struck player's own
         // knockback.
-        let knocks: std::collections::BTreeMap<ConnId, (f64, f64, f64)> = struck
-            .iter()
-            .map(|(conn, _, _, k)| (*conn, *k))
-            .collect();
+        let knocks: std::collections::BTreeMap<ConnId, (f64, f64, f64)> =
+            struck.iter().map(|hit| (hit.conn, hit.knock)).collect();
         for conn in self.players.keys().copied().collect::<Vec<_>>() {
             let Some(p) = self.players.get(&conn) else {
                 continue;
@@ -405,7 +418,8 @@ mod tests {
             "the floor block under the center dies"
         );
         assert!(
-            g.block_label_for_test(12, 99, 5).starts_with("minecraft:grass"),
+            g.block_label_for_test(12, 99, 5)
+                .starts_with("minecraft:grass"),
             "the floor survives beyond the radius"
         );
         let frames = drain(&rx);

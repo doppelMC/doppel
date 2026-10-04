@@ -165,12 +165,15 @@ impl MobKind for Spider {
         );
         goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
         goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
-        targets.add(2, Box::new(NearestPlayerTargetGoal::new(
-            TARGET_SCAN_EVERY,
-            UNSEEN_LIMIT,
-            FOLLOW_RANGE,
-            Some(HOSTILE_BELOW),
-        )));
+        targets.add(
+            2,
+            Box::new(NearestPlayerTargetGoal::new(
+                TARGET_SCAN_EVERY,
+                UNSEEN_LIMIT,
+                FOLLOW_RANGE,
+                Some(HOSTILE_BELOW),
+            )),
+        );
     }
 
     fn kind_tick(&mut self, _ctx: &mut GoalCtx) {}
@@ -376,7 +379,7 @@ mod tests {
             .map(|(_, b)| b.clone())
             .expect("the attribute packet pairs");
         let mut i = 0usize;
-        let mut rd_varint = |body: &[u8], i: &mut usize| {
+        let rd_varint = |body: &[u8], i: &mut usize| {
             let mut v = 0i32;
             let mut shift = 0;
             loop {

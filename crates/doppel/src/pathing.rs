@@ -25,7 +25,12 @@ pub(crate) struct Waypoint {
 impl Waypoint {
     #[cfg(test)]
     fn stand(x: i32, y: i32, z: i32) -> Waypoint {
-        Waypoint { x, y, z, wall: None }
+        Waypoint {
+            x,
+            y,
+            z,
+            wall: None,
+        }
     }
 }
 
@@ -378,9 +383,10 @@ impl Nav {
             self.move_to(x, z, modifier);
             return;
         }
-        let keeps_route = self.path.last().is_some_and(|wp| {
-            (wp.x as f64 - x).abs().max((wp.z as f64 - z).abs()) <= 1.0
-        });
+        let keeps_route = self
+            .path
+            .last()
+            .is_some_and(|wp| (wp.x as f64 - x).abs().max((wp.z as f64 - z).abs()) <= 1.0);
         self.want = Some(Want { x, z, modifier });
         if !keeps_route {
             self.needs_search = true;
@@ -481,7 +487,10 @@ impl Nav {
         if self.recheck_in <= 0 {
             self.recheck_in = RECHECK_TICKS;
             let end_ok = self.path.last().is_none_or(|wp| {
-                (wp.x as f64 - want.0).abs().max((wp.z as f64 - want.1).abs()) <= 1.0
+                (wp.x as f64 - want.0)
+                    .abs()
+                    .max((wp.z as f64 - want.1).abs())
+                    <= 1.0
             });
             if !end_ok || !self.route_open(solid) {
                 self.run_search(x, y, z, solid);
@@ -643,9 +652,7 @@ mod tests {
         let route = find_path(&q, (0, 100, 2), (10, 2), false).unwrap();
         assert!(route.len() > 10, "the detour is longer than the line");
         assert!(
-            !route
-                .iter()
-                .any(|wp| wp.x == 5 && wp.z <= 3 && wp.y <= 104),
+            !route.iter().any(|wp| wp.x == 5 && wp.z <= 3 && wp.y <= 104),
             "the route never crosses the wall: {route:?}"
         );
         assert_eq!(route.last().map(|wp| (wp.x, wp.z)), Some((10, 2)));
@@ -675,7 +682,9 @@ mod tests {
         );
         assert_eq!(route.last().map(|wp| (wp.x, wp.z)), Some((8, 1)));
         // The dismount lands standing on the far floor.
-        assert!(route.last().is_some_and(|wp| wp.y == 100 && wp.wall.is_none()));
+        assert!(route
+            .last()
+            .is_some_and(|wp| wp.y == 100 && wp.wall.is_none()));
     }
 
     #[test]

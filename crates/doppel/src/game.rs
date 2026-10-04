@@ -142,6 +142,14 @@ pub enum Inbound {
         conn: ConnId,
         enabled: bool,
     },
+    /// `summon <kind> <x> <y> <z>`: the deterministic spawn driver.
+    Summon {
+        conn: ConnId,
+        kind: String,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
     /// `difficulty <word>`: peaceful removes monsters.
     SetDifficulty {
         conn: ConnId,
@@ -396,7 +404,6 @@ pub(crate) mod entities;
 // --- tracker hooks (tracker.rs) ---
 #[path = "tracker.rs"]
 pub(crate) mod tracker;
-
 
 pub(crate) const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -880,6 +887,16 @@ impl Game {
             // --- mob hooks (living.rs / spawning.rs) ---
             Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
                 self.apply_mob_command(event);
+            }
+            Inbound::Summon {
+                conn,
+                kind,
+                x,
+                y,
+                z,
+            } => {
+                self.spawn_named(&kind, x, y, z);
+                self.send_command_feedback(conn);
             }
             // --- placement hooks (placement.rs) ---
             Inbound::Rotated { conn, yaw, pitch } => {

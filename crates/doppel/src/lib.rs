@@ -597,6 +597,23 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
         };
         return Some(game::Inbound::TimeSet { conn, value });
     }
+    // `summon <kind> <x> <y> <z>`: the mobs gate's deterministic
+    // spawn driver.
+    if parts.len() == 5 && parts[0] == "summon" {
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            parts[2].parse::<f64>(),
+            parts[3].parse::<f64>(),
+            parts[4].parse::<f64>(),
+        ) {
+            return Some(game::Inbound::Summon {
+                conn,
+                kind: parts[1].to_string(),
+                x,
+                y,
+                z,
+            });
+        }
+    }
     // `difficulty <word>`: peaceful removes monsters.
     if parts.len() == 2 && parts[0] == "difficulty" {
         let peaceful = match parts[1] {

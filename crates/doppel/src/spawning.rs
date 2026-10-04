@@ -117,6 +117,20 @@ pub fn monsters_burn(t: u64) -> bool {
 // ---------------------------------------------------------------------
 
 impl Game {
+    /// The named-kind summon: the mobs gate's deterministic driver.
+    pub(crate) fn spawn_named(&mut self, kind: &str, x: f64, y: f64, z: f64) {
+        let mob: Option<Box<dyn MobKind>> = match kind {
+            "minecraft:zombie" => Some(Box::new(Zombie::new())),
+            "minecraft:skeleton" => Some(Box::new(Skeleton::new())),
+            "minecraft:creeper" => Some(Box::new(Creeper::new())),
+            "minecraft:spider" => Some(Box::new(Spider::new())),
+            _ => None,
+        };
+        if let Some(mob) = mob {
+            self.spawn_mob(x, y, z, mob);
+        }
+    }
+
     /// The monster-category natural spawn pass, per spawnable chunk:
     /// cap gate, random start column, conductor abort, then the pack
     /// loop with the jitter and the position checks.
@@ -233,12 +247,7 @@ impl Game {
         }
         let cx = x as f64 + 0.5;
         let cz = z as f64 + 0.5;
-        for (dx, dz) in [
-            (-half, -half),
-            (half, -half),
-            (-half, half),
-            (half, half),
-        ] {
+        for (dx, dz) in [(-half, -half), (half, -half), (-half, half), (half, half)] {
             let (qx, qz) = ((cx + dx) as i32, (cz + dz) as i32);
             if block_solid(self, qx, y, qz) || block_solid(self, qx, y + 1, qz) {
                 return false;
@@ -509,10 +518,7 @@ mod tests {
         }
         let frames = drain(&rx);
         let spawns = spawn_positions(&frames);
-        assert!(
-            !spawns.is_empty(),
-            "monsters appear at midnight"
-        );
+        assert!(!spawns.is_empty(), "monsters appear at midnight");
         assert!(!g.mobs.mobs.is_empty(), "the mob list holds the survivors");
         assert!(
             g.mobs.mobs.len() as u64 <= category_cap(25),

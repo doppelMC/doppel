@@ -104,11 +104,7 @@ impl Goal for SwellGoal {
             ctx.body.swell_dir = -1;
             return;
         }
-        if !visible(
-            ctx.world,
-            eye_of(ctx.body),
-            eye_at(PLAYER_EYE, (x, y, z)),
-        ) {
+        if !visible(ctx.world, eye_of(ctx.body), eye_at(PLAYER_EYE, (x, y, z))) {
             ctx.body.swell_dir = -1;
             return;
         }
@@ -186,12 +182,15 @@ impl MobKind for Creeper {
         );
         goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
         goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
-        targets.add(2, Box::new(NearestPlayerTargetGoal::new(
-            TARGET_SCAN_EVERY,
-            UNSEEN_LIMIT,
-            FOLLOW_RANGE,
-            None,
-        )));
+        targets.add(
+            2,
+            Box::new(NearestPlayerTargetGoal::new(
+                TARGET_SCAN_EVERY,
+                UNSEEN_LIMIT,
+                FOLLOW_RANGE,
+                None,
+            )),
+        );
     }
 
     fn kind_tick(&mut self, ctx: &mut GoalCtx) {
@@ -213,8 +212,8 @@ impl MobKind for Creeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::entities::PACKET_SET_ENTITY_DATA;
     use crate::explosion::PACKET_EXPLODE;
+    use crate::game::entities::PACKET_SET_ENTITY_DATA;
     use crate::game::{Game, Inbound, Outbound};
     use crate::living::DATA_SWELL_DIR;
     use doppel_world::WireChunk;

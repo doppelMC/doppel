@@ -119,9 +119,8 @@ impl Goal for RangedBowAttackGoal {
     }
 
     fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        self.target.is_some_and(|conn| {
-            ctx.body.target == Some(conn) || ctx.body.nav.in_progress()
-        })
+        self.target
+            .is_some_and(|conn| ctx.body.target == Some(conn) || ctx.body.nav.in_progress())
     }
 
     fn start(&mut self, ctx: &mut GoalCtx) {
@@ -237,6 +236,7 @@ impl Goal for RangedBowAttackGoal {
 
 /// The aim-and-fire step: origin at the eye minus 0.1, the one-third
 /// aim height plus the distance lead, jittered and scaled.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fire_shot(
     g: &mut Game,
     x: f64,
@@ -325,12 +325,15 @@ impl MobKind for Skeleton {
         );
         goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
         goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
-        targets.add(2, Box::new(NearestPlayerTargetGoal::new(
-            TARGET_SCAN_EVERY,
-            UNSEEN_LIMIT,
-            FOLLOW_RANGE,
-            None,
-        )));
+        targets.add(
+            2,
+            Box::new(NearestPlayerTargetGoal::new(
+                TARGET_SCAN_EVERY,
+                UNSEEN_LIMIT,
+                FOLLOW_RANGE,
+                None,
+            )),
+        );
     }
 
     fn kind_tick(&mut self, ctx: &mut GoalCtx) {
@@ -485,7 +488,7 @@ mod tests {
         let mut hit = false;
         for _ in 0..200 {
             g.tick_once_for_test();
-            hit |= g.projectiles.arrows.len() > 0;
+            hit |= !g.projectiles.arrows.is_empty();
             if hit {
                 break;
             }
