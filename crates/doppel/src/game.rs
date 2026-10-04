@@ -805,38 +805,16 @@ impl Game {
                 self.track_player_view(conn);
                 self.stream_if_moved(conn);
             }
-            Inbound::Tp { conn, x, y, z } => {
-                self.teleport_conn(conn, x, y, z);
-                let name = self
-                    .players
-                    .get(&conn)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
-            }
-            Inbound::TpNamed {
-                conn,
-                name,
-                x,
-                y,
-                z,
-            } => {
-                let target = self
-                    .players
-                    .iter()
-                    .find(|(_, p)| p.name == name)
-                    .map(|(&c, _)| c);
-                if let Some(target) = target {
-                    self.teleport_conn(target, x, y, z);
-                }
-                let name = self
-                    .players
-                    .iter()
-                    .find(|(_, p)| p.name == name)
-                    .map(|(_, p)| p.name.clone())
-                    .unwrap_or_default();
-                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
-            }
+            Inbound::Tp { .. }
+            | Inbound::TpNamed { .. }
+            | Inbound::Setblock { .. }
+            | Inbound::GameMode { .. }
+            | Inbound::Give { .. }
+            | Inbound::GameRule { .. }
+            | Inbound::TimeSet { .. }
+            | Inbound::GameRuleNoop { .. }
+            | Inbound::TickStep { .. }
+            | Inbound::TickFreeze { .. } => self.apply_command(event),
             Inbound::KeepAliveAnswer { conn, id } => {
                 if let Some(p) = self.players.get_mut(&conn) {
                     if let Some((challenge, _)) = p.pending_keep_alive {
@@ -847,53 +825,13 @@ impl Game {
                     }
                 }
             }
-            Inbound::Setblock {
-                conn,
-                x,
-                y,
-                z,
-                name,
-            } => {
-                self.setblock(conn, x, y, z, name);
-                self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
-            }
             // --- inventory hooks (inventory.rs) ---
             Inbound::SetCarriedItem { conn, slot } => self.select_hotbar_slot(conn, slot),
             Inbound::ContainerClick { conn, click } => self.container_clicked(conn, &click),
-            Inbound::GameMode { conn, creative } => {
-                if let Some(p) = self.players.get_mut(&conn) {
-                    p.inv.creative = creative;
-                }
-                let mode = if creative { "Creative" } else { "Survival" };
-                self.send_command_feedback(conn, &format!("Set own game mode to {mode} Mode"));
-            }
             Inbound::CreativeSlot { conn, set } => {
                 self.creative_slot(conn, set);
             }
-            Inbound::Give { conn, item, count } => {
-                self.give_item(conn, &item, count);
-                self.send_command_feedback(conn, &format!("Gave {count} {item}"));
-            }
             // --- survival hooks (entities.rs) ---
-            Inbound::GameRule { conn, tick_speed } => {
-                self.set_tick_speed(tick_speed);
-                self.send_command_feedback(
-                    conn,
-                    &format!("Gamerule randomTickSpeed is now set to: {tick_speed}"),
-                );
-            }
-            Inbound::TimeSet { conn, value } => {
-                self.day_time = value;
-                // The spawn cycle's darkness/burn timelines read the
-                // spawning clock, so the command drives both.
-                self.spawning.day_time = value.rem_euclid(24000) as u64;
-                self.spawning.time_running = true;
-                self.send_set_time();
-                self.send_command_feedback(conn, &format!("Set the time to {value}"));
-            }
-            Inbound::GameRuleNoop { conn } => {
-                self.send_command_feedback(conn, "Gamerule updated");
-            }
             // --- mob hooks (living.rs / spawning.rs) ---
             Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
                 self.apply_mob_command(event);
@@ -943,6 +881,86 @@ impl Game {
                     }
                 }
             }
+        }
+    }
+
+    /// The chat commands and their replies. Each arm applies its effect
+    /// and answers with a feedback frame; the oracle harness paces its
+    /// scripted volleys on those replies.
+    fn apply_command(&mut self, event: Inbound) {
+        match event {
+            Inbound::Tp { conn, x, y, z } => {
+                self.teleport_conn(conn, x, y, z);
+                let name = self
+                    .players
+                    .get(&conn)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
+            }
+            Inbound::TpNamed {
+                conn,
+                name,
+                x,
+                y,
+                z,
+            } => {
+                let target = self
+                    .players
+                    .iter()
+                    .find(|(_, p)| p.name == name)
+                    .map(|(&c, _)| c);
+                if let Some(target) = target {
+                    self.teleport_conn(target, x, y, z);
+                }
+                let name = self
+                    .players
+                    .iter()
+                    .find(|(_, p)| p.name == name)
+                    .map(|(_, p)| p.name.clone())
+                    .unwrap_or_default();
+                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
+            }
+            Inbound::Setblock {
+                conn,
+                x,
+                y,
+                z,
+                name,
+            } => {
+                self.setblock(conn, x, y, z, name);
+                self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
+            }
+            Inbound::GameMode { conn, creative } => {
+                if let Some(p) = self.players.get_mut(&conn) {
+                    p.inv.creative = creative;
+                }
+                let mode = if creative { "Creative" } else { "Survival" };
+                self.send_command_feedback(conn, &format!("Set own game mode to {mode} Mode"));
+            }
+            Inbound::Give { conn, item, count } => {
+                self.give_item(conn, &item, count);
+                self.send_command_feedback(conn, &format!("Gave {count} {item}"));
+            }
+            Inbound::GameRule { conn, tick_speed } => {
+                self.set_tick_speed(tick_speed);
+                self.send_command_feedback(
+                    conn,
+                    &format!("Gamerule randomTickSpeed is now set to: {tick_speed}"),
+                );
+            }
+            Inbound::TimeSet { conn, value } => {
+                self.day_time = value;
+                // The spawn cycle's darkness/burn timelines read the
+                // spawning clock, so the command drives both.
+                self.spawning.day_time = value.rem_euclid(24000) as u64;
+                self.spawning.time_running = true;
+                self.send_set_time();
+                self.send_command_feedback(conn, &format!("Set the time to {value}"));
+            }
+            Inbound::GameRuleNoop { conn } => {
+                self.send_command_feedback(conn, "Gamerule updated");
+            }
             Inbound::TickStep { conn, steps } => {
                 // Run the stepped ticks inline: commands queued behind this
                 // event in the same channel batch land on later ticks,
@@ -962,6 +980,7 @@ impl Game {
                 let what = if frozen { "frozen" } else { "resumed" };
                 self.send_command_feedback(conn, &format!("Tick {what}"));
             }
+            _ => {}
         }
     }
 
