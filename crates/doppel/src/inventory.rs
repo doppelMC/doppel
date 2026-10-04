@@ -409,9 +409,8 @@ const ITEM_IDS: &[(&str, i32)] = &[
     ("minecraft:netherite_sword", 1055),
 ];
 
-/// An item name -> registry id table. Built from the curated vanilla
-/// subset by default; a future items pin constructs one with
-/// `from_pairs`.
+/// An item name -> registry id table. The default table loads the full
+/// registry pin; `from_pairs` builds partial tables for tests.
 pub struct ItemTable {
     by_name: HashMap<String, i32>,
 }
@@ -423,9 +422,12 @@ impl ItemTable {
         }
     }
 
-    /// The curated vanilla-26.3 subset.
-    pub fn vanilla_subset() -> ItemTable {
-        ItemTable::from_pairs(ITEM_IDS.iter().copied())
+    /// The full vanilla-26.3 item registry from the pin.
+    pub fn from_pin() -> ItemTable {
+        let pin: HashMap<String, i32> =
+            serde_json::from_str(include_str!("../../../pins/items.json"))
+                .expect("pins/items.json parses");
+        ItemTable { by_name: pin }
     }
 
     /// Resolves an item name, applying the `minecraft:` default namespace
@@ -441,7 +443,7 @@ impl ItemTable {
 
 fn item_table() -> &'static ItemTable {
     static TABLE: OnceLock<ItemTable> = OnceLock::new();
-    TABLE.get_or_init(ItemTable::vanilla_subset)
+    TABLE.get_or_init(ItemTable::from_pin)
 }
 
 /// Resolves an item name against the default table.
@@ -449,8 +451,9 @@ pub fn item_id(name: &str) -> Option<i32> {
     item_table().id_of(name)
 }
 
-/// Reverse lookup: the registry name of a curated item id (block-entity
-/// NBT writes item names, not ids).
+/// Reverse lookup over the curated subset (block-entity NBT writes item
+/// names, not ids; full-registry reverse lookup arrives with the pin's
+/// consumers).
 pub fn item_name(id: i32) -> Option<&'static str> {
     ITEM_IDS.iter().find(|(_, v)| *v == id).map(|(k, _)| *k)
 }
@@ -1628,6 +1631,18 @@ mod tests {
 
     use super::*;
     use crate::game::{Game, Inbound, Outbound};
+
+    // -- the item registry pin ---------------------------------------------
+
+    #[test]
+    fn item_pin_resolves_the_full_registry() {
+        assert_eq!(item_id("minecraft:stone").unwrap(), 1);
+        assert_eq!(item_id("stone").unwrap(), 1, "default namespace applies");
+        assert_eq!(item_id("minecraft:redstone_block").unwrap(), 826);
+        assert_eq!(item_id("minecraft:redstone").unwrap(), 824);
+        assert!(item_table().by_name.len() > 1600, "full registry loads");
+        assert_eq!(item_id("minecraft:no_such_item_ever"), None);
+    }
 
     // -- codec golden bytes ------------------------------------------------
 
