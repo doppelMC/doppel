@@ -27,9 +27,10 @@ pub const PACKET_MOVE_ENTITY_ROT: i32 = 0x39;
 /// `rotate_head`: registration order 86. TODO wire-verify at the gate.
 pub const PACKET_ROTATE_HEAD: i32 = 0x55;
 /// `set_equipment`: registration order 105. Bare mobs send none (the
-/// packet only carries non-empty slots); the id stays pinned.
-#[allow(dead_code)]
+/// packet only carries non-empty slots).
 pub const PACKET_SET_EQUIPMENT: i32 = 0x68;
+/// Equipment slot ordinals (declaration order): main hand.
+pub const EQUIP_MAIN_HAND: u8 = 0;
 /// `update_attributes`: registration order 135. TODO wire-verify at the
 /// gate.
 pub const PACKET_UPDATE_ATTRIBUTES: i32 = 0x86;
@@ -52,11 +53,18 @@ pub const DATA_ENTITY_FLAGS: u8 = 0;
 pub const DATA_LIVING_HEALTH: u8 = 9;
 /// The mob flags accessor; bit 0x04 = aggressive.
 pub const DATA_MOB_FLAGS: u8 = 15;
+/// The wall-crawler's flag byte accessor (bit 0x01 = climbing).
+pub const DATA_CLIMBING_FLAGS: u8 = 16;
 
 /// `movement_speed` in the attribute registry (alphabetical
 /// registration); wire-verified: the reference's zombie snapshot carries
 /// it alone (default-valued attributes are omitted).
 pub const ATTR_MOVEMENT_SPEED: i32 = 26;
+/// `max_health` in the attribute registry (alphabetical registration).
+/// TODO wire-verify at the gate.
+pub const ATTR_MAX_HEALTH: i32 = 23;
+/// The max-health attribute's registry default; the pairing omits it.
+const DEFAULT_MAX_HEALTH: f32 = 20.0;
 /// A player's full health bar; mob melee damage beyond it means the
 /// player is down and no longer a target.
 const PLAYER_HEALTH: f32 = 20.0;
@@ -117,6 +125,10 @@ const DESPAWN_ROLL: u64 = 800;
 const DEATH_TICKS: i32 = 20;
 /// Body-yaw turn cap per tick (the move control's 90 degrees).
 const TURN_RATE: f32 = 90.0;
+/// Player eye height above the feet.
+pub const PLAYER_EYE: f64 = 1.62;
+/// The climb rise per tick while pressed against a wall.
+const CLIMB_RISE: f64 = 0.2;
 
 // ---------------------------------------------------------------------
 // Wire encoders
@@ -236,9 +248,52 @@ pub fn encode_damage_event(entity_id: i32, damage_type: i32, cause: i32, direct:
     body
 }
 
+/// `set_equipment`: id, then (slot byte, stack) pairs; the 0x80 bit on
+/// the slot byte marks a following entry.
+pub fn encode_equipment(entity_id: i32, slots: &[(u8, &crate::inventory::ItemStack)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + slots.len() * 6);
+    write_varint(&mut body, entity_id);
+    for (i, (slot, stack)) in slots.iter().enumerate() {
+        let more = if i + 1 < slots.len() { 0x80 } else { 0x00 };
+        body.push(slot | more);
+        crate::inventory::encode_item_stack(&mut body, Some(stack));
+    }
+    body
+}
+
 /// Degrees packed to the wire byte: `deg * 256 / 360`.
 pub fn pack_degrees(deg: f32) -> u8 {
     (deg * 256.0 / 360.0) as i8 as u8
+}
+
+/// Whether the sight line between two eye points is clear.
+pub(crate) fn visible(world: &Game, from: (f64, f64, f64), to: (f64, f64, f64)) -> bool {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    let steps = (dist * 2.0).ceil() as i32;
+    for s in 1..steps {
+        let t = s as f64 / steps as f64;
+        let (x, y, z) = (from.0 + dx * t, from.1 + dy * t, from.2 + dz * t);
+        if block_solid(world, x.floor() as i32, y.floor() as i32, z.floor() as i32) {
+            return false;
+        }
+    }
+    true
+}
+
+/// An eye position `eye` blocks above the feet.
+pub(crate) fn eye_at(eye: f64, pos: (f64, f64, f64)) -> (f64, f64, f64) {
+    (pos.0, pos.1 + eye, pos.2)
+}
+
+/// The look angles from an eye point toward a target point.
+pub(crate) fn look_angles(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f32, f32) {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    let horiz = (dx * dx + dz * dz).sqrt();
+    (
+        (-dx).atan2(dz).to_degrees() as f32,
+        -dy.atan2(horiz).to_degrees() as f32,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -455,12 +510,26 @@ pub trait MobKind: Send {
     fn half_width(&self) -> f64;
     /// Hitbox height.
     fn height(&self) -> f64;
+    /// Eye height above the feet.
+    fn eye(&self) -> f64;
     /// The movement-speed attribute.
     fn base_speed(&self) -> f64;
     /// The attack-damage attribute.
     fn attack_damage(&self) -> f32;
     /// The follow-range attribute.
     fn follow_range(&self) -> f64;
+    /// Whether the navigator climbs walls.
+    fn can_climb(&self) -> bool {
+        false
+    }
+    /// The max-health attribute.
+    fn max_health(&self) -> f32 {
+        20.0
+    }
+    /// The equipment a fresh spawn carries: (slot ordinal, stack).
+    fn equipment(&self) -> Option<(u8, crate::inventory::ItemStack)> {
+        None
+    }
     /// Registers the behavior and target goals at their priorities.
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector);
     /// The per-tick kind hook (daylight burning and kin).
@@ -512,6 +581,10 @@ pub struct MobBody {
     pub melee_active: bool,
     /// A melee hit awaiting the wire send.
     pub pending_hit: Option<ConnId>,
+    /// Whether the last move clipped horizontally.
+    pub horiz_collided: bool,
+    /// The climbing state (the wall-crawler's metadata bit).
+    pub climbing: bool,
 }
 
 impl MobBody {
@@ -544,6 +617,8 @@ impl MobBody {
             target: None,
             melee_active: false,
             pending_hit: None,
+            horiz_collided: false,
+            climbing: false,
         }
     }
 }
@@ -572,6 +647,8 @@ pub struct Mob {
     sync_phase: i64,
     /// The last sent entity/mob flag bytes.
     sent_flags: (u8, u8),
+    /// The last sent climbing state.
+    sent_climbing: bool,
 }
 
 impl Mob {
@@ -588,10 +665,13 @@ impl Mob {
         let mut goals = GoalSelector::new();
         let mut targets = GoalSelector::new();
         kind.register_goals(&mut goals, &mut targets);
-        let max_health = 20.0;
+        let max_health = kind.max_health();
+        let climb = kind.can_climb();
+        let mut body = MobBody::new(id, x, y, z, max_health);
+        body.nav.set_climb(climb);
         Mob {
             uuid,
-            body: MobBody::new(id, x, y, z, max_health),
+            body,
             kind,
             goals,
             targets,
@@ -608,6 +688,7 @@ impl Mob {
             teleport_delay: 0,
             sync_phase: 0,
             sent_flags: (0, 0),
+            sent_climbing: false,
         }
     }
 
@@ -620,11 +701,15 @@ impl Mob {
         (z ^ (z >> 31)) % n
     }
 
-    /// The spawn pairing: add_entity, the health datum, the
-    /// movement-speed attribute (the reference omits default-valued
-    /// attributes; no equipment packet for bare mobs).
+    /// The spawn pairing: add_entity, the health datum, the attribute
+    /// snapshot (the reference omits default-valued attributes), then
+    /// the equipment a kind carries.
     pub fn pairing_frames(&self) -> Vec<(i32, Vec<u8>)> {
-        vec![
+        let mut attrs = vec![(ATTR_MOVEMENT_SPEED, self.kind.base_speed())];
+        if self.kind.max_health() != DEFAULT_MAX_HEALTH {
+            attrs.push((ATTR_MAX_HEALTH, self.kind.max_health() as f64));
+        }
+        let mut frames = vec![
             (
                 PACKET_ADD_ENTITY,
                 encode_add_entity(
@@ -647,12 +732,16 @@ impl Mob {
             ),
             (
                 PACKET_UPDATE_ATTRIBUTES,
-                encode_update_attributes(
-                    self.body.id,
-                    &[(ATTR_MOVEMENT_SPEED, self.kind.base_speed())],
-                ),
+                encode_update_attributes(self.body.id, &attrs),
             ),
-        ]
+        ];
+        if let Some((slot, stack)) = self.kind.equipment() {
+            frames.push((
+                PACKET_SET_EQUIPMENT,
+                encode_equipment(self.body.id, &[(slot, &stack)]),
+            ));
+        }
+        frames
     }
 
     /// Damage plus knockback under the partial-hit rule; returns true
@@ -715,6 +804,7 @@ pub struct OutFrame {
 /// separated collision with a 1-block step-up and jump, gravity,
 /// friction, and the small-vector clamp.
 fn step_mob(world: &Game, body: &mut MobBody, half: f64, height: f64, forward: f64) {
+    body.horiz_collided = false;
     if forward > 0.0 {
         let speed = forward * BASE_SPEED;
         let accel = speed * BASE_SPEED;
@@ -756,6 +846,7 @@ fn step_mob(world: &Game, body: &mut MobBody, half: f64, height: f64, forward: f
             body.y = (feet_y + 1) as f64;
             continue;
         }
+        body.horiz_collided = true;
         if body.on_ground && body.jump_cooldown == 0 {
             body.vy = body.vy.max(JUMP_POWER);
             body.jump_cooldown = JUMP_DELAY;
@@ -1101,7 +1192,17 @@ impl Game {
         if over > 75.0 {
             mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, over - 75.0);
         }
-        // Move control: face the wanted position, walk forward.
+        // Move control: run the navigation housekeeping, face the
+        // wanted waypoint, walk forward.
+        let (bx, by, bz, bground) = (
+            mob.body.x,
+            mob.body.y,
+            mob.body.z,
+            mob.body.on_ground,
+        );
+        mob.body.nav.nav_tick(bx, by, bz, bground, &|x, y, z| {
+            block_solid(self, x, y, z)
+        });
         let mut forward = 0.0f64;
         if let Some((tx, tz, modifier)) = mob.body.nav.wanted() {
             mob.body.yaw = rotate_towards(
@@ -1117,6 +1218,13 @@ impl Game {
         let half = mob.kind.half_width();
         let height = mob.kind.height();
         step_mob(self, &mut mob.body, half, height, forward);
+        // The wall-crawl rule: pressed into a wall, the body rises.
+        if mob.kind.can_climb() {
+            mob.body.climbing = mob.body.horiz_collided && mob.body.nav.in_progress();
+            if mob.body.climbing {
+                mob.body.vy = mob.body.vy.max(CLIMB_RISE);
+            }
+        }
         mob_sync(mob, frames);
     }
 }
@@ -1252,6 +1360,18 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                 body: encode_float_data(mob.body.id, DATA_LIVING_HEALTH, mob.body.health),
             });
             mob.sent_health = mob.body.health.to_bits();
+        }
+        // The wall-crawler's climbing bit rides its own accessor.
+        if mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing {
+            let value = if mob.body.climbing { 0x01 } else { 0x00 };
+            frames.push(OutFrame {
+                x: mob.body.x,
+                y: mob.body.y,
+                z: mob.body.z,
+                id: PACKET_SET_ENTITY_DATA,
+                body: encode_byte_data(mob.body.id, DATA_CLIMBING_FLAGS, value),
+            });
+            mob.sent_climbing = mob.body.climbing;
         }
     }
 }

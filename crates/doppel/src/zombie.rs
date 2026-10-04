@@ -1,10 +1,11 @@
 //! The zombie: an undead melee mob that targets the nearest visible
 //! player, strolls and looks around while idle, and burns in daylight.
 
-use crate::game::entities::block_solid;
 use crate::game::ConnId;
-use crate::game::Game;
-use crate::living::{Goal, GoalCtx, GoalFlags, GoalSelector, MobKind, FIRE_IGNITE_TICKS};
+use crate::living::{
+    eye_at, look_angles, visible, Goal, GoalCtx, GoalFlags, GoalSelector, MobKind,
+    FIRE_IGNITE_TICKS, PLAYER_EYE,
+};
 use crate::spawning::{monsters_burn, sky_darken};
 
 /// Follow range (the attribute at default).
@@ -19,8 +20,6 @@ const HALF_WIDTH: f64 = 0.3;
 const HEIGHT: f64 = 1.95;
 /// Eye height.
 const EYE: f64 = 1.74;
-/// Player eye height.
-const PLAYER_EYE: f64 = 1.62;
 /// Melee reach: both half widths plus the 0.83 inflation.
 const REACH: f64 = HALF_WIDTH + 0.3 + 0.83;
 /// Attack cooldown, in ticks (the 20-tick interval halved).
@@ -40,39 +39,14 @@ const LOOK_RANGE: f64 = 8.0;
 /// Stroll give-up, in ticks.
 const STROLL_GIVE_UP: i32 = 200;
 
-/// Whether the sight line between two eye points is clear.
-fn visible(world: &Game, from: (f64, f64, f64), to: (f64, f64, f64)) -> bool {
-    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
-    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-    let steps = (dist * 2.0).ceil() as i32;
-    for s in 1..steps {
-        let t = s as f64 / steps as f64;
-        let (x, y, z) = (from.0 + dx * t, from.1 + dy * t, from.2 + dz * t);
-        if block_solid(world, x.floor() as i32, y.floor() as i32, z.floor() as i32) {
-            return false;
-        }
-    }
-    true
-}
-
 /// The mob eye position.
 fn eye_of(body: &crate::living::MobBody) -> (f64, f64, f64) {
     (body.x, body.y + EYE, body.z)
 }
 
 /// The player eye position above the feet.
-fn eye_at(pos: (f64, f64, f64)) -> (f64, f64, f64) {
-    (pos.0, pos.1 + PLAYER_EYE, pos.2)
-}
-
-/// The look angles from the mob's eyes toward a point.
-fn look_angles(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f32, f32) {
-    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
-    let horiz = (dx * dx + dz * dz).sqrt();
-    (
-        (-dx).atan2(dz).to_degrees() as f32,
-        -dy.atan2(horiz).to_degrees() as f32,
-    )
+fn eye_of_player(pos: (f64, f64, f64)) -> (f64, f64, f64) {
+    eye_at(PLAYER_EYE, pos)
 }
 
 // ---------------------------------------------------------------------
@@ -159,7 +133,7 @@ impl Goal for MeleeAttackGoal {
             return;
         };
         // Look at the target's eyes.
-        ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at((px, py, pz))));
+        ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_of_player((px, py, pz))));
         // Re-path when the target moved a block or on the 5% roll.
         let moved = (px - self.last_path.0) * (px - self.last_path.0)
             + (pz - self.last_path.1) * (pz - self.last_path.1);
@@ -178,7 +152,7 @@ impl Goal for MeleeAttackGoal {
         if horiz >= REACH || dy.abs() > 2.5 {
             return;
         }
-        if !visible(ctx.world, eye_of(ctx.body), eye_at((px, py, pz))) {
+        if !visible(ctx.world, eye_of(ctx.body), eye_of_player((px, py, pz))) {
             return;
         }
         ctx.body.pending_hit = Some(conn);
@@ -236,7 +210,7 @@ impl Goal for LookAtPlayerGoal {
         let Some((conn, pos)) = ctx.nearest_player(LOOK_RANGE) else {
             return false;
         };
-        if !visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
+        if !visible(ctx.world, eye_of(ctx.body), eye_of_player(pos)) {
             return false;
         }
         self.conn = Some(conn);
@@ -266,7 +240,7 @@ impl Goal for LookAtPlayerGoal {
         self.remaining -= 1;
         if let Some(conn) = self.conn {
             if let Some(pos) = ctx.player_pos(conn) {
-                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at(pos)));
+                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_of_player(pos)));
             }
         }
     }
@@ -341,7 +315,7 @@ impl Goal for NearestPlayerTargetGoal {
         let Some((conn, pos)) = ctx.nearest_player(FOLLOW_RANGE) else {
             return false;
         };
-        if !visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
+        if !visible(ctx.world, eye_of(ctx.body), eye_of_player(pos)) {
             return false;
         }
         self.unseen = 0;
@@ -360,7 +334,7 @@ impl Goal for NearestPlayerTargetGoal {
         if dx * dx + dy * dy + dz * dz > FOLLOW_RANGE * FOLLOW_RANGE {
             return false;
         }
-        if visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
+        if visible(ctx.world, eye_of(ctx.body), eye_of_player(pos)) {
             self.unseen = 0;
         } else {
             self.unseen += 1;
@@ -403,6 +377,10 @@ impl MobKind for Zombie {
 
     fn height(&self) -> f64 {
         HEIGHT
+    }
+
+    fn eye(&self) -> f64 {
+        EYE
     }
 
     fn base_speed(&self) -> f64 {
@@ -469,7 +447,7 @@ impl MobKind for Zombie {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::entities::PACKET_SET_ENTITY_DATA;
+    use crate::game::entities::{block_solid, PACKET_SET_ENTITY_DATA};
     use crate::game::{Inbound, Outbound};
     use crate::living::PACKET_DAMAGE_EVENT;
     use doppel_world::WireChunk;
@@ -612,6 +590,75 @@ mod tests {
         }
         let end = dist(&g);
         assert!(end < start - 1.0, "chase moved closer: {start} -> {end}");
+    }
+
+    #[test]
+    fn navigation_routes_around_a_wall() {
+        let (mut g, _rx) = harness();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 1.5,
+        });
+        // A 2-tall wall at x=6 across z=0..=3; the gap opens north.
+        for z in 0..=3i32 {
+            for y in 100..=101i32 {
+                g.handle(Inbound::Setblock {
+                    conn: 0,
+                    x: 6,
+                    y,
+                    z,
+                    name: "minecraft:stone".to_string(),
+                });
+            }
+        }
+        g.spawn_mob(12.5, 100.0, 1.5, Box::new(Zombie::new()));
+        let mut nav = crate::pathing::Nav::new();
+        nav.move_to(0.5, 1.5, 1.0);
+        nav.nav_tick(12.5, 100.0, 1.5, true, &|x, y, z| block_solid(&g, x, y, z));
+        let route = nav.route();
+        assert!(
+            !route.iter().any(|wp| wp.x == 6 && wp.z <= 3),
+            "the waypoints avoid the wall: {route:?}"
+        );
+        assert_eq!(route.last().map(|wp| (wp.x, wp.z)), Some((0, 1)));
+    }
+
+    #[test]
+    fn chase_closes_through_a_gap() {
+        let (mut g, _rx) = harness();
+        // A 2-tall wall at x=6 across z=0..=5; the sight line and the
+        // route pass through the z=6 gap.
+        for z in 0..=5i32 {
+            for y in 100..=101i32 {
+                g.handle(Inbound::Setblock {
+                    conn: 0,
+                    x: 6,
+                    y,
+                    z,
+                    name: "minecraft:stone".to_string(),
+                });
+            }
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 6.5,
+        });
+        g.spawn_mob(12.5, 100.0, 6.5, Box::new(Zombie::new()));
+        let dist = |g: &crate::game::Game| {
+            let m = &g.mobs.mobs[0];
+            let (dx, dz) = (m.body.x - 0.5, m.body.z - 6.5);
+            (dx * dx + dz * dz).sqrt()
+        };
+        let start = dist(&g);
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        let end = dist(&g);
+        assert!(end < start - 8.0, "the chase crossed the gap: {start} -> {end}");
     }
 
     #[test]
