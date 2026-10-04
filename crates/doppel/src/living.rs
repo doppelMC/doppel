@@ -44,6 +44,9 @@ pub const ENTITY_TYPE_SKELETON: i32 = 118;
 /// `minecraft:creeper` (registration order 33, 0-based).
 /// TODO wire-verify at the gate.
 pub const ENTITY_TYPE_CREEPER: i32 = 32;
+/// `minecraft:spider` (registration order 128, 0-based).
+/// TODO wire-verify at the gate.
+pub const ENTITY_TYPE_SPIDER: i32 = 127;
 
 // ---------------------------------------------------------------------
 // Entity data and attributes

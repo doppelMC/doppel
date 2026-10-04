@@ -4,9 +4,12 @@
 //! positions with the +-6 jitter, and validates each position against
 //! the player distances, the ground shape, and the darkness test.
 
+use crate::creeper::Creeper;
 use crate::game::entities::block_solid;
 use crate::game::Game;
 use crate::living::MobKind;
+use crate::skeleton::Skeleton;
+use crate::spider::Spider;
 use crate::zombie::Zombie;
 
 /// Monsters per 289 spawnable chunks (the full square at radius 8).
@@ -27,8 +30,14 @@ const PACK_SIZE: i32 = 4;
 const CLUSTER_CAP: i32 = 4;
 /// Jitter width per pack member.
 const JITTER: u64 = 6;
-/// Total spawn-list weight; the zombie slice is the only entry.
-const LIST_WEIGHT: u64 = 90;
+/// Total spawn-list weight: spider 100, zombie 90, skeleton 100,
+/// creeper 100 (the implemented slice of the plains monster list).
+const LIST_WEIGHT: u64 = 390;
+/// The spider's weight band and the zombie's.
+const SPIDER_WEIGHT: u64 = 100;
+const ZOMBIE_WEIGHT: u64 = 90;
+/// The skeleton's weight band.
+const SKELETON_WEIGHT: u64 = 100;
 
 /// Spawner and world-time state owned by the game thread.
 pub(crate) struct SpawnState {
@@ -154,6 +163,7 @@ impl Game {
         let mut px = x;
         let mut pz = z;
         let mut cluster = 0;
+        let mut pick = 0u64;
         for _ in 0..GROUPS {
             // The group-size roll, spent before the members.
             let _size = self.spawning.draw(PACK_SIZE as u64);
@@ -170,21 +180,19 @@ impl Game {
                     // The weighted-entry pick and its count resample,
                     // spent at the first distance-valid position.
                     picked = true;
-                    let _pick = self.spawning.draw(LIST_WEIGHT);
+                    pick = self.spawning.draw(LIST_WEIGHT);
                     let _count = self.spawning.draw(1);
                 }
                 if self.mobs.mobs.len() as u64 >= cap {
                     return;
                 }
-                if !self.spawn_ground_ok(px, y, pz) || !self.spawn_dark_ok(px, y, pz, day) {
+                let kind = make_kind(pick);
+                if !self.spawn_ground_ok(px, y, pz, kind.half_width())
+                    || !self.spawn_dark_ok(px, y, pz, day)
+                {
                     continue;
                 }
-                self.spawn_mob(
-                    px as f64 + 0.5,
-                    y as f64,
-                    pz as f64 + 0.5,
-                    Box::new(Zombie::new()) as Box<dyn MobKind>,
-                );
+                self.spawn_mob(px as f64 + 0.5, y as f64, pz as f64 + 0.5, kind);
                 cluster += 1;
             }
         }
@@ -214,11 +222,29 @@ impl Game {
         any_near
     }
 
-    /// The ground rules: solid below, the cell and the one above clear.
-    fn spawn_ground_ok(&self, x: i32, y: i32, z: i32) -> bool {
-        block_solid(self, x, y - 1, z)
+    /// The ground rules: solid below, the cell and the one above
+    /// clear, and the body's corner columns clear for wide types.
+    fn spawn_ground_ok(&self, x: i32, y: i32, z: i32, half: f64) -> bool {
+        if !(block_solid(self, x, y - 1, z)
             && !block_solid(self, x, y, z)
-            && !block_solid(self, x, y + 1, z)
+            && !block_solid(self, x, y + 1, z))
+        {
+            return false;
+        }
+        let cx = x as f64 + 0.5;
+        let cz = z as f64 + 0.5;
+        for (dx, dz) in [
+            (-half, -half),
+            (half, -half),
+            (-half, half),
+            (half, half),
+        ] {
+            let (qx, qz) = ((cx + dx) as i32, (cz + dz) as i32);
+            if block_solid(self, qx, y, qz) || block_solid(self, qx, y + 1, qz) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The darkness test: the raw sky draw, the block-light ceiling,
@@ -234,6 +260,19 @@ impl Game {
         // Check 3: the darkened brightness against the sample.
         let brightness = (raw_sky - sky_darken(day)).max(0);
         brightness <= self.spawning.draw(8) as i32
+    }
+}
+
+/// The weighted-entry pick over the implemented bands, in list order.
+fn make_kind(pick: u64) -> Box<dyn MobKind> {
+    if pick < SPIDER_WEIGHT {
+        Box::new(Spider::new())
+    } else if pick < SPIDER_WEIGHT + ZOMBIE_WEIGHT {
+        Box::new(Zombie::new())
+    } else if pick < SPIDER_WEIGHT + ZOMBIE_WEIGHT + SKELETON_WEIGHT {
+        Box::new(Skeleton::new())
+    } else {
+        Box::new(Creeper::new())
     }
 }
 
@@ -423,6 +462,44 @@ mod tests {
     }
 
     #[test]
+    fn weighted_pick_covers_all_four_kinds() {
+        use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};
+        let ty = |pick: u64| make_kind(pick).type_id();
+        assert_eq!(ty(0), ENTITY_TYPE_SPIDER);
+        assert_eq!(ty(99), ENTITY_TYPE_SPIDER);
+        assert_eq!(ty(100), ENTITY_TYPE_ZOMBIE);
+        assert_eq!(ty(189), ENTITY_TYPE_ZOMBIE);
+        assert_eq!(ty(190), ENTITY_TYPE_SKELETON);
+        assert_eq!(ty(289), ENTITY_TYPE_SKELETON);
+        assert_eq!(ty(290), ENTITY_TYPE_CREEPER);
+        assert_eq!(ty(389), ENTITY_TYPE_CREEPER);
+    }
+
+    #[test]
+    fn midnight_spawns_all_four_kinds() {
+        use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};
+        let (mut g, rx) = world();
+        g.spawning.day_time = 18000;
+        g.spawning.time_running = true;
+        for _ in 0..2000 {
+            g.tick_once_for_test();
+        }
+        let frames = drain(&rx);
+        let types: std::collections::BTreeSet<i32> = spawn_positions(&frames)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect();
+        for want in [
+            ENTITY_TYPE_ZOMBIE,
+            ENTITY_TYPE_SKELETON,
+            ENTITY_TYPE_CREEPER,
+            ENTITY_TYPE_SPIDER,
+        ] {
+            assert!(types.contains(&want), "missing type {want} in {types:?}");
+        }
+    }
+
+    #[test]
     fn midnight_spawns_zombies_within_the_rules() {
         let (mut g, rx) = world();
         g.spawning.day_time = 18000;
@@ -433,16 +510,15 @@ mod tests {
         let frames = drain(&rx);
         let spawns = spawn_positions(&frames);
         assert!(
-            spawns.iter().any(|(_, _, _, ty)| *ty == ENTITY_TYPE_ZOMBIE),
-            "zombies appear at midnight"
+            !spawns.is_empty(),
+            "monsters appear at midnight"
         );
         assert!(!g.mobs.mobs.is_empty(), "the mob list holds the survivors");
         assert!(
             g.mobs.mobs.len() as u64 <= category_cap(25),
             "the cluster stays under the category cap"
         );
-        for (x, y, z, ty) in &spawns {
-            assert_eq!(*ty, ENTITY_TYPE_ZOMBIE, "only zombies spawn");
+        for (x, y, z, _ty) in &spawns {
             assert!(
                 (x - x.floor() - 0.5).abs() < 1.0e-9,
                 "x at the block center: {x}"

@@ -14,6 +14,7 @@ pub mod placement;
 pub mod projectile;
 pub mod skeleton;
 pub mod spawning;
+pub mod spider;
 pub mod wire;
 pub mod zombie;
 
