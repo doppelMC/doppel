@@ -8,6 +8,7 @@ pub mod game;
 pub mod inventory;
 pub mod living;
 pub mod pathing;
+pub mod persistence;
 pub mod placement;
 pub mod spawning;
 pub mod wire;
@@ -36,6 +37,10 @@ const COMPRESSION_THRESHOLD: i32 = 256;
 pub struct WorldState {
     pub dir: doppel_world::WorldDir,
     pub boot: doppel_world::anvil_to_wire::PaletteBootstrap,
+    /// The world root every persistence write targets.
+    pub root: std::path::PathBuf,
+    /// Loaded level meta; defaults when no level.dat exists.
+    pub level: doppel_world::level::LevelMeta,
 }
 
 type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
@@ -711,9 +716,20 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
     };
     let world = match std::env::var("DOPPEL_WORLD") {
         Ok(dir) => {
+            let root = std::path::PathBuf::from(&dir);
+            // A fresh world dir has no region storage yet; the save path
+            // creates it on first write, the read path needs it now.
+            let _ = std::fs::create_dir_all(doppel_world::anvil_write::region_dir(&root));
+            let level = doppel_world::level::load(&root)
+                .inspect_err(|e| eprintln!("[doppel] level.dat: {e:#}"))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let state = WorldState {
-                dir: doppel_world::WorldDir::open(std::path::Path::new(&dir))?,
+                dir: doppel_world::WorldDir::open(&root)?,
                 boot: Default::default(),
+                root,
+                level,
             };
             println!("[doppel] world storage: {dir}");
             Some(Arc::new(std::sync::Mutex::new(state)))

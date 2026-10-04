@@ -561,16 +561,10 @@ pub struct WorldDir {
 
 impl WorldDir {
     pub fn open(path: &Path) -> Result<WorldDir> {
-        // Modern versions keep overworld regions under
-        // dimensions/minecraft/overworld; older layouts use the root.
-        let candidates = [
-            path.join("dimensions/minecraft/overworld/region"),
-            path.join("region"),
-        ];
-        let root = candidates
-            .into_iter()
-            .find(|p| p.is_dir())
-            .with_context(|| format!("no region dir under {}", path.display()))?;
+        let root = crate::anvil_write::region_dir(path);
+        if !root.is_dir() {
+            return Err(anyhow::anyhow!("no region dir under {}", path.display()));
+        }
         Ok(WorldDir {
             root,
             regions: HashMap::new(),
