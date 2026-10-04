@@ -257,6 +257,7 @@ pub fn parity_login() -> Result<bool> {
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing vanilla transcript")?;
@@ -471,6 +472,7 @@ pub fn parity_walk() -> Result<bool> {
             commands: &[],
             walk_chunks: Some(4),
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("walking through vanilla")?;
@@ -506,6 +508,7 @@ pub fn parity_walk() -> Result<bool> {
             commands: &[],
             walk_chunks: Some(4),
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("walking through doppel")?;
@@ -641,6 +644,7 @@ fn capture_clean_blobs(
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing clean vanilla join")?;
@@ -768,6 +772,7 @@ pub fn parity_blocks() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing vanilla setblocks")?;
@@ -799,6 +804,7 @@ pub fn parity_blocks() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing doppel setblocks")?;
@@ -1020,6 +1026,7 @@ pub fn parity_redstone() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing vanilla redstone")?;
@@ -1052,6 +1059,7 @@ pub fn parity_redstone() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing doppel redstone")?;
@@ -1205,6 +1213,7 @@ pub fn parity_placement() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &raw,
+            stop_after_raw: None,
         },
     )
     .context("capturing vanilla placement")?;
@@ -1235,6 +1244,7 @@ pub fn parity_placement() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &raw,
+            stop_after_raw: None,
         },
     )
     .context("capturing doppel placement")?;

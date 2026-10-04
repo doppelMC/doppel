@@ -23,6 +23,9 @@ pub const SERVERBOUND_PUNCH: i32 = 0x2e;
 /// of the pinned block_entity_data (6) / block_event (7) / block_update
 /// (8) trio.
 pub const CLIENTBOUND_BLOCK_DESTRUCTION: i32 = 0x05;
+/// `block_changed_ack` (one VarInt sequence). 26.3 registration order,
+/// adjacent to the confirmed 0x05 anchor.
+pub const PACKET_BLOCK_CHANGED_ACK: i32 = 0x04;
 
 /// player_action action ordinals (the reference enum order).
 pub const ACTION_START_DESTROY: i32 = 0;
@@ -99,6 +102,32 @@ pub fn destroy_stage(progress: f32) -> i32 {
 /// the reference's float-field default, which insta-breaks.
 ///
 /// NOTE(breaking): the full per-block table is future registry work.
+/// The pickaxe family's item registry ids (oracle-captured 26.3) and
+/// their harvest tiers. Every tool-gated block in the hardness table is
+/// pickaxe-minable; obsidian additionally demands diamond or better.
+const PICKAXES: &[(i32, &str, i32)] = &[
+    (1027, "minecraft:wooden_pickaxe", 0),
+    (1037, "minecraft:stone_pickaxe", 1),
+    (1042, "minecraft:golden_pickaxe", 0),
+    (1047, "minecraft:iron_pickaxe", 2),
+    (1052, "minecraft:diamond_pickaxe", 3),
+    (1057, "minecraft:netherite_pickaxe", 4),
+];
+
+/// Whether the held item harvests a requiresCorrectToolForDrops block.
+pub fn correct_tool_for_drops(block: &str, held: Option<i32>) -> bool {
+    let Some(held) = held else {
+        return false;
+    };
+    let Some((_, _, tier)) = PICKAXES.iter().find(|(id, _, _)| *id == held) else {
+        return false;
+    };
+    if block == "minecraft:obsidian" {
+        return *tier >= 3;
+    }
+    true
+}
+
 pub fn hardness(name: &str) -> (f32, bool) {
     match name {
         "minecraft:torch"
@@ -373,9 +402,14 @@ impl Game {
     /// the set_block path's own.
     fn break_block(&mut self, conn: ConnId, pos: (i32, i32, i32)) {
         // --- survival hooks (entities.rs) ---
-        // Creative breaks keep no drops; tool-gated blocks drop nothing
-        // bare-handed (that gate lives in spawn_break_drop).
+        // Creative breaks keep no drops; tool-gated blocks drop only for
+        // the correct held tool (that gate lives in spawn_break_drop).
         let creative = self.players.get(&conn).is_some_and(|p| p.inv.creative);
+        let held = self
+            .players
+            .get(&conn)
+            .and_then(|p| p.inv.inventory.get(p.inv.inventory.selected() as usize))
+            .map(|s| s.item());
         let name = self
             .get_block(pos.0, pos.1, pos.2)
             .map(|(n, _)| n)
@@ -383,7 +417,7 @@ impl Game {
         self.set_block(pos.0, pos.1, pos.2, AIR_STATE, true);
         if !creative {
             if let Some(name) = name {
-                self.spawn_break_drop(pos, &name);
+                self.spawn_break_drop(pos, &name, held);
             }
         }
     }
@@ -428,6 +462,8 @@ impl Game {
     /// creative, insta-break - still write at packet time and flush the
     /// same tick).
     pub(crate) fn advance_digs(&mut self) {
+        // The listener tick opens with the coalesced interaction ack.
+        self.flush_block_change_acks();
         enum Step {
             ClearDelayed,
             DelayedStage((i32, i32, i32), i32),
@@ -828,6 +864,114 @@ mod tests {
         assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]");
         let frames = dig_frames(&rx1);
         assert_eq!(frames.last(), Some(&(1, (5, 99, 5), -1)), "{frames:?}");
+    }
+
+    /// A survival break on the organic path always spawns the item
+    /// entity and broadcasts it: the witness sees one add_entity for the
+    /// drop and the block reads air.
+    #[test]
+    fn survival_break_spawns_and_broadcasts_drop() {
+        let (mut g, rx1) = dig_harness();
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        // Dirt drops bare-handed (stone is tool-gated: no drop).
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 5,
+            y: 99,
+            z: 5,
+            name: "minecraft:dirt".to_string(),
+        });
+        g.tick_once_for_test();
+        act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+        act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+        g.tick_once_for_test();
+        assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]", "block broke");
+        // The break lands in the player-tick phase, after this tick's
+        // tracking sync; the pairing flush rides the next tick.
+        g.tick_once_for_test();
+        let mut adds = 0;
+        while let Ok(frame) = rx1.try_recv() {
+            let Outbound::Frame { id, body } = frame else {
+                continue;
+            };
+            if id == crate::game::entities::PACKET_ADD_ENTITY {
+                adds += 1;
+                // add_entity: id varint, uuid 16, type varint, x y z f64.
+                assert!(body.len() > 8, "add_entity body: {} bytes", body.len());
+            }
+        }
+        assert_eq!(adds, 1, "exactly one drop entity broadcast");
+    }
+
+    /// Tool-gated blocks drop only for the correct held tool: bare-handed
+    /// stone drops nothing, an iron pickaxe drops cobblestone, and an iron
+    /// pickaxe still cannot harvest obsidian.
+    #[test]
+    fn tool_gated_drops_follow_the_held_item() {
+        let pickaxe_run = |item: &str, block: &str, want_drop: bool| {
+            let (mut g, rx1) = dig_harness();
+            for _ in 0..200 {
+                g.tick_once_for_test();
+            }
+            g.handle(Inbound::Give {
+                conn: 0,
+                item: item.to_string(),
+                count: 1,
+            });
+            g.tick_once_for_test();
+            g.handle(Inbound::Setblock {
+                conn: 0,
+                x: 5,
+                y: 99,
+                z: 5,
+                name: block.to_string(),
+            });
+            g.tick_once_for_test();
+            act(&mut g, ACTION_START_DESTROY, 5, 99, 5);
+            act(&mut g, ACTION_STOP_DESTROY, 5, 99, 5);
+            g.tick_once_for_test();
+            g.tick_once_for_test();
+            let mut adds = 0;
+            while let Ok(frame) = rx1.try_recv() {
+                if let Outbound::Frame { id: fid, .. } = frame {
+                    if fid == crate::game::entities::PACKET_ADD_ENTITY {
+                        adds += 1;
+                    }
+                }
+            }
+            assert_eq!(at(&g, 5, 99, 5), "minecraft:air[]");
+            assert_eq!(
+                adds,
+                usize::from(want_drop),
+                "{item} on {block}: drop expected {want_drop}"
+            );
+        };
+        pickaxe_run("minecraft:air", "minecraft:stone", false);
+        pickaxe_run("minecraft:stick", "minecraft:stone", false);
+        pickaxe_run("minecraft:diamond_pickaxe", "minecraft:stone", true);
+        pickaxe_run("minecraft:wooden_pickaxe", "minecraft:stone", true);
+        // Obsidian's tier gate: bare-hand speed never breaks it inside a
+        // test window, so the tier rule asserts directly.
+        let id = |n: &str| crate::inventory::item_id(n);
+        assert!(!correct_tool_for_drops(
+            "minecraft:obsidian",
+            id("minecraft:iron_pickaxe")
+        ));
+        assert!(correct_tool_for_drops(
+            "minecraft:obsidian",
+            id("minecraft:diamond_pickaxe")
+        ));
+        assert!(correct_tool_for_drops(
+            "minecraft:obsidian",
+            id("minecraft:netherite_pickaxe")
+        ));
+        assert!(!correct_tool_for_drops(
+            "minecraft:obsidian",
+            id("minecraft:wooden_pickaxe")
+        ));
+        assert!(!correct_tool_for_drops("minecraft:obsidian", None));
     }
 
     #[test]

@@ -423,23 +423,11 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     return Some(game::Inbound::TimeSet { conn, value });
                 }
             }
-            // `gamemode <mode>` for the commanding player flips the
-            // creative flag the inventory and placement paths read.
+            // `gamemode <mode>` for the commanding player switches the
+            // mode the inventory, placement, and dig paths read.
             if parts.len() == 2 && parts[0] == "gamemode" {
-                match parts[1] {
-                    "creative" => {
-                        return Some(game::Inbound::GameMode {
-                            conn,
-                            creative: true,
-                        });
-                    }
-                    "survival" | "adventure" | "spectator" => {
-                        return Some(game::Inbound::GameMode {
-                            conn,
-                            creative: false,
-                        });
-                    }
-                    _ => {}
+                if let Some(mode) = game::GameMode::parse(parts[1]) {
+                    return Some(game::Inbound::GameMode { conn, mode });
                 }
             }
             // `give @s <item> [count]`: the inventory test driver. The
@@ -508,6 +496,11 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         0x39 => {
             let set = inventory::parse_set_creative_slot(body).ok()?;
             Some(game::Inbound::CreativeSlot { conn, set })
+        }
+        // player_abilities: the client toggling flight.
+        0x28 => {
+            let flying = inventory::parse_player_abilities(body).ok()?;
+            Some(game::Inbound::PlayerAbilities { conn, flying })
         }
         // container_click: clicks against an open menu (HashedStack
         // predictions decoded but not applied — see inventory.rs).

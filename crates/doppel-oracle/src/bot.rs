@@ -210,6 +210,9 @@ pub struct CaptureOpts<'a> {
     /// After the join burst, walk this many chunks in +x (one
     /// move_player_pos per 400ms) to exercise chunk streaming.
     pub walk_chunks: Option<usize>,
+    /// End the session this long after the raw interaction burst (steady
+    /// entity traffic keeps a live server from ever going idle-quiet).
+    pub stop_after_raw: Option<Duration>,
 }
 
 impl CaptureOpts<'_> {
@@ -379,6 +382,7 @@ fn login_capture_legs_chase(
     let mut next_cmd = 0usize;
     let raw_packets = opts.raw_packets;
     let mut raw_sent = false;
+    let mut raw_sent_at: Option<std::time::Instant> = None;
     let walk = opts.walk_chunks;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
@@ -618,6 +622,9 @@ fn login_capture_legs_chase(
                     for (id, body) in raw_packets {
                         conn.write_packet(*id, body)?;
                     }
+                    if let Some(budget) = opts.stop_after_raw {
+                        raw_sent_at = Some(std::time::Instant::now() + budget);
+                    }
                     note = Some("sent raw interaction packets".to_string());
                 }
             }
@@ -794,6 +801,27 @@ fn login_capture_legs_chase(
                 steps_done += 1;
                 last_walk_at = std::time::Instant::now();
                 note = Some(format!("tp-walk step {steps_done}: x={x:.1}"));
+            }
+        }
+        // A raw-burst budget ends the session once the interactions have
+        // had their settle window: steady entity traffic would otherwise
+        // outlive every idle threshold.
+        if let Some(end_at) = raw_sent_at {
+            if std::time::Instant::now() >= end_at {
+                packets.push(CapturedPacket {
+                    id: -1,
+                    t_ms: started.elapsed().as_millis(),
+                    body_len: 0,
+                    head_hex: String::new(),
+                    file: None,
+                    note: Some("transcript ended: raw interaction budget spent".into()),
+                });
+                break;
+            }
+            let left = end_at.saturating_duration_since(std::time::Instant::now());
+            if left < idle_timeout {
+                conn.get_ref()
+                    .set_read_timeout(Some(left.max(Duration::from_millis(50))))?;
             }
         }
         // Keep plenty of headroom: decoder-error messages arrive inside

@@ -77,6 +77,7 @@ pub fn run() -> Result<bool> {
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
     )
     .context("capturing vanilla join burst")?;

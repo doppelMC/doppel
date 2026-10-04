@@ -338,6 +338,7 @@ fn run_session(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
+            stop_after_raw: None,
         },
         bot::ChaseFirst {
             entity_type: ZOMBIE_TYPE,

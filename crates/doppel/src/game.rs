@@ -102,15 +102,20 @@ pub enum Inbound {
         conn: ConnId,
         click: crate::inventory::ContainerClick,
     },
-    /// `gamemode <mode>`: flips the commanding player's creative flag.
+    /// `gamemode <mode>`: switches the commanding player's mode.
     GameMode {
         conn: ConnId,
-        creative: bool,
+        mode: GameMode,
     },
     /// set_creative_mode_slot: a creative client pushing its picked stack.
     CreativeSlot {
         conn: ConnId,
         set: crate::inventory::CreativeSlotSet,
+    },
+    /// player_abilities: the client's flight toggle.
+    PlayerAbilities {
+        conn: ConnId,
+        flying: bool,
     },
     /// `give @s <item> [count]` — the harness driver for inventory tests.
     Give {
@@ -235,6 +240,9 @@ pub(crate) struct Player {
     /// join counter dig progress runs on (vanilla's per-player
     /// game-mode ticks, not world time).
     pub(crate) dig: crate::dig::PlayerDigState,
+    /// The highest interaction sequence awaiting its block_changed_ack
+    /// (one coalesced ack per listener tick, like the reference).
+    pub(crate) ack_block_changes: Option<i32>,
 }
 
 /// One cached, versioned chunk. `wire` is the sendable form; block
@@ -378,6 +386,106 @@ const NEIGHBORS: [(i32, i32, i32); 6] = [
     (0, 0, 1),
     (0, 0, -1),
 ];
+
+/// The packed BlockPos form shared with the block-update packet.
+fn pack_block_pos(pos: (i32, i32, i32)) -> i64 {
+    (((pos.0 as i64) & 0x3ff_ffff) << 38)
+        | (((pos.2 as i64) & 0x3ff_ffff) << 12)
+        | ((pos.1 as i64) & 0xfff)
+}
+
+/// Block registry ids for the block_event packet (oracle-captured 26.3).
+pub const BLOCK_PISTON: i32 = 149;
+pub const BLOCK_STICKY_PISTON: i32 = 138;
+
+impl Game {
+    /// Records the highest sequence awaiting its block_changed_ack.
+    pub(crate) fn ack_block_changes(&mut self, conn: ConnId, sequence: i32) {
+        if let Some(p) = self.players.get_mut(&conn) {
+            p.ack_block_changes = Some(p.ack_block_changes.map_or(sequence, |s| s.max(sequence)));
+        }
+    }
+
+    /// One coalesced block_changed_ack per listener tick, sent from the
+    /// player tick phase like the reference.
+    pub(crate) fn flush_block_change_acks(&mut self) {
+        let conns: Vec<(ConnId, i32)> = self
+            .players
+            .iter_mut()
+            .filter_map(|(&c, p)| p.ack_block_changes.take().map(|s| (c, s)))
+            .collect();
+        for (conn, sequence) in conns {
+            let mut body = Vec::with_capacity(5);
+            doppel_protocol::write_varint(&mut body, sequence);
+            self.send(conn, crate::dig::PACKET_BLOCK_CHANGED_ACK, &body);
+        }
+    }
+
+    /// One authoritative block_update (0x08) for a single position, the
+    /// actor-facing correction the reference sends after a refused
+    /// interaction.
+    pub(crate) fn send_block_update(&mut self, conn: ConnId, x: i32, y: i32, z: i32) {
+        let Some(state) = self.get_state_id(x, y, z) else {
+            return;
+        };
+        let mut body = Vec::with_capacity(13);
+        body.extend_from_slice(&pack_block_pos((x, y, z)).to_be_bytes());
+        doppel_protocol::write_varint(&mut body, state as i32);
+        self.send(conn, 0x08, &body);
+    }
+}
+
+/// The four game modes, registry-id order (the `game_event` param).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl GameMode {
+    pub fn id(self) -> i32 {
+        match self {
+            GameMode::Survival => 0,
+            GameMode::Creative => 1,
+            GameMode::Adventure => 2,
+            GameMode::Spectator => 3,
+        }
+    }
+
+    /// The creative flag the inventory, placement, and dig paths gate on.
+    pub fn is_creative(self) -> bool {
+        self == GameMode::Creative
+    }
+
+    pub fn parse(name: &str) -> Option<GameMode> {
+        Some(match name {
+            "survival" => GameMode::Survival,
+            "creative" => GameMode::Creative,
+            "adventure" => GameMode::Adventure,
+            "spectator" => GameMode::Spectator,
+            _ => return None,
+        })
+    }
+
+    /// The `player_abilities` flag set the mode grants; `flying` adds the
+    /// FLYING bit for the modes that allow it (survival and adventure
+    /// force it off).
+    pub fn ability_flags(self, flying: bool) -> u8 {
+        use crate::inventory::ability;
+        let granted = match self {
+            GameMode::Creative => ability::INVULNERABLE | ability::MAYFLY | ability::INSTABUILD,
+            GameMode::Spectator => ability::INVULNERABLE | ability::MAYFLY | ability::FLYING,
+            GameMode::Survival | GameMode::Adventure => return 0,
+        };
+        if flying {
+            granted | ability::FLYING
+        } else {
+            granted
+        }
+    }
+}
 
 #[path = "comparator.rs"]
 mod comparator;
@@ -773,6 +881,7 @@ impl Game {
                         menu: Default::default(),
                         entity_id,
                         dig: Default::default(),
+                        ack_block_changes: None,
                     },
                 );
                 // --- tracker hooks (tracker.rs) ---
@@ -831,6 +940,12 @@ impl Game {
             Inbound::CreativeSlot { conn, set } => {
                 self.creative_slot(conn, set);
             }
+            Inbound::PlayerAbilities { conn, flying } => {
+                // The reference: flying = packet.flying && mayfly.
+                if let Some(p) = self.players.get_mut(&conn) {
+                    p.inv.flying = flying && p.inv.mayfly;
+                }
+            }
             // --- survival hooks (entities.rs) ---
             // --- mob hooks (living.rs / spawning.rs) ---
             Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
@@ -850,10 +965,23 @@ impl Game {
                 z,
                 face,
                 hand,
+                sequence,
                 ..
-            } => self.place_from_hand(conn, x, y, z, face, hand),
+            } => {
+                self.ack_block_changes(conn, sequence);
+                self.place_from_hand(conn, x, y, z, face, hand);
+            }
             // --- breaking hooks (dig.rs) ---
-            Inbound::PlayerAction { conn, act } => self.player_action(conn, act),
+            Inbound::PlayerAction { conn, act } => {
+                // Only the dig family carries a sequence the reference
+                // acks (drops, swaps, and the release do not).
+                if (crate::dig::ACTION_START_DESTROY..=crate::dig::ACTION_STOP_DESTROY)
+                    .contains(&act.action)
+                {
+                    self.ack_block_changes(conn, act.sequence);
+                }
+                self.player_action(conn, act);
+            }
             // The swing has no server-visible effect yet: the reference
             // only resets an idle clock that this build never reads.
             Inbound::Punch { conn: _ } => {}
@@ -931,12 +1059,42 @@ impl Game {
                 self.setblock(conn, x, y, z, name);
                 self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
             }
-            Inbound::GameMode { conn, creative } => {
-                if let Some(p) = self.players.get_mut(&conn) {
-                    p.inv.creative = creative;
-                }
-                let mode = if creative { "Creative" } else { "Survival" };
-                self.send_command_feedback(conn, &format!("Set own game mode to {mode} Mode"));
+            Inbound::GameMode { conn, mode } => {
+                // The reference's wire order, three packets: the mode
+                // change itself syncs abilities (changeGameModeForPlayer
+                // calls onUpdateAbilities), then setGameMode sends
+                // game_event followed by the abilities again.
+                let flags = {
+                    let Some(p) = self.players.get_mut(&conn) else {
+                        return;
+                    };
+                    p.inv.creative = mode.is_creative();
+                    p.inv.mayfly = matches!(mode, GameMode::Creative | GameMode::Spectator);
+                    if !p.inv.mayfly {
+                        p.inv.flying = false;
+                    } else if mode == GameMode::Spectator {
+                        p.inv.flying = true;
+                    }
+                    mode.ability_flags(p.inv.flying)
+                };
+                let abilities = crate::inventory::encode_player_abilities(flags, 0.05, 0.1);
+                self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
+                self.send(
+                    conn,
+                    crate::inventory::PACKET_GAME_EVENT,
+                    &crate::inventory::encode_game_event(
+                        crate::inventory::GAME_EVENT_CHANGE_GAME_MODE,
+                        mode.id() as f32,
+                    ),
+                );
+                self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
+                let name = match mode {
+                    GameMode::Survival => "Survival",
+                    GameMode::Creative => "Creative",
+                    GameMode::Adventure => "Adventure",
+                    GameMode::Spectator => "Spectator",
+                };
+                self.send_command_feedback(conn, &format!("Set own game mode to {name} Mode"));
             }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
@@ -1679,6 +1837,8 @@ impl Game {
 
     /// `ServerLevel.runBlockEvents`: drains FIFO; events queued while
     /// draining (cascades) run in the same tick, bounded defensively.
+    /// A fired event broadcasts its block_event packet right after the
+    /// trigger, like the reference's runBlockEvents.
     fn run_block_events(&mut self) {
         let mut guard = 0usize;
         while !self.block_events.is_empty() {
@@ -1688,23 +1848,60 @@ impl Game {
                 if guard > 10_000 {
                     return;
                 }
-                self.fire_block_event(e);
+                if self.fire_block_event(e) {
+                    self.broadcast_block_event(e);
+                }
             }
         }
     }
 
+    /// The block_event packet (0x07) for one fired piston event: the
+    /// packed pos, the trigger id, the direction, and the piston's block
+    /// registry id. Players within 64 blocks, the reference's broadcast
+    /// radius.
+    fn broadcast_block_event(&mut self, e: BlockEvent) {
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&pack_block_pos(e.pos).to_be_bytes());
+        body.push(e.event);
+        body.push(e.dir);
+        doppel_protocol::write_varint(
+            &mut body,
+            if e.sticky {
+                BLOCK_STICKY_PISTON
+            } else {
+                BLOCK_PISTON
+            },
+        );
+        let (px, py, pz) = (e.pos.0 as f64, e.pos.1 as f64 + 0.5, e.pos.2 as f64 + 0.5);
+        let conns: Vec<ConnId> = self
+            .players
+            .iter()
+            .filter(|(_, p)| {
+                let dx = p.x - px;
+                let dy = p.y - py;
+                let dz = p.z - pz;
+                dx * dx + dy * dy + dz * dz < 64.0 * 64.0
+            })
+            .map(|(&c, _)| c)
+            .collect();
+        for c in conns {
+            self.send(c, containers::PACKET_BLOCK_EVENT, &body);
+        }
+    }
+
     /// The block-event handler incl. the server-side staleness
-    /// re-validation.
-    fn fire_block_event(&mut self, e: BlockEvent) {
+    /// re-validation. The bool is the reference's triggerEvent result:
+    /// true means the event ran and its packet broadcast follows.
+    fn fire_block_event(&mut self, e: BlockEvent) -> bool {
         let Some((name, props)) = self.get_block(e.pos.0, e.pos.1, e.pos.2) else {
-            return;
+            return false;
         };
         let sticky = name == "minecraft:sticky_piston";
         if name != "minecraft:piston" && !sticky {
-            return; // block replaced while queued
+            return false; // block replaced while queued
         }
         if e.sticky != sticky {
-            return; // piston kind changed
+            return false; // piston kind changed
         }
         let dir = dir_id(prop_dir(&props));
         let extend = self.piston_powered(e.pos.0, e.pos.1, e.pos.2, dir);
@@ -1717,19 +1914,18 @@ impl Game {
             if let Some(state) = self.resolve_state(&spec) {
                 self.set_block(e.pos.0, e.pos.1, e.pos.2, state, false);
             }
-            return;
+            return false;
         }
         if !extend && e.event == 0 {
-            return; // extend event, no longer powered
+            return false; // extend event, no longer powered
         }
         match e.event {
-            0 => {
-                self.piston_extend(e.pos, dir, sticky);
-            }
+            0 => self.piston_extend(e.pos, dir, sticky),
             1 | 2 => {
                 self.piston_retract(e.pos, dir, sticky, e.event == 1);
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -1901,7 +2097,7 @@ impl Game {
 
     /// Schedules a neighbor update on the six neighbours of a position
     /// (`level.updateNeighborsAt`).
-    fn schedule_neighbor_update(&mut self, x: i32, y: i32, z: i32) {
+    pub(crate) fn schedule_neighbor_update(&mut self, x: i32, y: i32, z: i32) {
         for (dx, dy, dz) in NEIGHBORS {
             self.scheduled.push((
                 self.tick,
@@ -2486,6 +2682,7 @@ impl Game {
                 menu: Default::default(),
                 entity_id,
                 dig: Default::default(),
+                ack_block_changes: None,
             },
         );
         for c in chunks {
@@ -2555,7 +2752,7 @@ fn local_xzy(x: i32, y: i32, z: i32) -> u64 {
 }
 
 /// Reads the facing= direction from a props string (default north).
-fn prop_dir(props: &str) -> &str {
+pub(crate) fn prop_dir(props: &str) -> &str {
     for pair in props.split(',') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == "facing" {
@@ -2567,7 +2764,7 @@ fn prop_dir(props: &str) -> &str {
 }
 
 /// Reads one property value from a props string.
-fn prop_value<'a>(props: &'a str, name: &str) -> &'a str {
+pub(crate) fn prop_value<'a>(props: &'a str, name: &str) -> &'a str {
     for pair in props.split(',') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == name {
@@ -2588,7 +2785,7 @@ pub const DIR_WEST: u8 = 4;
 pub const DIR_EAST: u8 = 5;
 
 /// The unit step of a direction id.
-fn dir_step(id: u8) -> (i32, i32, i32) {
+pub(crate) fn dir_step(id: u8) -> (i32, i32, i32) {
     match id {
         DIR_DOWN => (0, -1, 0),
         DIR_UP => (0, 1, 0),
@@ -2599,7 +2796,7 @@ fn dir_step(id: u8) -> (i32, i32, i32) {
     }
 }
 
-fn dir_opposite(id: u8) -> u8 {
+pub(crate) fn dir_opposite(id: u8) -> u8 {
     match id {
         DIR_DOWN => DIR_UP,
         DIR_UP => DIR_DOWN,
@@ -2621,7 +2818,7 @@ fn dir_name(id: u8) -> &'static str {
     }
 }
 
-fn dir_id(name: &str) -> u8 {
+pub(crate) fn dir_id(name: &str) -> u8 {
     match name {
         "down" => DIR_DOWN,
         "up" => DIR_UP,
@@ -2633,7 +2830,7 @@ fn dir_id(name: &str) -> u8 {
 }
 
 /// `pos + step * n`.
-fn offset(pos: (i32, i32, i32), step: (i32, i32, i32), n: i32) -> (i32, i32, i32) {
+pub(crate) fn offset(pos: (i32, i32, i32), step: (i32, i32, i32), n: i32) -> (i32, i32, i32) {
     (pos.0 + step.0 * n, pos.1 + step.1 * n, pos.2 + step.2 * n)
 }
 

@@ -567,6 +567,7 @@ fn run_sessions(
                 commands: &witness_commands,
                 raw_packets: &[],
                 walk_chunks: None,
+                stop_after_raw: None,
             },
         )
     });
@@ -586,6 +587,7 @@ fn run_sessions(
                 commands: &commands,
                 raw_packets: &raw,
                 walk_chunks: None,
+                stop_after_raw: None,
             },
         )
     });
@@ -609,6 +611,7 @@ fn run_sessions(
                 commands: &walker_commands,
                 raw_packets: &[],
                 walk_chunks: None,
+                stop_after_raw: None,
             },
         )
     });
