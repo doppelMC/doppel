@@ -37,7 +37,7 @@ struct SpawnNbt {
     #[serde(default = "overworld")]
     dimension: String,
     #[serde(default)]
-    pos: Vec<i32>,
+    pos: [i32; 3],
     #[serde(default)]
     yaw: f32,
     #[serde(default)]
@@ -91,7 +91,7 @@ fn to_nbt(meta: &LevelMeta) -> RootNbt {
             data_version: meta.data_version,
             spawn: SpawnNbt {
                 dimension: "minecraft:overworld".into(),
-                pos: vec![meta.spawn.0, meta.spawn.1, meta.spawn.2],
+                pos: [meta.spawn.0, meta.spawn.1, meta.spawn.2],
                 yaw: 0.0,
                 pitch: 0.0,
             },
@@ -105,14 +105,14 @@ fn to_nbt(meta: &LevelMeta) -> RootNbt {
 
 fn from_nbt(root: RootNbt) -> LevelMeta {
     let data = root.data;
-    let spawn = |i: usize| data.spawn.pos.get(i).copied().unwrap_or(0);
+    let spawn = data.spawn.pos;
     let day_time = data
         .world_clocks
         .get("minecraft:overworld")
         .map(|c| c.total_ticks)
         .unwrap_or(0);
     LevelMeta {
-        spawn: (spawn(0), spawn(1), spawn(2)),
+        spawn: (spawn[0], spawn[1], spawn[2]),
         day_time,
         game_time: data.time,
         game_rules: data.game_rules,
@@ -179,6 +179,19 @@ mod tests {
         assert_eq!(load(&empty).unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn level_parses_a_vanilla_file() {
+        // The reference writes spawn/pos as a typed int array, not a list;
+        // this fixture is a real reference-generated level.dat.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/level-vanilla.dat");
+        let root = dir("vanilla");
+        std::fs::copy(&path, root.join("level.dat")).unwrap();
+        let meta = load(&root).unwrap().expect("vanilla level.dat parses");
+        assert_eq!(meta.spawn, (0, -60, 0));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
