@@ -526,6 +526,78 @@ fn play_event_accepts_bot_use_item_on() {
     }
 }
 
+/// Encodes a 0x07 chat_command body for `play_event` probes.
+fn chat_command_body(cmd: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    doppel_protocol::write_string(&mut b, cmd);
+    b
+}
+
+#[test]
+fn play_event_parses_time_set() {
+    let value = |cmd: &str| match crate::play_event(0, 0x07, &chat_command_body(cmd)) {
+        Some(Inbound::TimeSet { value, .. }) => Some(value),
+        _ => None,
+    };
+    assert_eq!(value("time set 6000"), Some(6000));
+    assert_eq!(value("time set -1"), Some(-1));
+    assert_eq!(value("time set 0"), Some(0));
+    // Word times resolve through the mob-clock parser: day=1000 etc.
+    assert_eq!(value("time set day"), Some(1000));
+    assert_eq!(value("time set abc"), None);
+    assert_eq!(value("time set"), None);
+    assert_eq!(value("time add 100"), None);
+    assert_eq!(value("time query daytime"), None);
+}
+
+#[test]
+fn time_set_broadcasts_set_time_and_replies() {
+    let (mut g, rx) = harness();
+    g.handle(Inbound::TimeSet {
+        conn: 0,
+        value: 6000,
+    });
+    // The frames ride the next tick's connection flush, like every
+    // scripted command reply.
+    g.tick_once_for_test();
+    let mut saw_set_time = false;
+    let mut saw_reply = false;
+    while let Ok(frame) = rx.try_recv() {
+        let Outbound::Frame { id, body } = frame else {
+            continue;
+        };
+        if id == 0x73 {
+            assert_eq!(body.len(), 17, "gameTime + day time + trailing byte");
+            assert_eq!(body[..8], 0i64.to_be_bytes(), "gameTime stays static");
+            assert_eq!(body[8..16], 6000i64.to_be_bytes(), "day time lands");
+            saw_set_time = true;
+        }
+        if id == 0x7c {
+            saw_reply = true;
+        }
+    }
+    assert!(saw_set_time, "time set pushes a set_time frame");
+    assert!(saw_reply, "time set answers with command feedback");
+    // Nineteen more ticks land on the tick-20 periodic broadcast.
+    for _ in 0..19 {
+        g.tick_once_for_test();
+    }
+    let mut periodic = false;
+    while let Ok(frame) = rx.try_recv() {
+        let Outbound::Frame { id, body } = frame else {
+            continue;
+        };
+        if id == 0x73 {
+            assert_eq!(body[8..16], 6000i64.to_be_bytes());
+            periodic = true;
+        }
+    }
+    assert!(
+        periodic,
+        "the periodic set_time carries the stored day time"
+    );
+}
+
 #[test]
 fn lever_state_ids() {
     let (_tx, _rx) = std::sync::mpsc::channel::<Inbound>();

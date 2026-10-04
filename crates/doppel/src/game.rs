@@ -126,6 +126,13 @@ pub enum Inbound {
     },
     /// A spawner gamerule other than `spawn_mobs` (nothing to do yet;
     /// the other categories have no entities).
+    /// `time set <ticks>`: stores the day time and pushes set_time.
+    TimeSet {
+        conn: ConnId,
+        value: i64,
+    },
+    /// A spawner gamerule (`spawn_mobs` and kin): a no-op here, this
+    /// build has no mob spawning.
     GameRuleNoop {
         conn: ConnId,
     },
@@ -134,11 +141,6 @@ pub enum Inbound {
     SpawnMobs {
         conn: ConnId,
         enabled: bool,
-    },
-    /// `time set <ticks>`: move the day clock and start it.
-    TimeSet {
-        conn: ConnId,
-        ticks: u64,
     },
     /// `difficulty <word>`: peaceful removes monsters.
     SetDifficulty {
@@ -273,6 +275,8 @@ pub struct Game {
     flat: Option<doppel_world::worldgen::FlatGenerator>,
     /// Monotonic game tick.
     tick: u64,
+    /// Day time in ticks, set by `time set` and carried by set_time.
+    day_time: i64,
     /// Scheduled actions: fire at tick T with a behavior tag.
     scheduled: Vec<(u64, (i32, i32, i32), TickAction)>,
     /// Unified pending-transition guard: (pos, kind). Replaces the
@@ -423,6 +427,7 @@ impl Game {
                     .flatten()
             }),
             tick: 0,
+            day_time: 0,
             scheduled: Vec::new(),
             pending: std::collections::BTreeSet::new(),
             torch_queue: Vec::new(),
@@ -612,10 +617,11 @@ impl Game {
     /// A world that never ran `time set` stays at the static 0/0 pair.
     fn broadcast_time(&mut self) {
         if self.tick.is_multiple_of(20) {
-            let (game, day) = if self.spawning.time_running {
-                (self.spawning.total_ticks, self.spawning.day_time)
+            let day = self.day_time;
+            let game = if self.spawning.time_running {
+                self.spawning.total_ticks
             } else {
-                (0, 0)
+                0
             };
             let mut body = Vec::with_capacity(18);
             body.extend_from_slice(&game.to_be_bytes());
@@ -625,6 +631,18 @@ impl Game {
             for c in conns {
                 self.send(c, 0x73, &body);
             }
+        }
+    }
+
+    /// Sends set_time (0x73) with the stored day time.
+    fn send_set_time(&mut self) {
+        let mut body = Vec::with_capacity(18);
+        body.extend_from_slice(&0i64.to_be_bytes());
+        body.extend_from_slice(&self.day_time.to_be_bytes());
+        body.push(0);
+        let conns: Vec<ConnId> = self.players.keys().copied().collect();
+        for c in conns {
+            self.send(c, 0x73, &body);
         }
     }
 
@@ -842,11 +860,16 @@ impl Game {
                 self.set_tick_speed(tick_speed);
                 self.send_command_feedback(conn);
             }
+            Inbound::TimeSet { conn, value } => {
+                self.day_time = value;
+                self.send_set_time();
+                self.send_command_feedback(conn);
+            }
             Inbound::GameRuleNoop { conn } => {
                 self.send_command_feedback(conn);
             }
             // --- mob hooks (living.rs / spawning.rs) ---
-            Inbound::SpawnMobs { .. } | Inbound::TimeSet { .. } | Inbound::SetDifficulty { .. } => {
+            Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
                 self.apply_mob_command(event);
             }
             // --- placement hooks (placement.rs) ---
@@ -923,11 +946,7 @@ impl Game {
                 self.spawning.spawn_mobs = enabled;
                 self.send_command_feedback(conn);
             }
-            Inbound::TimeSet { conn, ticks } => {
-                self.spawning.day_time = ticks % 24000;
-                self.spawning.time_running = true;
-                self.send_command_feedback(conn);
-            }
+
             Inbound::SetDifficulty { conn, peaceful } => {
                 self.spawning.peaceful = peaceful;
                 self.send_command_feedback(conn);

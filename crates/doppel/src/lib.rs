@@ -415,6 +415,14 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     _ => {}
                 }
             }
+            // `time set <ticks>`: the game thread stores the day time
+            // and answers with a set_time broadcast plus the pacing
+            // reply.
+            if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
+                if let Ok(value) = parts[2].parse::<i64>() {
+                    return Some(game::Inbound::TimeSet { conn, value });
+                }
+            }
             // `gamemode <mode>` for the commanding player flips the
             // creative flag the inventory and placement paths read.
             if parts.len() == 2 && parts[0] == "gamemode" {
@@ -575,14 +583,14 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
     // `time set <word|ticks>`: the day clock the darkness and burn
     // checks read.
     if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
-        let ticks = match parts[2] {
+        let value = match parts[2] {
             "day" => 1000,
             "noon" => 6000,
             "night" => 13000,
             "midnight" => 18000,
-            word => word.parse::<u64>().ok()? % 24000,
+            word => word.parse::<i64>().ok()? % 24000,
         };
-        return Some(game::Inbound::TimeSet { conn, ticks });
+        return Some(game::Inbound::TimeSet { conn, value });
     }
     // `difficulty <word>`: peaceful removes monsters.
     if parts.len() == 2 && parts[0] == "difficulty" {
