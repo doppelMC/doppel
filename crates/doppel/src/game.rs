@@ -876,7 +876,6 @@ impl Game {
                 self.client_closed_container(conn, container_id)
             }
             Inbound::Left { conn } => self.handle_left(conn),
-            _ => {}
         }
     }
 
