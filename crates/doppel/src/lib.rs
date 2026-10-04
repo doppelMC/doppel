@@ -41,6 +41,9 @@ pub struct WorldState {
     pub root: std::path::PathBuf,
     /// Loaded level meta; defaults when no level.dat exists.
     pub level: doppel_world::level::LevelMeta,
+    /// True when level.dat exists but does not parse; saves leave the
+    /// file alone instead of overwriting it with defaults.
+    pub level_readonly: bool,
 }
 
 type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
@@ -60,6 +63,79 @@ fn build_chunk(world: Option<&SharedWorld>, reference: &WireChunk) -> Result<Wir
         }
         None => Ok(reference.clone()),
     }
+}
+
+/// Saved inventory slots in container-slot order; out-of-range slots are
+/// dropped.
+fn saved_container_slots(
+    saved: &[doppel_world::playerdata::SavedSlot],
+) -> Vec<Option<inventory::ItemStack>> {
+    let mut slots = vec![None; inventory::TOTAL_SLOTS];
+    for slot in saved {
+        if slot.slot >= 0 && (slot.slot as usize) < inventory::TOTAL_SLOTS {
+            slots[slot.slot as usize] = persistence::saved_to_stack(slot);
+        }
+    }
+    slots
+}
+
+/// Rebuilds a player_position (0x49) body with a saved pose, preserving
+/// the teleport id, deltas, and flags. None when the body does not parse
+/// as the absolute form.
+fn rewrite_position(body: &[u8], pos: [f64; 3], yaw: f32, pitch: f32) -> Option<Vec<u8>> {
+    let mut r = Reader::new(body);
+    let teleport_id = r.read_varint().ok()?;
+    // The original position precedes the deltas.
+    for _ in 0..3 {
+        r.read_f64().ok()?;
+    }
+    let mut deltas = [0.0f64; 3];
+    for d in &mut deltas {
+        *d = r.read_f64().ok()?;
+    }
+    r.read_f32().ok()?;
+    r.read_f32().ok()?;
+    let flags = r.read_varint().ok()?;
+    if flags != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    write_varint(&mut out, teleport_id);
+    for v in pos {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    for d in deltas {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+    out.extend_from_slice(&yaw.to_be_bytes());
+    out.extend_from_slice(&pitch.to_be_bytes());
+    write_varint(&mut out, flags);
+    Some(out)
+}
+
+/// Rebuilds a container_set_content body for the player inventory menu
+/// with the saved slots, preserving the container and state ids. None
+/// when the body does not decode.
+fn rewrite_set_content(
+    body: &[u8],
+    container_slots: &[Option<inventory::ItemStack>],
+) -> Option<Vec<u8>> {
+    let (container_id, state_id, ..) = inventory::decode_container_set_content(body).ok()?;
+    if container_id != 0 {
+        return None;
+    }
+    let mut menu = Vec::with_capacity(inventory::INVENTORY_MENU_SIZE);
+    for slot in 0..inventory::INVENTORY_MENU_SIZE {
+        let stack = inventory::menu_to_container(slot)
+            .and_then(|c| container_slots.get(c).cloned().flatten());
+        menu.push(stack);
+    }
+    Some(inventory::encode_container_set_content(
+        container_id,
+        state_id,
+        &menu,
+        None,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,12 +290,39 @@ fn handle_login(
     // The burst's player_position (0x49) carries the spawn coordinates
     // the reference stands every joining player at; tracking them keeps
     // position-dependent rules (reach, overlay radius) honest before the
-    // first move or tp.
+    // first move or tp. Saved player state rewrites the burst's own
+    // position and inventory packets, so the client joins directly on
+    // the restored state instead of learning it afterwards.
+    let saved = world.as_ref().and_then(|w| {
+        let w = w.lock().unwrap_or_else(|e| e.into_inner());
+        doppel_world::playerdata::load(&w.root, &blobs::offline_uuid(&name))
+            .ok()
+            .flatten()
+    });
+    let saved_container: Vec<Option<inventory::ItemStack>> = saved
+        .as_ref()
+        .map(|data| saved_container_slots(&data.inventory))
+        .unwrap_or_default();
     let mut join_pos = (0.0f64, 0.0f64, 0.0f64);
     if let Some(b) = blobs {
         for (id, body) in &b.play {
+            let body = if *id == 0x2e {
+                let chunk =
+                    doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
+                build_chunk(world, &chunk)?.encode()
+            } else if *id == 0x49 {
+                match &saved {
+                    Some(data) => rewrite_position(body, data.pos, data.yaw, data.pitch)
+                        .unwrap_or_else(|| body.clone()),
+                    None => body.clone(),
+                }
+            } else if *id == inventory::PACKET_CONTAINER_SET_CONTENT && saved.is_some() {
+                rewrite_set_content(body, &saved_container).unwrap_or_else(|| body.clone())
+            } else {
+                body.clone()
+            };
             if *id == 0x49 {
-                let mut r = Reader::new(body);
+                let mut r = Reader::new(&body);
                 if r.read_varint().is_ok() {
                     if let (Ok(x), Ok(y), Ok(z)) = (r.read_f64(), r.read_f64(), r.read_f64()) {
                         let relative = r.read_f64().is_err()
@@ -234,13 +337,6 @@ fn handle_login(
                     }
                 }
             }
-            let body = if *id == 0x2e {
-                let chunk =
-                    doppel_world::WireChunk::decode(body).context("decoding replayed chunk")?;
-                build_chunk(world, &chunk)?.encode()
-            } else {
-                body.clone()
-            };
             conn.write_packet(*id, &body)?;
         }
     }
@@ -720,16 +816,19 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
             // A fresh world dir has no region storage yet; the save path
             // creates it on first write, the read path needs it now.
             let _ = std::fs::create_dir_all(doppel_world::anvil_write::region_dir(&root));
-            let level = doppel_world::level::load(&root)
-                .inspect_err(|e| eprintln!("[doppel] level.dat: {e:#}"))
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let (level, level_readonly) = match doppel_world::level::load(&root) {
+                Ok(meta) => (meta.unwrap_or_default(), false),
+                Err(e) => {
+                    eprintln!("[doppel] level.dat unreadable, leaving it untouched: {e:#}");
+                    (doppel_world::level::LevelMeta::default(), true)
+                }
+            };
             let state = WorldState {
                 dir: doppel_world::WorldDir::open(&root)?,
                 boot: Default::default(),
                 root,
                 level,
+                level_readonly,
             };
             println!("[doppel] world storage: {dir}");
             Some(Arc::new(std::sync::Mutex::new(state)))
@@ -739,4 +838,90 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     println!("[doppel] listening on {addr} (vanilla target: {})", pin.id);
     serve_on(listener, pin, blobs, world)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doppel_protocol::write_varint as out_varint;
+
+    fn position_body(teleport_id: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+        let mut body = Vec::new();
+        out_varint(&mut body, teleport_id);
+        for v in [x, y, z, 0.0, 0.0, 0.0] {
+            body.extend_from_slice(&v.to_be_bytes());
+        }
+        body.extend_from_slice(&yaw.to_be_bytes());
+        body.extend_from_slice(&pitch.to_be_bytes());
+        out_varint(&mut body, 0);
+        body
+    }
+
+    #[test]
+    fn rewrite_position_swaps_pose_and_keeps_shape() {
+        let body = position_body(3, 1.0, 2.0, 3.0, 10.0, 20.0);
+        let rewritten = rewrite_position(&body, [7.5, -60.0, 9.25], -90.0, 12.5).expect("rewrites");
+        let mut r = Reader::new(&rewritten);
+        assert_eq!(r.read_varint().unwrap(), 3, "teleport id kept");
+        assert_eq!(
+            (
+                r.read_f64().unwrap(),
+                r.read_f64().unwrap(),
+                r.read_f64().unwrap()
+            ),
+            (7.5, -60.0, 9.25)
+        );
+        assert_eq!(
+            (
+                r.read_f64().unwrap(),
+                r.read_f64().unwrap(),
+                r.read_f64().unwrap()
+            ),
+            (0.0, 0.0, 0.0),
+            "deltas kept"
+        );
+        assert_eq!(
+            (r.read_f32().unwrap(), r.read_f32().unwrap()),
+            (-90.0, 12.5)
+        );
+        assert_eq!(r.read_varint().unwrap(), 0, "flags kept");
+        // A truncated body stays untouched.
+        assert!(rewrite_position(&body[..8], [0.0; 3], 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn rewrite_set_content_carries_saved_slots() {
+        let empty = vec![None; inventory::INVENTORY_MENU_SIZE];
+        let body = inventory::encode_container_set_content(0, 1, &empty, None);
+        let mut slots = vec![None; inventory::TOTAL_SLOTS];
+        slots[0] = Some(inventory::ItemStack::new(1, 5));
+        let rewritten = rewrite_set_content(&body, &slots).expect("rewrites");
+        let (container_id, state_id, menu, carried) =
+            inventory::decode_container_set_content(&rewritten).unwrap();
+        assert_eq!((container_id, state_id), (0, 1));
+        assert!(carried.is_none());
+        // Hotbar container 0 presents as menu slot 36.
+        assert_eq!(menu[36].as_ref().map(inventory::ItemStack::count), Some(5));
+        assert!(menu.iter().enumerate().all(|(i, s)| i == 36 || s.is_none()));
+        // A foreign container id stays untouched.
+        let other = inventory::encode_container_set_content(2, 1, &empty, None);
+        assert!(rewrite_set_content(&other, &slots).is_none());
+    }
+
+    #[test]
+    fn saved_container_slots_drops_out_of_range() {
+        let stack = |slot: i8| doppel_world::playerdata::SavedSlot {
+            slot,
+            id: "minecraft:stone".into(),
+            count: 1,
+            extra: Some(vec![0x01, 0x01, 0x00, 0x00]),
+        };
+        let slots = saved_container_slots(&[stack(0), stack(-106), stack(100)]);
+        assert_eq!(slots.len(), inventory::TOTAL_SLOTS);
+        assert!(slots[0].is_some(), "in-range slot restores");
+        assert!(
+            slots[1..].iter().all(Option::is_none),
+            "foreign slot layouts drop instead of indexing wild"
+        );
+    }
 }

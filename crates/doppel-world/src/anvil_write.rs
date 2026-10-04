@@ -469,7 +469,8 @@ mod tests {
     }
 
     fn write_region(tag: &str, image: &[u8]) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("doppel-anvilwrite-{tag}"));
+        let root =
+            std::env::temp_dir().join(format!("doppel-anvilwrite-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let region = root.join("region");
         std::fs::create_dir_all(&region).unwrap();

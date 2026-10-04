@@ -989,30 +989,18 @@ impl Game {
             },
         );
         if let Some(data) = saved {
-            let mut sync = None;
             if let Some(p) = self.players.get_mut(&conn) {
                 p.inv.creative = data.game_mode == 1;
                 for slot in data.inventory {
-                    if let Some(stack) = crate::persistence::saved_to_stack(&slot) {
-                        p.inv.inventory.set(slot.slot as usize, Some(stack));
+                    // The connection thread already rewrote the join
+                    // burst's position and inventory packets; this keeps
+                    // the engine's own state on the same values.
+                    if slot.slot >= 0 && (slot.slot as usize) < crate::inventory::TOTAL_SLOTS {
+                        if let Some(stack) = crate::persistence::saved_to_stack(&slot) {
+                            p.inv.inventory.set(slot.slot as usize, Some(stack));
+                        }
                     }
                 }
-                // The client stands where the join burst placed it; a
-                // restored position needs its own sync to take hold
-                // before the first move packet overwrites it.
-                let teleport_id = p.teleport_id;
-                p.teleport_id += 1;
-                sync = Some(position_sync_body(
-                    teleport_id,
-                    p.x,
-                    p.y,
-                    p.z,
-                    p.yaw,
-                    p.pitch,
-                ));
-            }
-            if let Some(body) = sync {
-                self.send(conn, PACKET_PLAYER_POSITION, &body);
             }
         }
         // --- tracker hooks (tracker.rs) ---
