@@ -274,7 +274,7 @@ pub struct Game {
     /// not have, built from the same registry pins.
     flat: Option<doppel_world::worldgen::FlatGenerator>,
     /// Monotonic game tick.
-    tick: u64,
+    pub(crate) tick: u64,
     /// Day time in ticks, set by `time set` and carried by set_time.
     day_time: i64,
     /// Scheduled actions: fire at tick T with a behavior tag.
@@ -310,6 +310,9 @@ pub struct Game {
     pub(crate) mobs: crate::living::MobState,
     /// World time and the natural-spawn state.
     pub(crate) spawning: crate::spawning::SpawnState,
+    // --- projectile hooks (projectile.rs) ---
+    /// Live arrows.
+    pub(crate) projectiles: crate::projectile::ProjectileState,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -394,6 +397,7 @@ pub(crate) mod entities;
 #[path = "tracker.rs"]
 pub(crate) mod tracker;
 
+
 pub(crate) const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -441,6 +445,7 @@ impl Game {
             tracking: Default::default(),
             mobs: Default::default(),
             spawning: Default::default(),
+            projectiles: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {

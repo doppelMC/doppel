@@ -841,6 +841,7 @@ impl Game {
         self.entity_pickup();
         self.entity_item_pass();
         self.entity_despawn();
+        self.tick_projectiles();
         self.tick_mobs();
     }
 
