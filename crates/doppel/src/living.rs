@@ -41,6 +41,9 @@ pub const ENTITY_TYPE_ZOMBIE: i32 = 154;
 /// `minecraft:skeleton` (registration order 119, 0-based).
 /// TODO wire-verify at the gate.
 pub const ENTITY_TYPE_SKELETON: i32 = 118;
+/// `minecraft:creeper` (registration order 33, 0-based).
+/// TODO wire-verify at the gate.
+pub const ENTITY_TYPE_CREEPER: i32 = 32;
 
 // ---------------------------------------------------------------------
 // Entity data and attributes
@@ -48,6 +51,8 @@ pub const ENTITY_TYPE_SKELETON: i32 = 118;
 
 /// Entity-data serializer ids (registration order): BYTE.
 pub const SER_BYTE: i32 = 0;
+/// Entity-data serializer ids (registration order): INT.
+pub const SER_INT: i32 = 1;
 /// Entity-data serializer ids (registration order): FLOAT.
 pub const SER_FLOAT: i32 = 3;
 /// The base entity flags accessor; bit 0x01 = on fire.
@@ -58,6 +63,9 @@ pub const DATA_LIVING_HEALTH: u8 = 9;
 pub const DATA_MOB_FLAGS: u8 = 15;
 /// The wall-crawler's flag byte accessor (bit 0x01 = climbing).
 pub const DATA_CLIMBING_FLAGS: u8 = 16;
+/// The creeper's swell-direction accessor (INT: -1 shrinking, 1
+/// swelling).
+pub const DATA_SWELL_DIR: u8 = 16;
 
 /// `movement_speed` in the attribute registry (alphabetical
 /// registration); wire-verified: the reference's zombie snapshot carries
@@ -150,6 +158,17 @@ pub fn encode_float_data(entity_id: i32, accessor: u8, value: f32) -> Vec<u8> {
 
 /// Entity-data serializer ids (registration order): BOOLEAN.
 pub const SER_BOOLEAN: i32 = 10;
+
+/// `set_entity_data` for an int entry (the swell direction).
+pub fn encode_int_data(entity_id: i32, accessor: u8, value: i32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(10);
+    write_varint(&mut body, entity_id);
+    body.push(accessor);
+    write_varint(&mut body, SER_INT);
+    body.extend_from_slice(&value.to_be_bytes());
+    body.push(0xff);
+    body
+}
 
 /// `set_entity_data` for a boolean entry.
 pub fn encode_boolean_data(entity_id: i32, accessor: u8, value: bool) -> Vec<u8> {
@@ -999,10 +1018,18 @@ pub struct MobBody {
     pub pending_hit: Option<ConnId>,
     /// A bow shot awaiting the spawn: the target and the draw power.
     pub pending_shot: Option<(ConnId, f64)>,
+    /// A detonation awaiting the blast: the radius.
+    pub pending_blast: Option<f64>,
     /// Whether the last move clipped horizontally.
     pub horiz_collided: bool,
     /// The climbing state (the wall-crawler's metadata bit).
     pub climbing: bool,
+    /// The swell direction: -1 shrinking, 1 swelling (the creeper).
+    pub swell_dir: i32,
+    /// The fuse counter (the creeper).
+    pub fuse: i32,
+    /// An instant removal without the death animation.
+    pub discard: bool,
 }
 
 impl MobBody {
@@ -1037,8 +1064,12 @@ impl MobBody {
             melee_active: false,
             pending_hit: None,
             pending_shot: None,
+            pending_blast: None,
             horiz_collided: false,
             climbing: false,
+            swell_dir: -1,
+            fuse: 0,
+            discard: false,
         }
     }
 }
@@ -1069,6 +1100,8 @@ pub struct Mob {
     sent_flags: (u8, u8),
     /// The last sent climbing state.
     sent_climbing: bool,
+    /// The last sent swell direction.
+    sent_swell: i32,
 }
 
 impl Mob {
@@ -1110,6 +1143,7 @@ impl Mob {
             sync_phase: 0,
             sent_flags: (0, 0),
             sent_climbing: false,
+            sent_swell: -1,
         }
     }
 
@@ -1414,6 +1448,17 @@ impl Game {
         let mut removed: Vec<usize> = Vec::new();
         let mut mobs = std::mem::take(&mut self.mobs.mobs);
         for (i, mob) in mobs.iter_mut().enumerate() {
+            if mob.body.discard {
+                frames.push(OutFrame {
+                    x: mob.body.x,
+                    y: mob.body.y,
+                    z: mob.body.z,
+                    id: PACKET_REMOVE_ENTITIES,
+                    body: encode_remove_entities(&[mob.body.id]),
+                });
+                removed.push(i);
+                continue;
+            }
             if mob.body.death_time > 0 {
                 if mob.body.death_time == 1 {
                     frames.push(OutFrame {
@@ -1576,23 +1621,23 @@ impl Game {
         mob.rand = rand;
         mob.goals = goals;
         mob.targets = targets;
-        // A bow shot the goal queued: aim with the distance lead,
-        // jitter, and spawn the arrow from the eye.
+        // A detonation the fuse reached: the blast clears the mob.
+        if let Some(radius) = mob.body.pending_blast.take() {
+            let (x, y, z, id) = (mob.body.x, mob.body.y, mob.body.z, mob.body.id);
+            self.explode_at(x, y, z, radius, id);
+            mob.body.discard = true;
+        }
+        // A bow shot the goal queued: the skeleton module aims and
+        // spawns the arrow.
         if let Some((conn, power)) = mob.body.pending_shot.take() {
             let (x, y, z, eye, zid) = (mob.body.x, mob.body.y, mob.body.z, mob.body.eye, mob.body.id);
-            if let Some(p) = self.players.get(&conn) {
-                let (ax, ay, az) = (x, y + eye - 0.1, z);
-                let dist = ((p.x - x) * (p.x - x) + (p.z - z) * (p.z - z)).sqrt();
-                let dx = p.x - ax;
-                let dy = p.y + 1.0 / 3.0 - ay + dist * 0.2;
-                let dz = p.z - az;
+            let target = self.players.get(&conn).map(|p| (p.x, p.y, p.z));
+            if let Some(target) = target {
                 let mut seed = mob.rand;
-                let vel =
-                    crate::projectile::shot_velocity(&mut seed, dx, dy, dz, 1.6, 10.0);
-                let base =
-                    crate::projectile::mob_base_damage(&mut seed, power, 1.0);
+                crate::skeleton::fire_shot(
+                    self, x, y, z, eye, zid, target, power, &mut seed,
+                );
                 mob.rand = seed;
-                self.spawn_arrow(ax, ay, az, vel, zid, base);
             }
         }
         // A melee hit the goal queued: damage_event to the target plus
@@ -1800,6 +1845,17 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                 body: encode_float_data(mob.body.id, DATA_LIVING_HEALTH, mob.body.health),
             });
             mob.sent_health = mob.body.health.to_bits();
+        }
+        // The creeper's swell direction rides its own accessor.
+        if mob.body.swell_dir != mob.sent_swell {
+            frames.push(OutFrame {
+                x: mob.body.x,
+                y: mob.body.y,
+                z: mob.body.z,
+                id: PACKET_SET_ENTITY_DATA,
+                body: encode_int_data(mob.body.id, DATA_SWELL_DIR, mob.body.swell_dir),
+            });
+            mob.sent_swell = mob.body.swell_dir;
         }
         // The wall-crawler's climbing bit rides its own accessor.
         if mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing {

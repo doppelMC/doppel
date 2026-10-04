@@ -86,8 +86,6 @@ fn facing_yaw(dx: f64, dz: f64) -> f32 {
     (-dx).atan2(dz).to_degrees() as f32
 }
 
-use doppel_protocol::write_varint;
-
 /// One uniform draw in [0, 1) from a splitmix stream.
 fn unit(seed: &mut u64) -> f64 {
     *seed = seed.wrapping_add(0x9e3779b97f4a7c15);
@@ -369,7 +367,6 @@ pub(crate) fn in_ground_data(entity_id: i32) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::game::{Game, Inbound, Outbound};
-    use crate::living::ENTITY_TYPE_ZOMBIE;
     use crate::zombie::Zombie;
     use doppel_world::WireChunk;
     use std::sync::mpsc;

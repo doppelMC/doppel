@@ -3,7 +3,9 @@
 //! captured from the vanilla oracle.
 
 pub mod blobs;
+pub mod creeper;
 pub mod dig;
+pub mod explosion;
 pub mod game;
 pub mod inventory;
 pub mod living;

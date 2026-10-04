@@ -2,13 +2,14 @@
 //! holds distance while strafing, draws and fires on a fixed cadence,
 //! and burns in daylight.
 
-use crate::game::ConnId;
+use crate::game::{ConnId, Game};
 use crate::inventory::{item_id, ItemStack};
 use crate::living::{
     brightness, eye_at, eye_of, look_angles, visible, Goal, GoalCtx, GoalFlags, GoalSelector,
     LookAtPlayerGoal, MobKind, NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal,
     EQUIP_MAIN_HAND, FIRE_IGNITE_TICKS, PLAYER_EYE,
 };
+use crate::projectile::{mob_base_damage, shot_velocity};
 use crate::spawning::monsters_burn;
 
 /// Follow range (the attribute default).
@@ -228,6 +229,33 @@ impl Goal for RangedBowAttackGoal {
     fn requires_every_tick(&self) -> bool {
         true
     }
+}
+
+// ---------------------------------------------------------------------
+// The shot
+// ---------------------------------------------------------------------
+
+/// The aim-and-fire step: origin at the eye minus 0.1, the one-third
+/// aim height plus the distance lead, jittered and scaled.
+pub(crate) fn fire_shot(
+    g: &mut Game,
+    x: f64,
+    y: f64,
+    z: f64,
+    eye: f64,
+    shooter: i32,
+    target: (f64, f64, f64),
+    power: f64,
+    seed: &mut u64,
+) {
+    let (ax, ay, az) = (x, y + eye - SPAWN_DROP, z);
+    let dist = ((target.0 - ax) * (target.0 - ax) + (target.2 - az) * (target.2 - az)).sqrt();
+    let dx = target.0 - ax;
+    let dy = target.1 + AIM_HEIGHT - ay + dist * AIM_LEAD;
+    let dz = target.2 - az;
+    let vel = shot_velocity(seed, dx, dy, dz, LAUNCH_SPEED, UNCERTAINTY);
+    let base = mob_base_damage(seed, power, DIFFICULTY_ID);
+    g.spawn_arrow(ax, ay, az, vel, shooter, base);
 }
 
 // ---------------------------------------------------------------------
