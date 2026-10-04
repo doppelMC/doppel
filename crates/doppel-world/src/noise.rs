@@ -562,6 +562,22 @@ impl Simplex {
         }
     }
 
+    /// Builds from the 48-bit legacy stream; a zero offset scale still
+    /// draws the three offsets.
+    pub fn from_lcg48(rng: &mut Lcg48, offset_scale: f64) -> Simplex {
+        let mut base = GradientBase {
+            ox: rng.next_f64() * offset_scale,
+            oy: rng.next_f64() * offset_scale,
+            oz: rng.next_f64() * offset_scale,
+            perms: std::array::from_fn(|i| i as u8),
+        };
+        for i in 0..256usize {
+            let offset = rng.next_int((256 - i) as i32) as usize;
+            base.perms.swap(i, i + offset);
+        }
+        Simplex { base }
+    }
+
     fn corner(&self, index: i32, x: f64, y: f64, z: f64, base: f64) -> f64 {
         let t = base - x * x - y * y - z * z;
         if t < 0.0 {
@@ -663,6 +679,16 @@ impl Simplex {
         let n3 = self.corner(gi3, x3, y3, z3, 0.6);
         (32.0 * (n0 + n1 + n2 + n3)) as f32
     }
+}
+
+/// The standalone flower-count noise: a fixed-seed simplex on the legacy
+/// stream whose offset draw reads zero.
+pub fn flower_count_noise() -> &'static Simplex {
+    static NOISE: std::sync::OnceLock<Simplex> = std::sync::OnceLock::new();
+    NOISE.get_or_init(|| {
+        let mut rng = Lcg48::new(2345);
+        Simplex::from_lcg48(&mut rng, 0.0)
+    })
 }
 
 /// Layer parameters for the octave stack: octaves double in frequency and

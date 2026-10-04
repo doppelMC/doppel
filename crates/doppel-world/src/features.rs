@@ -105,6 +105,21 @@ impl Face {
         }
     }
 
+    /// The next face clockwise as seen from above.
+    fn clockwise(&self) -> Face {
+        match self.prop {
+            "north" => EAST,
+            "east" => SOUTH,
+            "south" => WEST,
+            _ => NORTH,
+        }
+    }
+
+    /// Whether the face steps toward positive coordinates on its axis.
+    fn positive(&self) -> bool {
+        self.dx > 0 || self.dz > 0
+    }
+
     /// The pillar axis name a log lying along this face takes.
     fn axis(&self) -> &'static str {
         match self.dx {
@@ -352,8 +367,7 @@ pub(crate) const UNPLACED_FEATURE_KINDS: [&str; 33] = [
 /// Trunk placers, foliage placers, and tree decorators the tree parser
 /// does not model: a tree config carrying one accepts as unplaced (the
 /// runtime rejects it there), and plan validation accepts exactly these.
-pub(crate) const UNPLACED_TREE_SHAPES: [&str; 22] = [
-    "minecraft:cherry_trunk_placer",
+pub(crate) const UNPLACED_TREE_SHAPES: [&str; 20] = [
     "minecraft:forking_trunk_placer",
     "minecraft:giant_trunk_placer",
     "minecraft:mega_jungle_trunk_placer",
@@ -361,7 +375,6 @@ pub(crate) const UNPLACED_TREE_SHAPES: [&str; 22] = [
     "minecraft:upwards_branching_trunk_placer",
     "minecraft:acacia_foliage_placer",
     "minecraft:bush_foliage_placer",
-    "minecraft:cherry_foliage_placer",
     "minecraft:jungle_foliage_placer",
     "minecraft:mega_pine_foliage_placer",
     "minecraft:pine_foliage_placer",
@@ -623,7 +636,7 @@ pub(crate) fn test_predicate(d: &mut Decorator, p: &Predicate, x: i32, y: i32, z
 }
 
 /// Blocks that survive on the vegetation substrate.
-const VEGETATION: [&str; 26] = [
+const VEGETATION: [&str; 28] = [
     "minecraft:short_grass",
     "minecraft:fern",
     "minecraft:tall_grass",
@@ -650,6 +663,8 @@ const VEGETATION: [&str; 26] = [
     "minecraft:oak_sapling",
     "minecraft:birch_sapling",
     "minecraft:dark_oak_sapling",
+    "minecraft:cherry_sapling",
+    "minecraft:pink_petals",
 ];
 
 /// Blocks that survive on the dry substrate.
@@ -815,6 +830,7 @@ enum FoliageKind {
     Fancy,
     DarkOak,
     RandomSpread,
+    Cherry,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -823,6 +839,7 @@ enum TrunkKind {
     DarkOak,
     Fancy,
     Bending,
+    Cherry,
 }
 
 #[derive(Clone)]
@@ -831,10 +848,15 @@ struct FoliageCfg {
     radius: IntDraw,
     offset: IntDraw,
     height: i32,
-    /// The scattered canopy's height provider; the other kinds read the
-    /// plain height field.
+    /// The scattered and cherry canopies draw their height; the other
+    /// kinds read the plain height field.
     spread_height: IntDraw,
     attempts: i32,
+    /// The cherry canopy's hole and hanging draws.
+    corner_hole: f32,
+    wide_bottom_hole: f32,
+    hanging: f32,
+    hanging_extend: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -915,6 +937,13 @@ pub(crate) struct TreeCfg {
     rand_b: i32,
     bend_length: IntDraw,
     min_height_for_leaves: i32,
+    /// The cherry trunk's branch draws; the second start offset narrows
+    /// the first draw's span by one from the top.
+    branch_count: IntDraw,
+    branch_length: IntDraw,
+    branch_start: IntDraw,
+    branch_start_second: IntDraw,
+    branch_end: IntDraw,
     foliage: FoliageCfg,
     size: SizeCfg,
     decorators: Vec<TreeDecoratorCfg>,
@@ -938,6 +967,7 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         "minecraft:dark_oak_trunk_placer" => TrunkKind::DarkOak,
         "minecraft:fancy_trunk_placer" => TrunkKind::Fancy,
         "minecraft:bending_trunk_placer" => TrunkKind::Bending,
+        "minecraft:cherry_trunk_placer" => TrunkKind::Cherry,
         _ => return None,
     };
     let (bend_length, min_height_for_leaves) = match trunk_kind {
@@ -947,12 +977,36 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         ),
         _ => (IntDraw::Constant(1), 0),
     };
+    let (branch_count, branch_length, branch_start, branch_start_second, branch_end) =
+        match trunk_kind {
+            TrunkKind::Cherry => {
+                let start = draw_field(trunk_placer, "branch_start_offset_from_top")?;
+                let IntDraw::Uniform { min, max } = start else {
+                    return None;
+                };
+                (
+                    draw_field(trunk_placer, "branch_count")?,
+                    draw_field(trunk_placer, "branch_horizontal_length")?,
+                    start,
+                    IntDraw::Uniform { min, max: max - 1 },
+                    draw_field(trunk_placer, "branch_end_offset_from_top")?,
+                )
+            }
+            _ => (
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+                IntDraw::Constant(0),
+            ),
+        };
     let foliage_json = v.get("foliage_placer")?;
     let kind = match foliage_json.get("type").and_then(Value::as_str)? {
         "minecraft:blob_foliage_placer" => FoliageKind::Blob,
         "minecraft:fancy_foliage_placer" => FoliageKind::Fancy,
         "minecraft:dark_oak_foliage_placer" => FoliageKind::DarkOak,
         "minecraft:random_spread_foliage_placer" => FoliageKind::RandomSpread,
+        "minecraft:cherry_foliage_placer" => FoliageKind::Cherry,
         _ => return None,
     };
     let (spread_height, attempts) = match kind {
@@ -960,8 +1014,11 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
             draw_field(foliage_json, "foliage_height")?,
             int_field(foliage_json, "leaf_placement_attempts", 0),
         ),
+        FoliageKind::Cherry => (draw_field(foliage_json, "height")?, 0),
         _ => (IntDraw::Constant(0), 0),
     };
+    let float_field =
+        |key: &str| -> f32 { foliage_json.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32 };
     let foliage = FoliageCfg {
         kind,
         radius: draw_field(foliage_json, "radius")?,
@@ -969,6 +1026,10 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         height: int_field(foliage_json, "height", 0),
         spread_height,
         attempts,
+        corner_hole: float_field("corner_hole_chance"),
+        wide_bottom_hole: float_field("wide_bottom_layer_hole_chance"),
+        hanging: float_field("hanging_leaves_chance"),
+        hanging_extend: float_field("hanging_leaves_extension_chance"),
     };
     let size_json = v.get("minimum_size")?;
     let min_clipped = size_json
@@ -1043,6 +1104,11 @@ pub(crate) fn parse_tree(d: &mut Decorator, v: &Value) -> Option<TreeCfg> {
         rand_b: int_field(trunk_placer, "height_rand_b", 0),
         bend_length,
         min_height_for_leaves,
+        branch_count,
+        branch_length,
+        branch_start,
+        branch_start_second,
+        branch_end,
         foliage,
         size: SizeCfg { kind, min_clipped },
         decorators,
@@ -1104,6 +1170,40 @@ fn place_log(
     true
 }
 
+/// Places one log with an optional forced pillar axis: branch logs lie
+/// along their branch while the climbing steps stay vertical.
+#[allow(clippy::too_many_arguments)]
+fn place_log_axis(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    axis: Option<&str>,
+    logs: &mut Vec<(i32, i32, i32)>,
+) {
+    if !valid_tree_pos(d, x, y, z) {
+        return;
+    }
+    if let Some(state) = cfg.trunk.sample(d, rng, x, y, z) {
+        let state = match axis {
+            Some(axis) => {
+                let (name, props) = d.registry().state_of(state).unwrap_or(("", ""));
+                if props.contains("axis") {
+                    d.state_id_of(name, &BlockRegistry::with_prop(props, "axis", axis))
+                        .unwrap_or(state)
+                } else {
+                    state
+                }
+            }
+            None => state,
+        };
+        d.set_block(x, y, z, state);
+        logs.push((x, y, z));
+    }
+}
+
 /// Places the soil block under a trunk cell when the provider yields one.
 fn place_below_trunk(
     d: &mut Decorator,
@@ -1128,7 +1228,7 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
     let foliage_height = match cfg.foliage.kind {
         FoliageKind::Blob | FoliageKind::Fancy => cfg.foliage.height,
         FoliageKind::DarkOak => 4,
-        FoliageKind::RandomSpread => cfg.foliage.spread_height.sample(rng),
+        FoliageKind::RandomSpread | FoliageKind::Cherry => cfg.foliage.spread_height.sample(rng),
     };
     let leaf_radius = cfg.foliage.radius.sample(rng);
     #[cfg(test)]
@@ -1147,6 +1247,7 @@ fn run_tree(d: &mut Decorator, v: &Value, rng: &mut DecorRng, x: i32, y: i32, z:
         TrunkKind::DarkOak => dark_oak_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
         TrunkKind::Fancy => fancy_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
         TrunkKind::Bending => bending_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
+        TrunkKind::Cherry => cherry_trunk(d, &cfg, rng, x, y, z, clipped, &mut logs),
     };
     #[cfg(test)]
     let stage_trunk = rng.words;
@@ -1439,6 +1540,141 @@ fn bending_trunk(
     attachments
 }
 
+/// The cherry trunk: a full column or a stump when only side branches
+/// remain, then one or two branches that step sideways and bend toward
+/// their tips; the middle anchor sits above the column only when the
+/// branch-count draw takes the tallest shape.
+#[allow(clippy::too_many_arguments)]
+fn cherry_trunk(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    tree_height: i32,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Vec<Attachment> {
+    place_below_trunk(d, cfg, rng, x, y - 1, z, logs);
+    let first = 0.max(tree_height - 1 + cfg.branch_start.sample(rng));
+    let second = 0.max(tree_height - 1 + cfg.branch_start_second.sample(rng));
+    let second = if second >= first { second + 1 } else { second };
+    let branch_count = cfg.branch_count.sample(rng);
+    let has_middle = branch_count == 3;
+    let has_both = branch_count >= 2;
+    let trunk_height = if has_middle {
+        tree_height
+    } else if has_both {
+        first.max(second) + 1
+    } else {
+        first + 1
+    };
+    for dy in 0..trunk_height {
+        place_log(d, cfg, rng, x, y + dy, z, logs);
+    }
+    let mut attachments = Vec::new();
+    if has_middle {
+        attachments.push(Attachment {
+            x,
+            y: y + trunk_height,
+            z,
+            double: false,
+        });
+    }
+    let direction = HORIZONTAL[rng.next_int(4) as usize];
+    let axis = direction.axis();
+    attachments.push(cherry_branch(
+        d,
+        cfg,
+        rng,
+        tree_height,
+        x,
+        y,
+        z,
+        direction,
+        first,
+        first < trunk_height - 1,
+        axis,
+        logs,
+    ));
+    if has_both {
+        attachments.push(cherry_branch(
+            d,
+            cfg,
+            rng,
+            tree_height,
+            x,
+            y,
+            z,
+            direction.opposite(),
+            second,
+            second < trunk_height - 1,
+            axis,
+            logs,
+        ));
+    }
+    attachments
+}
+
+/// One cherry branch: two or one sideways logs out of the trunk, then a
+/// walk that mixes sideways and vertical steps until it reaches the
+/// branch end; both branches of a tree share the trunk direction's axis.
+#[allow(clippy::too_many_arguments)]
+fn cherry_branch(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    tree_height: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    direction: Face,
+    offset_from_origin: i32,
+    middle_continues_up: bool,
+    axis: &'static str,
+    logs: &mut Vec<(i32, i32, i32)>,
+) -> Attachment {
+    let (mut px, mut py, mut pz) = (x, y + offset_from_origin, z);
+    let end_offset = tree_height - 1 + cfg.branch_end.sample(rng);
+    let extend = middle_continues_up || end_offset < offset_from_origin;
+    let distance = cfg.branch_length.sample(rng) + i32::from(extend);
+    let (ex, ey, ez) = (
+        x + direction.dx * distance,
+        y + end_offset,
+        z + direction.dz * distance,
+    );
+    let sideways = if extend { 2 } else { 1 };
+    for _ in 0..sideways {
+        px += direction.dx;
+        pz += direction.dz;
+        place_log_axis(d, cfg, rng, px, py, pz, Some(axis), logs);
+    }
+    // The vertical step points toward the branch end; equal heights pin
+    // it down, where the zero chance keeps the walk sideways.
+    let vertical_up = ey > py;
+    loop {
+        let left = (px - ex).abs() + (py - ey).abs() + (pz - ez).abs();
+        if left == 0 {
+            break;
+        }
+        let chance = ((ey - py).abs() as f32) / (left as f32);
+        if rng.next_f32() < chance {
+            py += if vertical_up { 1 } else { -1 };
+            place_log_axis(d, cfg, rng, px, py, pz, None, logs);
+        } else {
+            px += direction.dx;
+            pz += direction.dz;
+            place_log_axis(d, cfg, rng, px, py, pz, Some(axis), logs);
+        }
+    }
+    Attachment {
+        x: ex,
+        y: ey + 1,
+        z: ez,
+        double: false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn straight_trunk(
     d: &mut Decorator,
@@ -1693,16 +1929,18 @@ fn fancy_trunk(
 }
 
 /// Whether a row cell drops out: corner dither for blobs, a circular
-/// mask for fancy canopies, corner cuts for the dark oak.
+/// mask for fancy canopies, corner cuts for the dark oak, and the
+/// cherry's staged hole draws.
 fn should_skip(
     rng: &mut DecorRng,
-    kind: FoliageKind,
+    foliage: &FoliageCfg,
     dx: i32,
     dz: i32,
     y: i32,
     radius: i32,
     double: bool,
 ) -> bool {
+    let kind = foliage.kind;
     if kind == FoliageKind::DarkOak && y == 0 && double {
         let open_x = dx != -radius && dx < radius;
         let open_z = dz != -radius && dz < radius;
@@ -1724,6 +1962,23 @@ fn should_skip(
         }
         // The scattered canopy places per attempt, never in rows.
         FoliageKind::RandomSpread => false,
+        FoliageKind::Cherry => {
+            // The wide bottom row thins its outer arms before the corner
+            // draw, and the corner draw itself only runs once the layer
+            // shape asks for it.
+            if y == -1
+                && (mdx == radius || mdz == radius)
+                && rng.next_f32() < foliage.wide_bottom_hole
+            {
+                return true;
+            }
+            let corner = mdx == radius && mdz == radius;
+            if radius > 2 {
+                corner || (mdx + mdz > radius * 2 - 2 && rng.next_f32() < foliage.corner_hole)
+            } else {
+                corner && rng.next_f32() < foliage.corner_hole
+            }
+        }
         FoliageKind::DarkOak => {
             if y == -1 && !double {
                 return mdx == radius && mdz == radius;
@@ -1748,13 +2003,12 @@ fn place_leaves_row(
     radius: i32,
     y: i32,
     double: bool,
-    kind: FoliageKind,
     leaves: &mut Vec<(i32, i32, i32)>,
 ) {
     let ext = i32::from(double);
     for dx in -radius..=radius + ext {
         for dz in -radius..=radius + ext {
-            if should_skip(rng, kind, dx, dz, y, radius, double) {
+            if should_skip(rng, &cfg.foliage, dx, dz, y, radius, double) {
                 continue;
             }
             let (lx, ly, lz) = (ax + dx, ay + y, az + dz);
@@ -1770,9 +2024,95 @@ fn place_leaves_row(
     }
 }
 
-/// Places one scattered leaf: a persistent leaf already at the cell
-/// refuses the write, the cell must accept tree placement, and the
-/// provider draws only then.
+/// Places one row of leaves, then walks the row's underside edges: a
+/// cell with a leaf above may hang one, and a hung cell may extend one
+/// further down. Each edge runs clockwise from its side.
+#[allow(clippy::too_many_arguments)]
+fn place_leaves_row_hanging(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    ax: i32,
+    ay: i32,
+    az: i32,
+    radius: i32,
+    y: i32,
+    double: bool,
+    leaves: &mut Vec<(i32, i32, i32)>,
+) {
+    place_leaves_row(d, cfg, rng, ax, ay, az, radius, y, double, leaves);
+    let ext = i32::from(double);
+    let log_pos = (ax, ay - 1, az);
+    for along_edge in HORIZONTAL {
+        let to_edge = along_edge.clockwise();
+        let offset_to_edge = if to_edge.positive() {
+            radius + ext
+        } else {
+            radius
+        };
+        let py = ay + y - 1;
+        let mut px = ax + to_edge.dx * offset_to_edge + along_edge.dx * -radius;
+        let mut pz = az + to_edge.dz * offset_to_edge + along_edge.dz * -radius;
+        for _ in -radius..radius + ext {
+            let above = leaves.contains(&(px, py + 1, pz));
+            if above
+                && try_place_extension(
+                    d,
+                    cfg,
+                    rng,
+                    px,
+                    py,
+                    pz,
+                    cfg.foliage.hanging,
+                    log_pos,
+                    leaves,
+                )
+            {
+                try_place_extension(
+                    d,
+                    cfg,
+                    rng,
+                    px,
+                    py - 1,
+                    pz,
+                    cfg.foliage.hanging_extend,
+                    log_pos,
+                    leaves,
+                );
+            }
+            px += along_edge.dx;
+            pz += along_edge.dz;
+        }
+    }
+}
+
+/// Hangs one leaf cell under the canopy edge: the distance gate comes
+/// before the chance draw, and only a placed cell counts as extended.
+#[allow(clippy::too_many_arguments)]
+fn try_place_extension(
+    d: &mut Decorator,
+    cfg: &TreeCfg,
+    rng: &mut DecorRng,
+    x: i32,
+    y: i32,
+    z: i32,
+    chance: f32,
+    log_pos: (i32, i32, i32),
+    leaves: &mut Vec<(i32, i32, i32)>,
+) -> bool {
+    if (x - log_pos.0).abs() + (y - log_pos.1).abs() + (z - log_pos.2).abs() >= 7 {
+        return false;
+    }
+    if rng.next_f32() > chance {
+        return false;
+    }
+    try_place_leaf(d, cfg, rng, x, y, z, leaves)
+}
+
+/// Places one scattered or hanging leaf: a persistent leaf already at
+/// the cell refuses the write, the cell must accept tree placement, and
+/// the provider draws only then. The result reports whether the cell
+/// took the leaf.
 fn try_place_leaf(
     d: &mut Decorator,
     cfg: &TreeCfg,
@@ -1781,19 +2121,21 @@ fn try_place_leaf(
     y: i32,
     z: i32,
     leaves: &mut Vec<(i32, i32, i32)>,
-) {
+) -> bool {
     let persistent = d
         .registry()
         .state_of(d.block(x, y, z))
         .is_some_and(|(_, props)| props.split(',').any(|pair| pair == "persistent=true"));
     if persistent || !valid_tree_pos(d, x, y, z) {
-        return;
+        return false;
     }
     if let Some(state) = cfg.leaves.sample(d, rng, x, y, z) {
         let state = waterlogged_leaf(d, state, x, y, z);
         d.set_block(x, y, z, state);
         leaves.push((x, y, z));
+        return true;
     }
+    false
 }
 
 /// A leaf state inside water logs itself.
@@ -1823,8 +2165,7 @@ fn create_foliage(
     leaves: &mut Vec<(i32, i32, i32)>,
 ) {
     let offset = cfg.foliage.offset.sample(rng);
-    let kind = cfg.foliage.kind;
-    match kind {
+    match cfg.foliage.kind {
         // The scattered canopy: each attempt draws its own offset, three
         // doubled draws around the anchor.
         FoliageKind::RandomSpread => {
@@ -1838,92 +2179,78 @@ fn create_foliage(
         FoliageKind::Blob => {
             for yo in ((offset - foliage_height)..=offset).rev() {
                 let r = (leaf_radius - 1 - yo / 2).max(0);
-                place_leaves_row(
-                    d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, kind, leaves,
-                );
+                place_leaves_row(d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, leaves);
             }
         }
         FoliageKind::Fancy => {
             for yo in ((offset - foliage_height)..=offset).rev() {
                 let r = leaf_radius + i32::from(yo != offset && yo != offset - foliage_height);
+                place_leaves_row(d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, leaves);
+            }
+        }
+        // The cherry canopy: two shoulder rows, the main body, and two
+        // hanging rows under it.
+        FoliageKind::Cherry => {
+            let py = att.y + offset;
+            let radius = leaf_radius - 1;
+            place_leaves_row(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 2,
+                foliage_height - 3,
+                att.double,
+                leaves,
+            );
+            place_leaves_row(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 1,
+                foliage_height - 4,
+                att.double,
+                leaves,
+            );
+            for yo in (0..=foliage_height - 5).rev() {
                 place_leaves_row(
-                    d, cfg, rng, att.x, att.y, att.z, r, yo, att.double, kind, leaves,
+                    d, cfg, rng, att.x, py, att.z, radius, yo, att.double, leaves,
                 );
             }
+            place_leaves_row_hanging(
+                d, cfg, rng, att.x, py, att.z, radius, -1, att.double, leaves,
+            );
+            place_leaves_row_hanging(
+                d,
+                cfg,
+                rng,
+                att.x,
+                py,
+                att.z,
+                radius - 1,
+                -2,
+                att.double,
+                leaves,
+            );
         }
         FoliageKind::DarkOak => {
             let py = att.y + offset;
             let (ax, az) = (att.x, att.z);
             if att.double {
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    -1,
-                    true,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 3,
-                    0,
-                    true,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    1,
-                    true,
-                    kind,
-                    leaves,
-                );
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, -1, true, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 3, 0, true, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, 1, true, leaves);
                 if rng.next_bool() {
-                    place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius, 2, true, kind, leaves);
+                    place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius, 2, true, leaves);
                 }
             } else {
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 2,
-                    -1,
-                    false,
-                    kind,
-                    leaves,
-                );
-                place_leaves_row(
-                    d,
-                    cfg,
-                    rng,
-                    ax,
-                    py,
-                    az,
-                    leaf_radius + 1,
-                    0,
-                    false,
-                    kind,
-                    leaves,
-                );
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 2, -1, false, leaves);
+                place_leaves_row(d, cfg, rng, ax, py, az, leaf_radius + 1, 0, false, leaves);
             }
         }
     }
@@ -2861,6 +3188,46 @@ mod tests {
             }
         }
         assert!(leaves > 20, "the dark crown wrote leaves");
+    }
+
+    /// The cherry tree writes the soil swap, a vertical trunk, sideways
+    /// branch logs on the branch axis, and a leaf canopy.
+    #[test]
+    fn cherry_tree_writes_branches_and_canopy() {
+        let mut d = region();
+        let cfg = feature_value("cherry");
+        let base = surface(&mut d, 8, 8);
+        let placed = run_feature(&mut d, &cfg, &mut test_rng(), 8, base, 8);
+        assert!(placed, "the cherry tree placed");
+        assert_eq!(name_at(&d, 8, base, 8), "minecraft:cherry_log");
+        assert_eq!(
+            name_at(&d, 8, base - 1, 8),
+            "minecraft:dirt",
+            "grass under the trunk swaps to dirt"
+        );
+        let mut sideways = 0;
+        let mut leaves = 0;
+        let mut top = base;
+        for dy in -1..14i32 {
+            for dx in -10..=10 {
+                for dz in -10..=10 {
+                    let (x, y, z) = (8 + dx, base + dy, 8 + dz);
+                    if name_at(&d, x, y, z) == "minecraft:cherry_log" {
+                        top = top.max(y);
+                        let (_, props) = d.registry().state_of(d.block(x, y, z)).unwrap();
+                        if !props.contains("axis=y") {
+                            sideways += 1;
+                        }
+                    }
+                    if name_at(&d, x, y, z) == "minecraft:cherry_leaves" {
+                        leaves += 1;
+                    }
+                }
+            }
+        }
+        assert!(sideways > 0, "a branch log lies on its side");
+        assert!(leaves > 20, "the canopy wrote leaves");
+        assert!(top > base, "the tree reached above its origin");
     }
 
     /// Glow lichen hugs the first placeable face: a stone ceiling above

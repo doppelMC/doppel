@@ -182,12 +182,23 @@ impl IntDraw {
         if let Some(n) = v.as_i64() {
             return Ok(IntDraw::Constant(n as i32));
         }
-        let kind = v.get("type").and_then(Value::as_str).context("draw type")?;
         let int = |v: &Value, key: &str| -> Result<i32> {
             v.get(key)
                 .and_then(Value::as_i64)
                 .with_context(|| format!("draw field {key}"))
                 .map(|n| n as i32)
+        };
+        let Some(kind) = v.get("type").and_then(Value::as_str) else {
+            // The compact uniform form carries its bounds without a tag.
+            if v.get("min_inclusive").is_some_and(Value::is_i64)
+                && v.get("max_inclusive").is_some_and(Value::is_i64)
+            {
+                return Ok(IntDraw::Uniform {
+                    min: int(v, "min_inclusive")?,
+                    max: int(v, "max_inclusive")?,
+                });
+            }
+            bail!("integer draw without a type");
         };
         match kind {
             "minecraft:constant" => Ok(IntDraw::Constant(int(v, "value")?)),
@@ -511,6 +522,13 @@ impl Predicate {
 #[derive(Clone)]
 enum Modifier {
     Count(IntDraw),
+    /// The flower-count noise picks the repeat count per position: the
+    /// low-noise count below the level, the high-noise count above.
+    NoiseThresholdCount {
+        noise_level: f64,
+        below_noise: i32,
+        above_noise: i32,
+    },
     Rarity(i32),
     InSquare,
     Heightmap(HeightKind),
@@ -551,6 +569,20 @@ impl Modifier {
                 }
                 Ok(Modifier::Count(draw))
             }
+            "minecraft:noise_threshold_count" => Ok(Modifier::NoiseThresholdCount {
+                noise_level: v
+                    .get("noise_level")
+                    .and_then(Value::as_f64)
+                    .context("noise level")?,
+                below_noise: v
+                    .get("below_noise")
+                    .and_then(Value::as_i64)
+                    .context("below noise count")? as i32,
+                above_noise: v
+                    .get("above_noise")
+                    .and_then(Value::as_i64)
+                    .context("above noise count")? as i32,
+            }),
             "minecraft:rarity_filter" => Ok(Modifier::Rarity(
                 v.get("chance")
                     .and_then(Value::as_i64)
@@ -641,7 +673,6 @@ impl Modifier {
             }
             "minecraft:count_on_every_layer"
             | "minecraft:noise_based_count"
-            | "minecraft:noise_threshold_count"
             | "minecraft:random_chance"
             | "minecraft:randomly_selected"
             | "minecraft:cuboid"
@@ -1567,6 +1598,23 @@ impl<'a> Decorator<'a> {
             match &cfg.placement[index] {
                 Modifier::Count(draw) => {
                     let n = draw.sample(rng);
+                    for _ in 0..n {
+                        out.push((x, y, z));
+                    }
+                }
+                Modifier::NoiseThresholdCount {
+                    noise_level,
+                    below_noise,
+                    above_noise,
+                } => {
+                    let noise = crate::noise::flower_count_noise();
+                    let sample =
+                        f64::from(noise.sample_2d(f64::from(x) / 200.0, f64::from(z) / 200.0));
+                    let n = if sample < *noise_level {
+                        *below_noise
+                    } else {
+                        *above_noise
+                    };
                     for _ in 0..n {
                         out.push((x, y, z));
                     }
