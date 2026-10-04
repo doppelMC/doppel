@@ -32,16 +32,26 @@ impl Default for LevelMeta {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct SpawnNbt {
     #[serde(default = "overworld")]
     dimension: String,
-    #[serde(default)]
-    pos: [i32; 3],
+    pos: fastnbt::IntArray,
     #[serde(default)]
     yaw: f32,
     #[serde(default)]
     pitch: f32,
+}
+
+impl Default for SpawnNbt {
+    fn default() -> Self {
+        SpawnNbt {
+            dimension: overworld(),
+            pos: fastnbt::IntArray::new(Vec::new()),
+            yaw: 0.0,
+            pitch: 0.0,
+        }
+    }
 }
 
 fn overworld() -> String {
@@ -91,7 +101,7 @@ fn to_nbt(meta: &LevelMeta) -> RootNbt {
             data_version: meta.data_version,
             spawn: SpawnNbt {
                 dimension: "minecraft:overworld".into(),
-                pos: [meta.spawn.0, meta.spawn.1, meta.spawn.2],
+                pos: fastnbt::IntArray::new(vec![meta.spawn.0, meta.spawn.1, meta.spawn.2]),
                 yaw: 0.0,
                 pitch: 0.0,
             },
@@ -105,14 +115,14 @@ fn to_nbt(meta: &LevelMeta) -> RootNbt {
 
 fn from_nbt(root: RootNbt) -> LevelMeta {
     let data = root.data;
-    let spawn = data.spawn.pos;
+    let pick = |i: usize| data.spawn.pos.get(i).copied().unwrap_or(0);
     let day_time = data
         .world_clocks
         .get("minecraft:overworld")
         .map(|c| c.total_ticks)
         .unwrap_or(0);
     LevelMeta {
-        spawn: (spawn[0], spawn[1], spawn[2]),
+        spawn: (pick(0), pick(1), pick(2)),
         day_time,
         game_time: data.time,
         game_rules: data.game_rules,
