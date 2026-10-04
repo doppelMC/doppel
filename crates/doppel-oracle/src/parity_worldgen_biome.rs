@@ -467,8 +467,14 @@ fn compare_prepared(
     // (positive) and what we place instead (negative).
     diffs.sort_by_key(|(d, _)| d.abs());
     println!("[biome] {label} largest material deltas (vanilla-ours):");
+    let abs = |name: &str| {
+        let ours = ours_hist.get(name).copied().unwrap_or(0);
+        let vanilla = vanilla_hist.get(name).copied().unwrap_or(0);
+        (ours, vanilla)
+    };
     for (d, name) in diffs.iter().rev().take(25) {
-        println!("[biome] {label}   {name}: {d:+}");
+        let (ours, vanilla) = abs(name);
+        println!("[biome] {label}   {name}: {d:+} (vanilla {vanilla}, ours {ours})");
     }
 
     let agreement = if cells_total == 0 {
