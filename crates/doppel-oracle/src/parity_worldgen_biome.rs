@@ -4,14 +4,15 @@
 //! chunk stream, so oracle coverage reaches biomes the spawn window
 //! never shows (cherry groves, mangrove swamps).
 //!
-//! Doppel's generator has none of the biome features yet. Height
-//! thresholds sit at spawn-parity levels (the spawn leg prints its own
-//! scores as calibration), material thresholds only catch garbage
-//! captures, and the printed per-block deltas are the feature to-do
-//! list for the biome wave. Height correlation is printed but not
-//! gated: a flat biome carries only small-scale shape, where the two
-//! generators sit within a block of each other in absolute terms while
-//! Pearson noise dominates the ratio.
+//! The comparison runs the decorated pipeline: the biome legs carry
+//! cherry groves and mangrove swamps, so the material floors read the
+//! trees, roots, and petals the decorator places. Height thresholds
+//! sit at spawn-parity levels (the spawn leg prints its own scores as
+//! calibration), and the printed per-block deltas are the feature
+//! to-do list for the next biome wave. Height correlation is printed
+//! but not gated: a flat biome carries only small-scale shape, where
+//! the two generators sit within a block of each other in absolute
+//! terms while Pearson noise dominates the ratio.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,6 +23,7 @@ use doppel_protocol::load_pin;
 use doppel_world::anvil_to_wire::unpack;
 use doppel_world::chunk_codec::{Container, WireChunk};
 use doppel_world::registry::BlockRegistry;
+#[cfg(test)]
 use doppel_world::structures::{generate_chunk, WellBlocks};
 use doppel_world::terrain::HeightmapGenerator;
 
@@ -42,22 +44,24 @@ const MIN_BIOME_CHUNKS: usize = 20;
 /// blocks of the located position.
 const MAX_LANDING_DRIFT: i32 = 128;
 
-/// Heightmap convergence targets. The engine scores median 7 / p95 10 at
-/// spawn (the gate's calibration line) and median 0 / p95 18 across a
-/// full biome disc (the swamp rim holds the worst cliffs), so the
-/// thresholds sit at comfortable distance above both measurements while
-/// a terrain-shape regression still crosses them.
+/// Heightmap convergence targets. The decorated legs measure median 0
+/// with p95 8 at spawn and p95 at most 6 in the biome legs, so the
+/// thresholds sit far above the measurements while a terrain-shape
+/// regression still crosses them.
 const MAX_MEDIAN_DELTA: f64 = 12.0;
 const MAX_P95_DELTA: f64 = 28.0;
-/// Coastline agreement floor; swamp margins and grove cliffs cost some
-/// columns the spawn window does not.
-const MIN_LANDMASK: f64 = 0.6;
-/// Material floors: missing biome features (cherry trees, mangrove
-/// roots, mud) are the known gap these gates measure, so the floors
-/// only reject garbage captures (wrong seed, wrong position, decode
-/// failure), not the gap itself.
-const MIN_OVERLAP: f64 = 0.5;
-const MIN_CELL_AGREEMENT: f64 = 0.3;
+/// Coastline agreement floor. The decorated legs measure 0.954 at
+/// spawn, 0.925 in the mangrove swamp and 0.999 in the cherry grove;
+/// the floor sits under the swamp leg with room for the capture window
+/// to shift.
+const MIN_LANDMASK: f64 = 0.9;
+/// Material floors over the decorated chunks. The legs measure
+/// histogram overlap 0.993-0.995 and cell agreement 0.975-0.985; the
+/// floors hold the decorator to the shapes it writes while absorbing
+/// leg-window edges (features rooted in chunks the hop did not
+/// capture).
+const MIN_OVERLAP: f64 = 0.97;
+const MIN_CELL_AGREEMENT: f64 = 0.95;
 
 pub fn run() -> Result<bool> {
     let pin = load_pin()?;
@@ -231,9 +235,8 @@ pub fn run() -> Result<bool> {
     let registry = BlockRegistry::load(&root.join("pins").join("blocks.json"))
         .context("loading block registry pins")?;
     let terrain = HeightmapGenerator::with_seed(SEED, &registry)?;
-    let well = WellBlocks::from_registry(&registry)?;
 
-    let spawn = compare_leg("spawn", spawn_chunks, &terrain, &well, &registry, &dump_dir)?;
+    let spawn = compare_leg("spawn", spawn_chunks, &terrain, &registry, &dump_dir)?;
     println!(
         "[biome] calibration: spawn leg scores corr {:.3} overlap {:.3} cells {:.3} landmask {:.3} median {:.1} p95 {:.1}",
         spawn.correlation,
@@ -246,11 +249,11 @@ pub fn run() -> Result<bool> {
 
     let mut ok = true;
     for (label, chunks) in leg_chunks.iter().skip(1) {
-        let m = compare_leg(label, chunks, &terrain, &well, &registry, &dump_dir)?;
+        let m = compare_leg(label, chunks, &terrain, &registry, &dump_dir)?;
         ok &= gate_leg(label, &m);
     }
     if ok {
-        println!("[biome] gate green: terrain-shape targets met, feature gap printed above");
+        println!("[biome] gate green: decorated legs hold the shape and material floors");
     }
     Ok(ok)
 }
@@ -310,7 +313,36 @@ fn gate_leg(label: &str, m: &LegMetrics) -> bool {
     ok
 }
 
+/// The leg comparison over the decorated pipeline: every chunk in the
+/// leg decorates before any of them emits, so features crossing chunk
+/// borders land whole.
 fn compare_leg(
+    label: &str,
+    captured: &[WireChunk],
+    terrain: &HeightmapGenerator,
+    registry: &BlockRegistry,
+    dump_dir: &Path,
+) -> Result<LegMetrics> {
+    let mut decorator =
+        doppel_world::decoration::Decorator::new(terrain, registry, SEED).context("decorator")?;
+    for v in captured {
+        decorator.decorate(v.x, v.z);
+    }
+    let mut ours = Vec::with_capacity(captured.len());
+    for v in captured {
+        ours.push(
+            decorator
+                .emit(v.x, v.z)
+                .with_context(|| format!("emitting chunk ({}, {})", v.x, v.z))?,
+        );
+    }
+    compare_prepared(label, captured, &ours, registry, dump_dir)
+}
+
+/// The terrain-only variant: the same comparison over undecorated
+/// chunks, for separating a shape regression from a feature one.
+#[cfg(test)]
+fn compare_leg_terrain(
     label: &str,
     captured: &[WireChunk],
     terrain: &HeightmapGenerator,
@@ -693,38 +725,11 @@ mod tests {
             }
             let owned: Vec<WireChunk> = leg.into_iter().cloned().collect();
             if decorate {
-                compare_leg_decorated(label, &owned, &terrain, &registry, &dump_dir)
-                    .expect("decorated compare");
+                compare_leg(label, &owned, &terrain, &registry, &dump_dir).expect("decorated leg");
             } else {
-                compare_leg(label, &owned, &terrain, &well, &registry, &dump_dir)
-                    .expect("terrain compare");
+                compare_leg_terrain(label, &owned, &terrain, &well, &registry, &dump_dir)
+                    .expect("terrain leg");
             }
         }
-    }
-
-    /// The decorated variant of the leg comparison: every chunk in the
-    /// leg decorates before any of them emits.
-    fn compare_leg_decorated(
-        label: &str,
-        captured: &[WireChunk],
-        terrain: &HeightmapGenerator,
-        registry: &BlockRegistry,
-        dump_dir: &Path,
-    ) -> Result<()> {
-        let mut decorator = doppel_world::decoration::Decorator::new(terrain, registry, SEED)
-            .context("decorator")?;
-        for v in captured {
-            decorator.decorate(v.x, v.z);
-        }
-        let mut ours = Vec::with_capacity(captured.len());
-        for v in captured {
-            ours.push(
-                decorator
-                    .emit(v.x, v.z)
-                    .with_context(|| format!("emitting chunk ({}, {})", v.x, v.z))?,
-            );
-        }
-        compare_prepared(label, captured, &ours, registry, dump_dir)?;
-        Ok(())
     }
 }
