@@ -613,24 +613,24 @@ fn login_capture_legs_chase(
             } else {
                 // Volley complete: back to the session's idle threshold.
                 conn.get_ref().set_read_timeout(Some(idle_timeout))?;
-                // Chase probe: after the scripted volley, teleport to the
-                // first wanted entity so chase goals engage (the pacing
-                // code's idle timeout stays authoritative).
-                if !chase_done && play_started && !commands_pending && next_cmd >= commands.len() {
-                    if let (Some(chase), 0x01) = (&chase, id) {
-                        if let Some((cmd, cbody)) = chase_tp(chase, &body) {
-                            conn.write_packet(0x07, &cbody)?;
-                            note = Some(format!("chase: {cmd}"));
-                            chase_done = true;
-                        }
-                    }
-                }
                 if !raw_sent && !raw_packets.is_empty() {
                     raw_sent = true;
                     for (id, body) in raw_packets {
                         conn.write_packet(*id, body)?;
                     }
                     note = Some("sent raw interaction packets".to_string());
+                }
+            }
+        }
+        // Chase probe: after the scripted volley, the first add_entity of
+        // the wanted type teleports the bot beside it so hostile chase
+        // goals engage on a stationary player.
+        if !chase_done && play_started && !commands_pending && next_cmd >= commands.len() {
+            if let (Some(chase), 0x01) = (&chase, id) {
+                if let Some((cmd, cbody)) = chase_tp(chase, &body) {
+                    conn.write_packet(0x07, &cbody)?;
+                    note = Some(format!("chase: {cmd}"));
+                    chase_done = true;
                 }
             }
         }
