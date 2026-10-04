@@ -567,13 +567,14 @@ fn time_set_broadcasts_set_time_and_replies() {
             continue;
         };
         if id == 0x73 {
-            // gameTime + one overworld clock entry: id 0, varlong ticks,
-            // partial 0.0, rate 1.0.
-            assert_eq!(body.len(), 19, "gameTime + count + clock entry");
+            // gameTime + one overworld clock entry: holder id 0, varlong
+            // ticks, partial 0.0, rate 1.0.
+            assert_eq!(body.len(), 20, "gameTime + count + clock entry");
             assert_eq!(body[8], 1, "one clock entry");
-            assert_eq!(&body[9..11], &[0xf0, 0x2e], "varlong 6000");
-            assert_eq!(body[11..15], 0f32.to_be_bytes(), "partial tick 0");
-            assert_eq!(body[15..19], 1f32.to_be_bytes(), "rate 1");
+            assert_eq!(body[9], 0, "overworld holder id");
+            assert_eq!(&body[10..12], &[0xf0, 0x2e], "varlong 6000");
+            assert_eq!(body[12..16], 0f32.to_be_bytes(), "partial tick 0");
+            assert_eq!(body[16..20], 1f32.to_be_bytes(), "rate 1");
             saw_set_time = true;
         }
         if id == 0x7c {

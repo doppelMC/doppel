@@ -640,9 +640,10 @@ impl Game {
         } else {
             0
         };
-        let mut body = Vec::with_capacity(19);
+        let mut body = Vec::with_capacity(20);
         body.extend_from_slice(&(game as i64).to_be_bytes());
         body.push(1);
+        body.push(0);
         doppel_protocol::write_varlong(&mut body, self.day_time);
         body.extend_from_slice(&0f32.to_be_bytes());
         body.extend_from_slice(&1f32.to_be_bytes());
