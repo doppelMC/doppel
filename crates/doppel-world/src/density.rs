@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::biome::{BiomeTable, AXIS_COUNT};
-use crate::noise::{world_positional, Perlin, Positional, Xoroshiro};
+use crate::noise::{obfuscate_seed, world_positional, Perlin, Positional, Xoroshiro};
 use crate::registry::BlockRegistry;
 
 /// Blocks per chunk edge.
@@ -611,6 +611,8 @@ struct Loader<'a> {
     functions: HashMap<String, NodeRef>,
     /// Position-keyed random factories named by the surface rules.
     gradient_factories: HashMap<String, Positional>,
+    /// Biome names to wire ids, read from the registry order on first use.
+    biome_ids: HashMap<String, u32>,
 }
 
 impl<'a> Loader<'a> {
@@ -634,6 +636,7 @@ impl<'a> Loader<'a> {
             stacks: HashMap::new(),
             functions: HashMap::new(),
             gradient_factories: HashMap::new(),
+            biome_ids: HashMap::new(),
         }
     }
 
@@ -1353,8 +1356,8 @@ enum Cond {
         max: f64,
         three_d: bool,
     },
-    /// Resolved at parse: the single-biome world either matches or not.
-    Biome(bool),
+    /// Biome wire ids the position's biome must be one of.
+    Biome(Vec<u32>),
     AbovePreliminary,
     Not(Box<Cond>),
     Hole,
@@ -1477,6 +1480,27 @@ impl<'a> Loader<'a> {
         self.condition(&config)
     }
 
+    /// One biome name to its wire id; the registry order file loads once
+    /// and caches.
+    fn biome_id(&mut self, name: &str) -> Result<u32> {
+        if self.biome_ids.is_empty() {
+            let order: Vec<String> = serde_json::from_str(
+                &std::fs::read_to_string(self.pins.join("biome_registry_order.json"))
+                    .context("biome registry order")?,
+            )
+            .context("parsing biome registry order")?;
+            self.biome_ids = order
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| (name, i as u32))
+                .collect();
+        }
+        self.biome_ids
+            .get(name)
+            .copied()
+            .with_context(|| format!("biome {name} missing from registry order"))
+    }
+
     fn condition(&mut self, v: &Value) -> Result<Cond> {
         if let Value::String(id) = v {
             return self.condition_id(id);
@@ -1533,7 +1557,11 @@ impl<'a> Loader<'a> {
                     Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
                     _ => bail!("biome_is"),
                 };
-                Ok(Cond::Biome(list.contains(&"minecraft:plains")))
+                let mut ids = Vec::with_capacity(list.len());
+                for name in list {
+                    ids.push(self.biome_id(name)?);
+                }
+                Ok(Cond::Biome(ids))
             }
             "minecraft:above_preliminary_surface" => Ok(Cond::AbovePreliminary),
             "minecraft:not" => {
@@ -1716,6 +1744,7 @@ pub struct NoiseTerrain {
     gradient_factories: HashMap<String, Positional>,
     ore_pos: Positional,
     carvers: crate::caves::Carvers,
+    zoom_seed: i64,
     stone: u32,
     water: u32,
     lava: u32,
@@ -1834,6 +1863,7 @@ impl NoiseTerrain {
                 .from_name("minecraft:ore")
                 .fork_positional(),
             carvers,
+            zoom_seed: obfuscate_seed(seed),
             stone,
             water,
             lava: resolve("minecraft:lava")?,
@@ -2369,6 +2399,8 @@ impl NoiseTerrain {
             depth: HashMap::new(),
             secondary: HashMap::new(),
             min_level: HashMap::new(),
+            biomes: HashMap::new(),
+            quart: HashMap::new(),
         };
         mask.for_each_column(&mut |x: usize, z: usize, bottom: i32, top: i32| {
             let column = z * EDGE as usize + x;
@@ -2478,6 +2510,8 @@ impl NoiseTerrain {
             depth: HashMap::new(),
             secondary: HashMap::new(),
             min_level: HashMap::new(),
+            biomes: HashMap::new(),
+            quart: HashMap::new(),
         };
         for z in 0..EDGE {
             for x in 0..EDGE {
@@ -2562,6 +2596,11 @@ struct SurfaceJob<'a> {
     depth: HashMap<(i32, i32), i32>,
     secondary: HashMap<(i32, i32), f64>,
     min_level: HashMap<(i32, i32), i32>,
+    /// The zoomed biome of each column's current walk block: one live
+    /// entry per column, keyed (x, z) to (y, biome).
+    biomes: HashMap<(i32, i32), (i32, u32)>,
+    /// Climate biomes per quart cell; the zoom's corner lookups land here.
+    quart: HashMap<(i32, i32, i32), u32>,
 }
 
 impl SurfaceJob<'_> {
@@ -2609,6 +2648,109 @@ impl SurfaceJob<'_> {
         self.min_level.insert((x, z), level);
         level
     }
+
+    /// The biome one surface block resolves to: the block's position sits
+    /// inside a 4x4x4 quart cell, a seeded fiddle picks one of the eight
+    /// corner cells, and the climate resolves the biome there.
+    fn block_biome(&mut self, ctx: &mut ChunkCtx, x: i32, y: i32, z: i32) -> u32 {
+        if let Some(&(memo_y, biome)) = self.biomes.get(&(x, z)) {
+            if memo_y == y {
+                return biome;
+            }
+        }
+        let abs_x = x - 2;
+        let abs_y = y - 2;
+        let abs_z = z - 2;
+        let parent_x = abs_x.div_euclid(4);
+        let parent_y = abs_y.div_euclid(4);
+        let parent_z = abs_z.div_euclid(4);
+        let fract_x = (abs_x & 3) as f64 / 4.0;
+        let fract_y = (abs_y & 3) as f64 / 4.0;
+        let fract_z = (abs_z & 3) as f64 / 4.0;
+        let mut best = 0usize;
+        let mut best_distance = f64::INFINITY;
+        for i in 0..8usize {
+            let x_even = i & 4 == 0;
+            let y_even = i & 2 == 0;
+            let z_even = i & 1 == 0;
+            let corner_x = if x_even { parent_x } else { parent_x + 1 };
+            let corner_y = if y_even { parent_y } else { parent_y + 1 };
+            let corner_z = if z_even { parent_z } else { parent_z + 1 };
+            let dx = if x_even { fract_x } else { fract_x - 1.0 };
+            let dy = if y_even { fract_y } else { fract_y - 1.0 };
+            let dz = if z_even { fract_z } else { fract_z - 1.0 };
+            let distance = fiddled_distance(
+                self.terrain.zoom_seed,
+                corner_x,
+                corner_y,
+                corner_z,
+                dx,
+                dy,
+                dz,
+            );
+            if distance < best_distance {
+                best = i;
+                best_distance = distance;
+            }
+        }
+        let corner = (
+            parent_x + i32::from(best & 4 != 0),
+            parent_y + i32::from(best & 2 != 0),
+            parent_z + i32::from(best & 1 != 0),
+        );
+        let biome = self.quart_biome(ctx, corner.0, corner.1, corner.2);
+        self.biomes.insert((x, z), (y, biome));
+        biome
+    }
+
+    /// The climate biome of one quart cell, sampled at the cell's corner.
+    fn quart_biome(&mut self, ctx: &mut ChunkCtx, qx: i32, qy: i32, qz: i32) -> u32 {
+        if let Some(&biome) = self.quart.get(&(qx, qy, qz)) {
+            return biome;
+        }
+        let biome = self
+            .terrain
+            .climate
+            .biome(&self.terrain.graph, ctx, qx * 4, qy * 4, qz * 4);
+        self.quart.insert((qx, qy, qz), biome);
+        biome
+    }
+}
+
+/// One corner's fiddled distance: the corner position and the zoom seed
+/// drive a short multiply-mix chain whose three fiddle values offset the
+/// block's fractional position inside its quart cell.
+fn fiddled_distance(seed: i64, x: i32, y: i32, z: i32, dx: f64, dy: f64, dz: f64) -> f64 {
+    let mut rval = seed;
+    for _ in 0..2 {
+        rval = lcg_next(rval, x as i64);
+        rval = lcg_next(rval, y as i64);
+        rval = lcg_next(rval, z as i64);
+    }
+    let fiddle_x = fiddle(rval);
+    rval = lcg_next(rval, seed);
+    let fiddle_y = fiddle(rval);
+    rval = lcg_next(rval, seed);
+    let fiddle_z = fiddle(rval);
+    let dz = dz + fiddle_z;
+    let dy = dy + fiddle_y;
+    let dx = dx + fiddle_x;
+    dz * dz + dy * dy + dx * dx
+}
+
+/// The corner mix step: square-scale the state, add the input.
+fn lcg_next(rval: i64, addend: i64) -> i64 {
+    let scaled = rval
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    rval.wrapping_mul(scaled).wrapping_add(addend)
+}
+
+/// One fiddle value in [-0.45, 0.45], drawn from bits 24..34 of the state.
+fn fiddle(rval: i64) -> f64 {
+    let bits = (rval >> 24) as u64;
+    let uniform = f64::from((bits % 1024) as u32) / 1024.0;
+    (uniform - 0.5) * 0.9
 }
 
 fn try_apply(
@@ -2753,7 +2895,7 @@ fn cond_holds(
             let value = f64::from(value);
             value >= *min && value <= *max
         }
-        Cond::Biome(hit) => *hit,
+        Cond::Biome(ids) => ids.contains(&job.block_biome(ctx, x, y, z)),
         Cond::AbovePreliminary => y >= job.min_surface_level(ctx, x, z),
         Cond::Not(inner) => !cond_holds(inner, job, ctx, walk, x, y, z),
         Cond::Hole => job.surface_depth(x, z) <= 0,
@@ -2812,6 +2954,7 @@ mod tests {
             stacks: HashMap::new(),
             functions: HashMap::new(),
             gradient_factories: HashMap::new(),
+            biome_ids: HashMap::new(),
         }
     }
 

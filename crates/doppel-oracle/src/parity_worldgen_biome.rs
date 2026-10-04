@@ -318,6 +318,25 @@ fn compare_leg(
     registry: &BlockRegistry,
     dump_dir: &Path,
 ) -> Result<LegMetrics> {
+    let mut ours = Vec::with_capacity(captured.len());
+    for v in captured {
+        ours.push(
+            generate_chunk(terrain, well, SEED, v.x, v.z)
+                .with_context(|| format!("generating chunk ({}, {})", v.x, v.z))?,
+        );
+    }
+    compare_prepared(label, captured, &ours, registry, dump_dir)
+}
+
+/// The metric core: every captured chunk paired with our emitted chunk
+/// for the same position.
+fn compare_prepared(
+    label: &str,
+    captured: &[WireChunk],
+    ours: &[WireChunk],
+    registry: &BlockRegistry,
+    dump_dir: &Path,
+) -> Result<LegMetrics> {
     let mut heights = HeightCompare::default();
     let mut ours_hist: HashMap<String, u64> = HashMap::new();
     let mut vanilla_hist: HashMap<String, u64> = HashMap::new();
@@ -325,11 +344,9 @@ fn compare_leg(
     let mut cells_total = 0u64;
     let mut cells_equal = 0u64;
 
-    for v in captured {
-        let mine = generate_chunk(terrain, well, SEED, v.x, v.z)
-            .with_context(|| format!("generating chunk ({}, {})", v.x, v.z))?;
-        heights.add_chunk(v, &mine);
-        let ours_cells = chunk_cells(&mine, registry);
+    for (v, mine) in captured.iter().zip(ours.iter()) {
+        heights.add_chunk(v, mine);
+        let ours_cells = chunk_cells(mine, registry);
         let vanilla_cells = chunk_cells(v, registry);
         for (name, count) in ours_cells.hist {
             *ours_hist.entry(name).or_default() += count;
@@ -418,7 +435,7 @@ fn compare_leg(
     // (positive) and what we place instead (negative).
     diffs.sort_by_key(|(d, _)| d.abs());
     println!("[biome] {label} largest material deltas (vanilla-ours):");
-    for (d, name) in diffs.iter().rev().take(12) {
+    for (d, name) in diffs.iter().rev().take(25) {
         println!("[biome] {label}   {name}: {d:+}");
     }
 
@@ -615,4 +632,99 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
         return 0.0;
     }
     cov / (va.sqrt() * vb.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The leg windows in chunk coordinates: the three capture hops land
+    /// far apart, so membership by position is unambiguous.
+    const LEG_WINDOWS: &[(&str, i32, i32, i32, i32)] = &[
+        ("spawn", -16, 8, -12, 12),
+        ("mangrove_swamp", -90, -70, -70, -45),
+        ("cherry_grove", -135, -110, -50, -25),
+    ];
+
+    /// Replays a capture dump through compare_leg without booting the
+    /// vanilla server: the three legs fall out of the chunk coordinates,
+    /// and DOPPEL_BIOME_PROBE=decorate runs the decorated pipeline
+    /// instead of terrain-only.
+    #[test]
+    #[ignore = "diagnostic: needs a live capture dump"]
+    fn offline_leg_probe() {
+        let dump_dir = crate::vanilla::vanilla_dir()
+            .expect("vanilla dir")
+            .join("biome-capture");
+        let entries = std::fs::read_dir(&dump_dir).expect("biome capture dump");
+        let mut chunks: Vec<WireChunk> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let body = std::fs::read(&path).expect("chunk body");
+            let Ok(chunk) = WireChunk::decode(&body) else {
+                continue;
+            };
+            if seen.insert((chunk.x, chunk.z)) {
+                chunks.push(chunk);
+            }
+        }
+        assert!(!chunks.is_empty(), "capture dump held no chunks");
+
+        let root = doppel_protocol::find_repo_root().expect("repo root");
+        let registry =
+            BlockRegistry::load(&root.join("pins").join("blocks.json")).expect("registry");
+        let terrain = HeightmapGenerator::with_seed(SEED, &registry).expect("terrain");
+        let well = WellBlocks::from_registry(&registry).expect("well blocks");
+        let decorate = std::env::var("DOPPEL_BIOME_PROBE").as_deref() == Ok("decorate");
+
+        for (label, x0, x1, z0, z1) in LEG_WINDOWS {
+            let mut leg: Vec<&WireChunk> = chunks
+                .iter()
+                .filter(|c| (*x0..=*x1).contains(&c.x) && (*z0..=*z1).contains(&c.z))
+                .collect();
+            leg.sort_by_key(|c| (c.x, c.z));
+            if leg.is_empty() {
+                println!("[probe] {label}: no chunks in window");
+                continue;
+            }
+            let owned: Vec<WireChunk> = leg.into_iter().cloned().collect();
+            if decorate {
+                compare_leg_decorated(label, &owned, &terrain, &registry, &dump_dir)
+                    .expect("decorated compare");
+            } else {
+                compare_leg(label, &owned, &terrain, &well, &registry, &dump_dir)
+                    .expect("terrain compare");
+            }
+        }
+    }
+
+    /// The decorated variant of the leg comparison: every chunk in the
+    /// leg decorates before any of them emits.
+    fn compare_leg_decorated(
+        label: &str,
+        captured: &[WireChunk],
+        terrain: &HeightmapGenerator,
+        registry: &BlockRegistry,
+        dump_dir: &Path,
+    ) -> Result<()> {
+        let mut decorator = doppel_world::decoration::Decorator::new(terrain, registry, SEED)
+            .context("decorator")?;
+        for v in captured {
+            decorator.decorate(v.x, v.z);
+        }
+        let mut ours = Vec::with_capacity(captured.len());
+        for v in captured {
+            ours.push(
+                decorator
+                    .emit(v.x, v.z)
+                    .with_context(|| format!("emitting chunk ({}, {})", v.x, v.z))?,
+            );
+        }
+        compare_prepared(label, captured, &ours, registry, dump_dir)?;
+        Ok(())
+    }
 }
