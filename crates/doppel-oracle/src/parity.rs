@@ -683,7 +683,7 @@ fn decode_update_writes(pkts: &[&bot::CapturedPacket]) -> Vec<((i32, i32, i32), 
             let sec = i64::from_be_bytes(raw[0..8].try_into().unwrap());
             let sx = (sec >> 42) & 0x3f_ffff;
             let sz = (sec >> 20) & 0x3f_ffff;
-            let sy = (((sec & 0xf_ffff) as i64) << 12) >> 12;
+            let sy = ((sec & 0xf_ffff) << 44) >> 44;
             let sx = (sx << 10) >> 10;
             let sz = (sz << 10) >> 10;
             let mut o = 8usize;
