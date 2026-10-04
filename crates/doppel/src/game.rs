@@ -399,6 +399,25 @@ pub(crate) mod tracker;
 
 pub(crate) const VIEW_RADIUS: i32 = 4;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// player_position (0x49): the absolute position sync.
+pub(crate) const PACKET_PLAYER_POSITION: i32 = 0x49;
+
+/// The player_position (0x49) body: teleport id, position, zero deltas,
+/// rotation, absolute flags.
+fn position_sync_body(teleport_id: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(42);
+    doppel_protocol::write_varint(&mut body, teleport_id);
+    body.extend_from_slice(&x.to_be_bytes());
+    body.extend_from_slice(&y.to_be_bytes());
+    body.extend_from_slice(&z.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&0.0f64.to_be_bytes());
+    body.extend_from_slice(&yaw.to_be_bytes());
+    body.extend_from_slice(&pitch.to_be_bytes());
+    body.extend_from_slice(&0i32.to_be_bytes());
+    body
+}
 
 impl Game {
     pub fn new(
@@ -453,6 +472,13 @@ impl Game {
                 .ok()
         });
         game.boot_from_level();
+        // --- persistence hooks (persistence.rs) ---
+        // Default-state names resolve without a capture; learned entries
+        // keep precedence over the seeds.
+        if let (Some(world), Some(registry)) = (&game.world, &game.registry) {
+            let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+            w.boot.seed_defaults(registry);
+        }
         game
     }
 
@@ -927,7 +953,7 @@ impl Game {
     ) {
         self.outbounds.insert(conn, tx);
         // Register the viewer index for chunks the join burst
-        // already delivered — without this, block broadcasts skip
+        // already delivered - without this, block broadcasts skip
         // players who never triggered movement streaming.
         for chunk in &sent {
             self.viewers.entry(*chunk).or_default().push(conn);
@@ -963,6 +989,7 @@ impl Game {
             },
         );
         if let Some(data) = saved {
+            let mut sync = None;
             if let Some(p) = self.players.get_mut(&conn) {
                 p.inv.creative = data.game_mode == 1;
                 for slot in data.inventory {
@@ -970,6 +997,22 @@ impl Game {
                         p.inv.inventory.set(slot.slot as usize, Some(stack));
                     }
                 }
+                // The client stands where the join burst placed it; a
+                // restored position needs its own sync to take hold
+                // before the first move packet overwrites it.
+                let teleport_id = p.teleport_id;
+                p.teleport_id += 1;
+                sync = Some(position_sync_body(
+                    teleport_id,
+                    p.x,
+                    p.y,
+                    p.z,
+                    p.yaw,
+                    p.pitch,
+                ));
+            }
+            if let Some(body) = sync {
+                self.send(conn, PACKET_PLAYER_POSITION, &body);
             }
         }
         // --- tracker hooks (tracker.rs) ---
@@ -1151,19 +1194,9 @@ impl Game {
         p.x = x;
         p.y = y;
         p.z = z;
-        let mut sync = Vec::with_capacity(64);
-        doppel_protocol::write_varint(&mut sync, p.teleport_id);
-        sync.extend_from_slice(&x.to_be_bytes());
-        sync.extend_from_slice(&y.to_be_bytes());
-        sync.extend_from_slice(&z.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&0.0f64.to_be_bytes());
-        sync.extend_from_slice(&p.yaw.to_be_bytes());
-        sync.extend_from_slice(&p.pitch.to_be_bytes());
-        sync.extend_from_slice(&0i32.to_be_bytes());
+        let sync = position_sync_body(p.teleport_id, x, y, z, p.yaw, p.pitch);
         p.teleport_id += 1;
-        self.send(conn, 0x49, &sync);
+        self.send(conn, PACKET_PLAYER_POSITION, &sync);
         // --- tracker hooks (tracker.rs) ---
         // The pairing pass reads the old view: entities in the fresh
         // surroundings wait for the player's next move, like the

@@ -32,9 +32,9 @@ pub struct PlayerData {
 
 #[derive(Serialize, Deserialize)]
 struct PlayerNbt {
-    #[serde(rename = "Pos")]
+    #[serde(rename = "Pos", default)]
     pos: Vec<f64>,
-    #[serde(rename = "Rotation")]
+    #[serde(rename = "Rotation", default)]
     rotation: Vec<f32>,
     #[serde(rename = "playerGameType", default)]
     game_mode: i32,
@@ -232,12 +232,15 @@ mod tests {
     fn playerdata_tolerates_missing_fields() {
         let root = dir("sparse");
         let uuid = [1u8; 16];
-        // Only the position: no rotation, no gamemode, no inventory.
-        let nbt = fastnbt::to_bytes(&PlayerNbt {
+        // Only the position: no rotation list at all, no gamemode, no
+        // inventory.
+        #[derive(Serialize)]
+        struct PosOnly {
+            #[serde(rename = "Pos")]
+            pos: Vec<f64>,
+        }
+        let nbt = fastnbt::to_bytes(&PosOnly {
             pos: vec![1.0, 2.0, 3.0],
-            rotation: vec![],
-            game_mode: 0,
-            inventory: vec![],
         })
         .unwrap();
         let dir_path = root.join("playerdata");

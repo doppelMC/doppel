@@ -388,9 +388,16 @@ mod tests {
             .expect("repo root")
             .join("pins/blocks.json");
         let registry = BlockRegistry::load(&pins).expect("registry pins");
+        game_over_with_boot(root, seeded_boot(&registry))
+    }
+
+    fn game_over_with_boot(
+        root: &std::path::Path,
+        boot: PaletteBootstrap,
+    ) -> (Game, std::sync::mpsc::Sender<Inbound>) {
         let world = WorldState {
             dir: WorldDir::open(root).expect("region dir"),
-            boot: seeded_boot(&registry),
+            boot,
             root: root.to_path_buf(),
             level: Default::default(),
         };
@@ -474,7 +481,8 @@ mod tests {
     }
 
     /// (b) Position, rotation, game mode, and inventory (including a
-    /// component patch) restore on rejoin.
+    /// component patch) restore on rejoin, and the restored position
+    /// reaches the client as a position sync.
     #[test]
     fn player_rejoin_restores_state() {
         let root = world_root("rejoin");
@@ -527,7 +535,35 @@ mod tests {
             sent: Vec::new(),
             tx: out2_tx,
         });
-        while out2_rx.try_recv().is_ok() {}
+        g2.flush_connections();
+        let mut synced_pose = None;
+        while let Ok(frame) = out2_rx.try_recv() {
+            if let Outbound::Frame { id: 0x49, body } = frame {
+                let mut r = doppel_protocol::Reader::new(&body);
+                let _teleport_id = r.read_varint().unwrap();
+                let (x, y, z) = (
+                    r.read_f64().unwrap(),
+                    r.read_f64().unwrap(),
+                    r.read_f64().unwrap(),
+                );
+                // Zero deltas sit between the position and the rotation.
+                assert_eq!(
+                    (
+                        r.read_f64().unwrap(),
+                        r.read_f64().unwrap(),
+                        r.read_f64().unwrap()
+                    ),
+                    (0.0, 0.0, 0.0),
+                    "deltas precede rotation"
+                );
+                synced_pose = Some((x, y, z, r.read_f32().unwrap(), r.read_f32().unwrap()));
+            }
+        }
+        assert_eq!(
+            synced_pose,
+            Some((12.5, -60.0, 7.25, -90.0, 12.5)),
+            "a position sync carries the restored pose"
+        );
         assert_eq!(
             g2.player_pose_for_test(3),
             Some(([12.5, -60.0, 7.25], -90.0, 12.5))
@@ -547,6 +583,32 @@ mod tests {
         assert_eq!(
             (plain.count(), plain.item()),
             (5, crate::inventory::item_id("minecraft:dirt").unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A world store with no capture-learned names still saves and
+    /// reloads: the registry seeds the default states.
+    #[test]
+    fn standalone_world_saves_without_learned_boot() {
+        let root = world_root("standalone");
+        let (mut g, _tx) = game_over_with_boot(&root, PaletteBootstrap::default());
+        let flat = FlatGenerator::classic(&g.registry_snapshot_for_test()).unwrap();
+        g.seed_chunk_for_test(0, 0, flat.generate(0, 0));
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 4,
+            y: -60,
+            z: 4,
+            name: "minecraft:stone".into(),
+        });
+        g.flush_connections();
+        g.flush_all();
+        let (mut g2, _tx2) = game_over_with_boot(&root, PaletteBootstrap::default());
+        assert!(g2.ensure_chunk_loaded(0, 0), "saved chunk reloads");
+        assert_eq!(
+            g2.get_block(4, -60, 4),
+            Some(("minecraft:stone".into(), "".into()))
         );
         let _ = std::fs::remove_dir_all(&root);
     }

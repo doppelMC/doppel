@@ -89,6 +89,18 @@ impl PaletteBootstrap {
         }
     }
 
+    /// Seeds the maps with the registry's default states so worlds save
+    /// and load before any capture has learned names; learned entries
+    /// keep precedence.
+    pub fn seed_defaults(&mut self, registry: &crate::registry::BlockRegistry) {
+        for (name, id) in registry.defaults() {
+            self.blocks.entry(name.to_string()).or_insert(id);
+        }
+        self.biomes
+            .entry("minecraft:plains".to_string())
+            .or_insert(crate::worldgen::PLAINS_BIOME_ID);
+    }
+
     /// Learns mappings from one (wire, anvil) chunk pair. Sections are
     /// paired by Y — Anvil section lists may be unordered, carry extra
     /// light-only sections, or omit empty ones, so positional zip would
