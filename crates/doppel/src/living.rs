@@ -1500,6 +1500,18 @@ impl Game {
             }
             self.mob_ai(mob, &mut frames);
         }
+        let mut blasts: Vec<(i32, f64, f64, f64, f64)> = Vec::new();
+        for mob in mobs.iter_mut() {
+            if let Some(radius) = mob.body.pending_blast.take() {
+                blasts.push((
+                    mob.body.id,
+                    mob.body.x,
+                    mob.body.y,
+                    mob.body.z,
+                    radius,
+                ));
+            }
+        }
         if removed.is_empty() {
             self.mobs.mobs = mobs;
         } else {
@@ -1510,6 +1522,15 @@ impl Game {
                 }
             }
             self.mobs.mobs = kept;
+        }
+        // The detonations the fuses reached: they run with the mob
+        // list whole, so the blast sees every mob, and the spent
+        // creeper leaves without a corpse.
+        for (id, x, y, z, radius) in blasts {
+            self.explode_at(x, y, z, radius, id);
+            if let Some(mob) = self.mobs.mobs.iter_mut().find(|m| m.body.id == id) {
+                mob.body.discard = true;
+            }
         }
         for frame in &frames {
             self.send_within(
@@ -1626,12 +1647,6 @@ impl Game {
         mob.rand = rand;
         mob.goals = goals;
         mob.targets = targets;
-        // A detonation the fuse reached: the blast clears the mob.
-        if let Some(radius) = mob.body.pending_blast.take() {
-            let (x, y, z, id) = (mob.body.x, mob.body.y, mob.body.z, mob.body.id);
-            self.explode_at(x, y, z, radius, id);
-            mob.body.discard = true;
-        }
         // A bow shot the goal queued: the skeleton module aims and
         // spawns the arrow.
         if let Some((conn, power)) = mob.body.pending_shot.take() {

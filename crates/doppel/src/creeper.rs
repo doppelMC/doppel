@@ -318,6 +318,49 @@ mod tests {
     }
 
     #[test]
+    fn the_blast_hurts_nearby_mobs_through_the_fuse() {
+        let (mut g, _rx) = harness();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 8.5,
+            y: 100.0,
+            z: 5.5,
+        });
+        g.spawning.day_time = 18000;
+        g.spawn_mob(5.5, 100.0, 5.5, Box::new(Creeper::new()));
+        // A bystander zombie two blocks east of the creeper.
+        g.spawn_mob(7.5, 100.0, 5.5, Box::new(crate::zombie::Zombie::new()));
+        let zombie_health = g.mobs.mobs[1].body.health;
+        for _ in 0..140 {
+            g.tick_once_for_test();
+            if !g
+                .mobs
+                .mobs
+                .iter()
+                .any(|m| m.kind.type_id() == crate::living::ENTITY_TYPE_CREEPER)
+            {
+                break;
+            }
+        }
+        let spent = g
+            .mobs
+            .mobs
+            .iter()
+            .all(|m| m.kind.type_id() != crate::living::ENTITY_TYPE_CREEPER);
+        assert!(spent, "the creeper detonated");
+        let hurt = g
+            .mobs
+            .mobs
+            .iter()
+            .find(|m| m.kind.type_id() == crate::living::ENTITY_TYPE_ZOMBIE)
+            .map(|m| m.body.health);
+        assert!(
+            hurt.is_some_and(|h| h < zombie_health),
+            "the bystander zombie took blast damage: {hurt:?} vs {zombie_health}"
+        );
+    }
+
+    #[test]
     fn the_fuse_ends_in_an_explosion() {
         let (mut g, rx) = harness();
         g.handle(Inbound::Tp {

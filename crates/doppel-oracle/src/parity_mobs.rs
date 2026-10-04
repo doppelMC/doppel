@@ -432,8 +432,12 @@ fn run_session(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
 /// spider second (an open chase), the creeper last (the blast closes
 /// the session).
 fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
+    // The tick loop freezes first: stepping only advances a frozen
+    // clock, so each barrier lands its commands on distinct game
+    // ticks and the creeper's blast happens inside the last step.
     let commands: Vec<String> = vec![
         "gamerule spawn_mobs false".into(),
+        "tick freeze".into(),
         "tp @s 100.5 -60 100.5".into(),
         "time set midnight".into(),
         "summon minecraft:skeleton 108.5 -60 100.5".into(),
@@ -446,6 +450,7 @@ fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
         "tick step 20".into(),
         "summon minecraft:creeper 104.5 -60 160.5".into(),
         "tick step 140".into(),
+        "tick unfreeze".into(),
     ];
     let login = capture::login_start_c("Doppel");
     bot::login_capture(
