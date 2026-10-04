@@ -862,6 +862,10 @@ impl Game {
             }
             Inbound::TimeSet { conn, value } => {
                 self.day_time = value;
+                // The spawn cycle's darkness/burn timelines read the
+                // spawning clock, so the command drives both.
+                self.spawning.day_time = value.rem_euclid(24000) as u64;
+                self.spawning.time_running = true;
                 self.send_set_time();
                 self.send_command_feedback(conn);
             }
