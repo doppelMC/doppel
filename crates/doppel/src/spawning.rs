@@ -484,6 +484,203 @@ mod tests {
         assert_eq!(ty(389), ENTITY_TYPE_CREEPER);
     }
 
+    /// The wave-2 summon scenario, in process: the same command shape
+    /// the mobs gate drives, with the gate's structural assertions.
+    #[test]
+    fn summon_scenario_matches_the_gate_checks() {
+        use crate::explosion::PACKET_EXPLODE;
+        use crate::game::entities::{
+            PACKET_ADD_ENTITY, PACKET_REMOVE_ENTITIES, PACKET_SET_ENTITY_MOTION,
+        };
+        use crate::living::{
+            ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER, PACKET_SET_EQUIPMENT,
+        };
+        use crate::projectile::ENTITY_TYPE_ARROW;
+        let (mut g, rx) = world();
+        g.spawning.day_time = 18000;
+        g.spawning.spawn_mobs = false;
+        // The scripted volley: skeleton, retreat, spider, retreat,
+        // creeper, blast.
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:skeleton".into(),
+            x: 8.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        for _ in 0..180 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 44.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:spider".into(),
+            x: 44.5,
+            y: 100.0,
+            z: 8.5,
+        });
+        for _ in 0..90 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 36.5,
+        });
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:creeper".into(),
+            x: 4.5,
+            y: 100.0,
+            z: 36.5,
+        });
+        for _ in 0..140 {
+            g.tick_once_for_test();
+        }
+        g.flush_connections();
+        let frames = drain(&rx);
+        // The add types.
+        let mut types = std::collections::BTreeSet::new();
+        let mut equipment_ids = Vec::new();
+        for (id, body) in &frames {
+            if *id != PACKET_ADD_ENTITY {
+                continue;
+            }
+            let (x, y, z, ty) = spawn_decode(body);
+            types.insert(ty);
+            let _ = (x, y, z);
+            if ty == ENTITY_TYPE_SKELETON {
+                equipment_ids.push(entity_id_of(body));
+            }
+        }
+        for want in [
+            ENTITY_TYPE_SKELETON,
+            ENTITY_TYPE_SPIDER,
+            ENTITY_TYPE_CREEPER,
+            ENTITY_TYPE_ARROW,
+        ] {
+            assert!(types.contains(&want), "missing add type {want}: {types:?}");
+        }
+        // The skeleton's main-hand equipment.
+        assert!(
+            frames.iter().any(|(id, b)| {
+                *id == PACKET_SET_EQUIPMENT
+                    && equipment_ids.contains(&entity_id_of(b))
+                    && b[entity_header_len(b)] == 0
+            }),
+            "the skeleton pairs with the main-hand bow"
+        );
+        // The arrow flies: motion or position packets reference it.
+        let arrow_id = frames
+            .iter()
+            .find_map(|(id, b)| {
+                if *id == PACKET_ADD_ENTITY && spawn_decode(b).3 == ENTITY_TYPE_ARROW {
+                    Some(entity_id_of(b))
+                } else {
+                    None
+                }
+            })
+            .expect("the arrow add");
+        let arrow_moves = frames.iter().any(|(id, b)| {
+            (*id == PACKET_SET_ENTITY_MOTION
+                || *id == crate::game::entities::PACKET_MOVE_ENTITY_POS
+                || *id == crate::game::entities::PACKET_ENTITY_POSITION_SYNC)
+                && entity_id_of(b) == arrow_id
+        });
+        assert!(arrow_moves, "the arrow sends movement");
+        // The creeper swells, detonates, and leaves no corpse.
+        let creeper_id = frames
+            .iter()
+            .find_map(|(id, b)| {
+                if *id == PACKET_ADD_ENTITY && spawn_decode(b).3 == ENTITY_TYPE_CREEPER {
+                    Some(entity_id_of(b))
+                } else {
+                    None
+                }
+            })
+            .expect("the creeper add");
+        let swelled = frames.iter().any(|(id, b)| {
+            *id == crate::game::entities::PACKET_SET_ENTITY_DATA
+                && entity_id_of(b) == creeper_id
+                && b[entity_header_len(b)] == 16
+        });
+        assert!(swelled, "the swell datum goes out");
+        assert!(
+            frames.iter().any(|(id, _)| *id == PACKET_EXPLODE),
+            "the explosion packet goes out"
+        );
+        assert!(
+            frames.iter().any(|(id, _)| *id == PACKET_REMOVE_ENTITIES),
+            "the creeper is removed"
+        );
+        let updates = frames
+            .iter()
+            .filter(|(id, _)| *id == 0x08 || *id == 0x56)
+            .count();
+        assert!(updates > 0, "the blast clears blocks");
+    }
+
+    /// The entity id leading a packet body.
+    fn entity_id_of(body: &[u8]) -> i32 {
+        let mut i = 0usize;
+        let mut v = 0i32;
+        let mut shift = 0;
+        loop {
+            let b = body[i];
+            i += 1;
+            v |= ((b & 0x7f) as i32) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return v;
+            }
+        }
+    }
+
+    /// The byte length of the leading entity-id varint.
+    fn entity_header_len(body: &[u8]) -> usize {
+        let mut i = 0usize;
+        while body[i] & 0x80 != 0 {
+            i += 1;
+        }
+        i + 1
+    }
+
+    /// The (x, y, z, type) of an add_entity body.
+    fn spawn_decode(body: &[u8]) -> (f64, f64, f64, i32) {
+        let mut i = entity_header_len(body) + 16;
+        let mut ty = 0i32;
+        let mut shift = 0;
+        loop {
+            let b = body[i];
+            i += 1;
+            ty |= ((b & 0x7f) as i32) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let rd = |i: usize| f64::from_be_bytes(body[i..i + 8].try_into().unwrap());
+        (rd(i), rd(i + 8), rd(i + 16), ty)
+    }
+
     #[test]
     fn midnight_spawns_all_four_kinds() {
         use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};
