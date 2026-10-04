@@ -483,51 +483,74 @@ pub fn parity_mobs() -> Result<bool> {
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
-    // Vanilla reference sessions. The default difficulty boots easy;
-    // scenario one opens spawning at midnight, scenario two runs the
-    // scripted summons.
+    // Vanilla reference sessions, one boot per scenario: a session
+    // whose bot dies never idles out (keep-alives keep the read loop
+    // fed), so each server is let go when its session's wall clock
+    // ends, exactly how the single-session gate always ran.
     let vport = vanilla_port();
-    let server = vanilla::boot(&pin, &jar, vport)?;
     let vworker = std::thread::spawn(move || -> Result<_> {
-        let one = run_session(vport, protocol)?;
-        let two = run_session2(vport, protocol)?;
+        let one = {
+            let _server = vanilla::boot(&pin, &jar, vport)?;
+            std::thread::sleep(Duration::from_secs(2));
+            run_session(vport, protocol)?
+        };
+        let two = {
+            let _server = vanilla::boot(&pin, &jar, vport)?;
+            std::thread::sleep(Duration::from_secs(2));
+            run_session2(vport, protocol)?
+        };
         Ok((one, two))
     });
-    let vdeadline = std::time::Instant::now() + Duration::from_secs(280);
+    let vdeadline = std::time::Instant::now() + Duration::from_secs(560);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
         std::thread::sleep(Duration::from_millis(500));
     }
-    drop(server);
     let (v_pkts, v2_pkts) = vworker
         .join()
         .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
 
+    // The doppel side runs the same two boots.
     let bin = default_doppel_bin()?;
     let pin_path = doppel_protocol::pin_path()?;
-    let mut child = Command::new(&bin)
-        .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
-        .env("DOPPEL_PIN", &pin_path)
-        .env("DOPPEL_BLOBS", &blobs_dir)
-        .env("DOPPEL_WORLD", &pristine_world)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawning {}", bin.display()))?;
+    let spawn_doppel = move || -> Result<_> {
+        let child = Command::new(&bin)
+            .env("DOPPEL_ADDR", "127.0.0.1")
+            .env("DOPPEL_PORT", doppel_port().to_string())
+            .env("DOPPEL_PIN", &pin_path)
+            .env("DOPPEL_BLOBS", &blobs_dir)
+            .env("DOPPEL_WORLD", &pristine_world)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawning {}", bin.display()))?;
+        Ok(child)
+    };
     let dport = doppel_port();
-    wait_for_port(dport, Duration::from_secs(30))?;
-    std::thread::sleep(Duration::from_secs(2));
     let worker = std::thread::spawn(move || -> Result<_> {
-        let one = run_session(dport, protocol)?;
-        let two = run_session2(dport, protocol)?;
+        let one = {
+            let mut child = spawn_doppel()?;
+            wait_for_port(dport, Duration::from_secs(30))?;
+            std::thread::sleep(Duration::from_secs(2));
+            let pkts = run_session(dport, protocol)?;
+            let _ = child.kill();
+            let _ = child.wait();
+            pkts
+        };
+        let two = {
+            let mut child = spawn_doppel()?;
+            wait_for_port(dport, Duration::from_secs(30))?;
+            std::thread::sleep(Duration::from_secs(2));
+            let pkts = run_session2(dport, protocol)?;
+            let _ = child.kill();
+            let _ = child.wait();
+            pkts
+        };
         Ok((one, two))
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(280);
+    let deadline = std::time::Instant::now() + Duration::from_secs(560);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
     }
-    let _ = child.kill();
-    let _ = child.wait();
     let (d_pkts, d2_pkts) = worker
         .join()
         .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
