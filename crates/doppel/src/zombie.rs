@@ -2,8 +2,8 @@
 //! player, strolls and looks around while idle, and burns in daylight.
 
 use crate::living::{
-    brightness, GoalCtx, GoalSelector, LookAtPlayerGoal, MeleeAttackGoal, MobKind,
-    NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal, FIRE_IGNITE_TICKS,
+    brightness, ChaseHitGoal, GlanceGoal, GoalCtx, GoalSelector, IdleStrollGoal, MobKind,
+    NearestPlayerTargetGoal, WatchPlayerGoal, FIRE_IGNITE_TICKS,
 };
 use crate::spawning::monsters_burn;
 
@@ -85,18 +85,18 @@ impl MobKind for Zombie {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(3, Box::new(MeleeAttackGoal::new(REACH, FOLLOW_RANGE, true)));
+        goals.add(3, Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, true)));
         goals.add(
             7,
-            Box::new(RandomStrollGoal::new(
+            Box::new(IdleStrollGoal::new(
                 STROLL_RANGE,
                 STROLL_CHANCE,
                 STROLL_GIVE_UP,
                 1.0,
             )),
         );
-        goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
-        goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
+        goals.add(8, Box::new(WatchPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
+        goals.add(8, Box::new(GlanceGoal::new(LOOK_CHANCE)));
         targets.add(
             2,
             Box::new(NearestPlayerTargetGoal::new(

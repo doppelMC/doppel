@@ -3,8 +3,8 @@
 //! the dark.
 
 use crate::living::{
-    Goal, GoalCtx, GoalFlags, GoalSelector, LookAtPlayerGoal, MeleeAttackGoal, MobKind,
-    NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal,
+    ChaseHitGoal, GlanceGoal, Goal, GoalCtx, GoalFlags, GoalSelector, IdleStrollGoal, MobKind,
+    NearestPlayerTargetGoal, WatchPlayerGoal,
 };
 
 /// Follow range (the attribute default).
@@ -53,9 +53,9 @@ const UNSEEN_LIMIT: i32 = 30;
 
 /// The leap: leave the ground toward the target from 2 to 4 blocks on
 /// a one-in-three roll.
-struct LeapAtTargetGoal;
+struct PounceGoal;
 
-impl Goal for LeapAtTargetGoal {
+impl Goal for PounceGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::JUMP.union(GoalFlags::MOVE)
     }
@@ -152,19 +152,19 @@ impl MobKind for Spider {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(3, Box::new(LeapAtTargetGoal));
-        goals.add(4, Box::new(MeleeAttackGoal::new(REACH, FOLLOW_RANGE, true)));
+        goals.add(3, Box::new(PounceGoal));
+        goals.add(4, Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, true)));
         goals.add(
             5,
-            Box::new(RandomStrollGoal::new(
+            Box::new(IdleStrollGoal::new(
                 STROLL_RANGE,
                 STROLL_CHANCE,
                 STROLL_GIVE_UP,
                 0.8,
             )),
         );
-        goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
-        goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
+        goals.add(8, Box::new(WatchPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
+        goals.add(8, Box::new(GlanceGoal::new(LOOK_CHANCE)));
         targets.add(
             2,
             Box::new(NearestPlayerTargetGoal::new(

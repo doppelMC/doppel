@@ -5,8 +5,8 @@
 use crate::game::{ConnId, Game};
 use crate::inventory::{item_id, ItemStack};
 use crate::living::{
-    brightness, eye_at, eye_of, look_angles, visible, Goal, GoalCtx, GoalFlags, GoalSelector,
-    LookAtPlayerGoal, MobKind, NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal,
+    brightness, eye_at, eye_of, look_angles, visible, GlanceGoal, Goal, GoalCtx, GoalFlags,
+    GoalSelector, IdleStrollGoal, MobKind, NearestPlayerTargetGoal, WatchPlayerGoal,
     EQUIP_MAIN_HAND, FIRE_IGNITE_TICKS, PLAYER_EYE,
 };
 use crate::projectile::{mob_base_damage, shot_velocity};
@@ -79,7 +79,7 @@ const UNSEEN_LIMIT: i32 = 30;
 
 /// The ranged attack: chase into the radius, hold and strafe at mid
 /// range, draw and release on the cadence.
-struct RangedBowAttackGoal {
+struct BowFireGoal {
     attack_time: i32,
     see_time: i32,
     draw: Option<i32>,
@@ -90,9 +90,9 @@ struct RangedBowAttackGoal {
     target: Option<ConnId>,
 }
 
-impl RangedBowAttackGoal {
-    fn new() -> RangedBowAttackGoal {
-        RangedBowAttackGoal {
+impl BowFireGoal {
+    fn new() -> BowFireGoal {
+        BowFireGoal {
             attack_time: 0,
             see_time: 0,
             draw: None,
@@ -105,7 +105,7 @@ impl RangedBowAttackGoal {
     }
 }
 
-impl Goal for RangedBowAttackGoal {
+impl Goal for BowFireGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::MOVE.union(GoalFlags::LOOK)
     }
@@ -313,18 +313,18 @@ impl MobKind for Skeleton {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(4, Box::new(RangedBowAttackGoal::new()));
+        goals.add(4, Box::new(BowFireGoal::new()));
         goals.add(
             5,
-            Box::new(RandomStrollGoal::new(
+            Box::new(IdleStrollGoal::new(
                 STROLL_RANGE,
                 STROLL_CHANCE,
                 STROLL_GIVE_UP,
                 1.0,
             )),
         );
-        goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
-        goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
+        goals.add(8, Box::new(WatchPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
+        goals.add(8, Box::new(GlanceGoal::new(LOOK_CHANCE)));
         targets.add(
             2,
             Box::new(NearestPlayerTargetGoal::new(

@@ -555,16 +555,16 @@ pub(crate) fn brightness(world: &Game, body: &MobBody) -> f64 {
 }
 
 /// The idle stroll: a random nearby column on a roll.
-pub(crate) struct RandomStrollGoal {
+pub(crate) struct IdleStrollGoal {
     range: i64,
     chance: u64,
     give_up: i32,
     speed: f64,
 }
 
-impl RandomStrollGoal {
-    pub(crate) fn new(range: i64, chance: u64, give_up: i32, speed: f64) -> RandomStrollGoal {
-        RandomStrollGoal {
+impl IdleStrollGoal {
+    pub(crate) fn new(range: i64, chance: u64, give_up: i32, speed: f64) -> IdleStrollGoal {
+        IdleStrollGoal {
             range,
             chance,
             give_up,
@@ -573,7 +573,7 @@ impl RandomStrollGoal {
     }
 }
 
-impl Goal for RandomStrollGoal {
+impl Goal for IdleStrollGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::MOVE
     }
@@ -598,7 +598,7 @@ impl Goal for RandomStrollGoal {
 }
 
 /// Look at the nearest visible player inside the range.
-pub(crate) struct LookAtPlayerGoal {
+pub(crate) struct WatchPlayerGoal {
     range: f64,
     chance: u64,
     remaining: i32,
@@ -606,9 +606,9 @@ pub(crate) struct LookAtPlayerGoal {
     conn: Option<ConnId>,
 }
 
-impl LookAtPlayerGoal {
-    pub(crate) fn new(range: f64, chance: u64) -> LookAtPlayerGoal {
-        LookAtPlayerGoal {
+impl WatchPlayerGoal {
+    pub(crate) fn new(range: f64, chance: u64) -> WatchPlayerGoal {
+        WatchPlayerGoal {
             range,
             chance,
             remaining: 0,
@@ -618,7 +618,7 @@ impl LookAtPlayerGoal {
     }
 }
 
-impl Goal for LookAtPlayerGoal {
+impl Goal for WatchPlayerGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::LOOK
     }
@@ -667,16 +667,16 @@ impl Goal for LookAtPlayerGoal {
 }
 
 /// A random horizontal glance.
-pub(crate) struct RandomLookGoal {
+pub(crate) struct GlanceGoal {
     chance: u64,
     remaining: i32,
     duration: i32,
     want: (f32, f32),
 }
 
-impl RandomLookGoal {
-    pub(crate) fn new(chance: u64) -> RandomLookGoal {
-        RandomLookGoal {
+impl GlanceGoal {
+    pub(crate) fn new(chance: u64) -> GlanceGoal {
+        GlanceGoal {
             chance,
             remaining: 0,
             duration: 0,
@@ -685,7 +685,7 @@ impl RandomLookGoal {
     }
 }
 
-impl Goal for RandomLookGoal {
+impl Goal for GlanceGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::MOVE.union(GoalFlags::LOOK)
     }
@@ -802,7 +802,7 @@ impl Goal for NearestPlayerTargetGoal {
 /// The melee approach: chase the target, look at it, hit inside the
 /// reach once the cooldown spends. Approaches without hitting when
 /// `hits` is false.
-pub(crate) struct MeleeAttackGoal {
+pub(crate) struct ChaseHitGoal {
     reach: f64,
     follow_range: f64,
     hits: bool,
@@ -812,9 +812,9 @@ pub(crate) struct MeleeAttackGoal {
     last_path: (f64, f64),
 }
 
-impl MeleeAttackGoal {
-    pub(crate) fn new(reach: f64, follow_range: f64, hits: bool) -> MeleeAttackGoal {
-        MeleeAttackGoal {
+impl ChaseHitGoal {
+    pub(crate) fn new(reach: f64, follow_range: f64, hits: bool) -> ChaseHitGoal {
+        ChaseHitGoal {
             reach,
             follow_range,
             hits,
@@ -829,7 +829,7 @@ impl MeleeAttackGoal {
 /// Attack cooldown, in ticks (the 20-tick interval halved).
 const MELEE_COOLDOWN: i32 = 10;
 
-impl Goal for MeleeAttackGoal {
+impl Goal for ChaseHitGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::MOVE.union(GoalFlags::LOOK)
     }

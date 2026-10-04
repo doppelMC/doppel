@@ -4,9 +4,8 @@
 
 use crate::game::ConnId;
 use crate::living::{
-    eye_at, eye_of, visible, Goal, GoalCtx, GoalFlags, GoalSelector, LookAtPlayerGoal,
-    MeleeAttackGoal, MobKind, NearestPlayerTargetGoal, RandomLookGoal, RandomStrollGoal,
-    PLAYER_EYE,
+    eye_at, eye_of, visible, ChaseHitGoal, GlanceGoal, Goal, GoalCtx, GoalFlags, GoalSelector,
+    IdleStrollGoal, MobKind, NearestPlayerTargetGoal, WatchPlayerGoal, PLAYER_EYE,
 };
 
 /// Follow range (the attribute default).
@@ -52,11 +51,11 @@ const UNSEEN_LIMIT: i32 = 30;
 
 /// The swell: stop the navigation and drive the fuse direction while
 /// the target stays close, visible, and inside the cancel range.
-struct SwellGoal {
+struct FuseGoal {
     target: Option<ConnId>,
 }
 
-impl Goal for SwellGoal {
+impl Goal for FuseGoal {
     fn flags(&self) -> GoalFlags {
         GoalFlags::MOVE
     }
@@ -166,22 +165,19 @@ impl MobKind for Creeper {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(2, Box::new(SwellGoal { target: None }));
-        goals.add(
-            4,
-            Box::new(MeleeAttackGoal::new(REACH, FOLLOW_RANGE, false)),
-        );
+        goals.add(2, Box::new(FuseGoal { target: None }));
+        goals.add(4, Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, false)));
         goals.add(
             5,
-            Box::new(RandomStrollGoal::new(
+            Box::new(IdleStrollGoal::new(
                 STROLL_RANGE,
                 STROLL_CHANCE,
                 STROLL_GIVE_UP,
                 0.8,
             )),
         );
-        goals.add(8, Box::new(LookAtPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
-        goals.add(8, Box::new(RandomLookGoal::new(LOOK_CHANCE)));
+        goals.add(8, Box::new(WatchPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
+        goals.add(8, Box::new(GlanceGoal::new(LOOK_CHANCE)));
         targets.add(
             2,
             Box::new(NearestPlayerTargetGoal::new(
