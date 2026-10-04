@@ -868,21 +868,8 @@ impl Game {
                 self.send_command_feedback(conn);
             }
             // --- survival hooks (entities.rs) ---
-            Inbound::GameRule { conn, tick_speed } => {
-                self.set_tick_speed(tick_speed);
-                self.send_command_feedback(conn);
-            }
-            Inbound::TimeSet { conn, value } => {
-                self.day_time = value;
-                // The spawn cycle's darkness/burn timelines read the
-                // spawning clock, so the command drives both.
-                self.spawning.day_time = value.rem_euclid(24000) as u64;
-                self.spawning.time_running = true;
-                self.send_set_time();
-                self.send_command_feedback(conn);
-            }
-            Inbound::GameRuleNoop { conn } => {
-                self.send_command_feedback(conn);
+            Inbound::GameRule { .. } | Inbound::TimeSet { .. } | Inbound::GameRuleNoop { .. } => {
+                self.apply_survival_command(event);
             }
             // --- mob hooks (living.rs / spawning.rs) ---
             Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } | Inbound::Summon { .. } => {
@@ -951,6 +938,29 @@ impl Game {
                 self.frozen = frozen;
                 self.send_command_feedback(conn);
             }
+        }
+    }
+
+    /// The survival-hook commands: apply the state, then acknowledge.
+    fn apply_survival_command(&mut self, event: Inbound) {
+        match event {
+            Inbound::GameRule { conn, tick_speed } => {
+                self.set_tick_speed(tick_speed);
+                self.send_command_feedback(conn);
+            }
+            Inbound::TimeSet { conn, value } => {
+                self.day_time = value;
+                // The spawn cycle's darkness/burn timelines read the
+                // spawning clock, so the command drives both.
+                self.spawning.day_time = value.rem_euclid(24000) as u64;
+                self.spawning.time_running = true;
+                self.send_set_time();
+                self.send_command_feedback(conn);
+            }
+            Inbound::GameRuleNoop { conn } => {
+                self.send_command_feedback(conn);
+            }
+            _ => {}
         }
     }
 
