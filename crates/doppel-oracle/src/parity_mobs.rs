@@ -20,6 +20,23 @@ use crate::{bot, capture, vanilla};
 const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
+/// Port overrides for local runs that share the machine with another
+/// gate's servers; CI uses the defaults.
+fn vanilla_port() -> u16 {
+    std::env::var("MOBS_VANILLA_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VANILLA_PORT)
+}
+
+/// The doppel-side override twin.
+fn doppel_port() -> u16 {
+    std::env::var("MOBS_DOPPEL_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DOPPEL_PORT)
+}
+
 /// minecraft:zombie in the entity-type registry (registration order 155,
 /// 0-based). The gate asserts both servers' zombie adds carry it.
 const ZOMBIE_TYPE: i32 = 154;
@@ -469,10 +486,11 @@ pub fn parity_mobs() -> Result<bool> {
     // Vanilla reference sessions. The default difficulty boots easy;
     // scenario one opens spawning at midnight, scenario two runs the
     // scripted summons.
-    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let vport = vanilla_port();
+    let server = vanilla::boot(&pin, &jar, vport)?;
     let vworker = std::thread::spawn(move || -> Result<_> {
-        let one = run_session(VANILLA_PORT, protocol)?;
-        let two = run_session2(VANILLA_PORT, protocol)?;
+        let one = run_session(vport, protocol)?;
+        let two = run_session2(vport, protocol)?;
         Ok((one, two))
     });
     let vdeadline = std::time::Instant::now() + Duration::from_secs(280);
@@ -488,7 +506,7 @@ pub fn parity_mobs() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PORT", doppel_port().to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -496,11 +514,12 @@ pub fn parity_mobs() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let dport = doppel_port();
+    wait_for_port(dport, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
     let worker = std::thread::spawn(move || -> Result<_> {
-        let one = run_session(DOPPEL_PORT, protocol)?;
-        let two = run_session2(DOPPEL_PORT, protocol)?;
+        let one = run_session(dport, protocol)?;
+        let two = run_session2(dport, protocol)?;
         Ok((one, two))
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(280);
