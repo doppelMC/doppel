@@ -885,18 +885,8 @@ impl Game {
                 self.send_command_feedback(conn);
             }
             // --- mob hooks (living.rs / spawning.rs) ---
-            Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
+            Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } | Inbound::Summon { .. } => {
                 self.apply_mob_command(event);
-            }
-            Inbound::Summon {
-                conn,
-                kind,
-                x,
-                y,
-                z,
-            } => {
-                self.spawn_named(&kind, x, y, z);
-                self.send_command_feedback(conn);
             }
             // --- placement hooks (placement.rs) ---
             Inbound::Rotated { conn, yaw, pitch } => {
@@ -965,7 +955,7 @@ impl Game {
     }
 
     /// The mob-hook commands: apply the state, then acknowledge; the
-    /// three share one reply path and differ only in their writes.
+    /// four share one reply path and differ only in their writes.
     fn apply_mob_command(&mut self, event: Inbound) {
         match event {
             Inbound::SpawnMobs { conn, enabled } => {
@@ -975,6 +965,17 @@ impl Game {
 
             Inbound::SetDifficulty { conn, peaceful } => {
                 self.spawning.peaceful = peaceful;
+                self.send_command_feedback(conn);
+            }
+
+            Inbound::Summon {
+                conn,
+                kind,
+                x,
+                y,
+                z,
+            } => {
+                self.spawn_named(&kind, x, y, z);
                 self.send_command_feedback(conn);
             }
             _ => {}
