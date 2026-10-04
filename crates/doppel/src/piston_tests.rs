@@ -567,9 +567,13 @@ fn time_set_broadcasts_set_time_and_replies() {
             continue;
         };
         if id == 0x73 {
-            assert_eq!(body.len(), 17, "gameTime + day time + trailing byte");
-            assert_eq!(body[..8], 0i64.to_be_bytes(), "gameTime stays static");
-            assert_eq!(body[8..16], 6000i64.to_be_bytes(), "day time lands");
+            // gameTime + one overworld clock entry: id 0, varlong ticks,
+            // partial 0.0, rate 1.0.
+            assert_eq!(body.len(), 19, "gameTime + count + clock entry");
+            assert_eq!(body[8], 1, "one clock entry");
+            assert_eq!(&body[9..11], &[0xf0, 0x2e], "varlong 6000");
+            assert_eq!(body[11..15], 0f32.to_be_bytes(), "partial tick 0");
+            assert_eq!(body[15..19], 1f32.to_be_bytes(), "rate 1");
             saw_set_time = true;
         }
         if id == 0x7c {
@@ -578,7 +582,8 @@ fn time_set_broadcasts_set_time_and_replies() {
     }
     assert!(saw_set_time, "time set pushes a set_time frame");
     assert!(saw_reply, "time set answers with command feedback");
-    // Nineteen more ticks land on the tick-20 periodic broadcast.
+    // Nineteen more ticks land on the tick-20 periodic broadcast: the
+    // steady-state form carries gameTime and zero clock entries.
     for _ in 0..19 {
         g.tick_once_for_test();
     }
@@ -588,14 +593,12 @@ fn time_set_broadcasts_set_time_and_replies() {
             continue;
         };
         if id == 0x73 {
-            assert_eq!(body[8..16], 6000i64.to_be_bytes());
+            assert_eq!(body.len(), 9, "gameTime + empty clock map");
+            assert_eq!(body[8], 0, "no clock entries");
             periodic = true;
         }
     }
-    assert!(
-        periodic,
-        "the periodic set_time carries the stored day time"
-    );
+    assert!(periodic, "the periodic set_time carries game time only");
 }
 
 #[test]

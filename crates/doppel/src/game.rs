@@ -613,19 +613,17 @@ impl Game {
         self.flush_connections();
     }
 
-    /// set_time (0x73): gameTime i64 + day counter, every 20 ticks.
-    /// A world that never ran `time set` stays at the static 0/0 pair.
+    /// set_time (0x73): gameTime i64 + a map of changed clocks, every 20
+    /// ticks. Steady state carries no clock entries.
     fn broadcast_time(&mut self) {
         if self.tick.is_multiple_of(20) {
-            let day = self.day_time;
             let game = if self.spawning.time_running {
                 self.spawning.total_ticks
             } else {
                 0
             };
-            let mut body = Vec::with_capacity(18);
-            body.extend_from_slice(&game.to_be_bytes());
-            body.extend_from_slice(&day.to_be_bytes());
+            let mut body = Vec::with_capacity(9);
+            body.extend_from_slice(&(game as i64).to_be_bytes());
             body.push(0);
             let conns: Vec<ConnId> = self.players.keys().copied().collect();
             for c in conns {
@@ -634,12 +632,20 @@ impl Game {
         }
     }
 
-    /// Sends set_time (0x73) with the stored day time.
+    /// set_time (0x73) with one clock entry: the overworld clock (network
+    /// id 0) at the stored day time.
     fn send_set_time(&mut self) {
-        let mut body = Vec::with_capacity(18);
-        body.extend_from_slice(&0i64.to_be_bytes());
-        body.extend_from_slice(&self.day_time.to_be_bytes());
-        body.push(0);
+        let game = if self.spawning.time_running {
+            self.spawning.total_ticks
+        } else {
+            0
+        };
+        let mut body = Vec::with_capacity(19);
+        body.extend_from_slice(&(game as i64).to_be_bytes());
+        body.push(1);
+        doppel_protocol::write_varlong(&mut body, self.day_time);
+        body.extend_from_slice(&0f32.to_be_bytes());
+        body.extend_from_slice(&1f32.to_be_bytes());
         let conns: Vec<ConnId> = self.players.keys().copied().collect();
         for c in conns {
             self.send(c, 0x73, &body);

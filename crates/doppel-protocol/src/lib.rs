@@ -33,6 +33,22 @@ pub fn varint_len(value: i32) -> usize {
     tmp.len()
 }
 
+/// Minecraft protocol VarLong: LEB128-style, 7 bits per byte, max 9 bytes.
+pub fn write_varlong(buf: &mut Vec<u8>, value: i64) {
+    let mut v = value as u64;
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
 /// Writes a protocol string: VarInt byte-length prefix + UTF-8 bytes.
 pub fn write_string(buf: &mut Vec<u8>, s: &str) {
     write_varint(buf, s.len() as i32);
