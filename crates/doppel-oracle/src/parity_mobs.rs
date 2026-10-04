@@ -464,6 +464,52 @@ fn run_session2(port: u16, protocol: i32) -> Result<Vec<bot::CapturedPacket>> {
     )
 }
 
+/// One session against a freshly booted vanilla server: the session
+/// thread runs until it idles out, and the server stops at the cap so
+/// a session whose bot died (keep-alives keep its reads fed) still
+/// returns its transcript.
+fn vanilla_session_capped(
+    pin: &doppel_protocol::Pin,
+    jar: &std::path::Path,
+    port: u16,
+    protocol: i32,
+    run: fn(u16, i32) -> Result<Vec<bot::CapturedPacket>>,
+) -> Result<Vec<bot::CapturedPacket>> {
+    let server = vanilla::boot(pin, jar, port)?;
+    std::thread::sleep(Duration::from_secs(2));
+    let handle = std::thread::spawn(move || run(port, protocol));
+    let cap = std::time::Instant::now() + Duration::from_secs(160);
+    while !handle.is_finished() && std::time::Instant::now() < cap {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(server);
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))?
+}
+
+/// The doppel twin: one child per session, stopped at the cap.
+fn doppel_session_capped(
+    port: u16,
+    protocol: i32,
+    spawn_child: impl Fn() -> Result<std::process::Child>,
+    run: fn(u16, i32) -> Result<Vec<bot::CapturedPacket>>,
+) -> Result<Vec<bot::CapturedPacket>> {
+    let mut child = spawn_child()?;
+    wait_for_port(port, Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(2));
+    let handle = std::thread::spawn(move || run(port, protocol));
+    let cap = std::time::Instant::now() + Duration::from_secs(160);
+    while !handle.is_finished() && std::time::Instant::now() < cap {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))?
+}
+
 /// The differential mobs test.
 pub fn parity_mobs() -> Result<bool> {
     let pin = load_pin()?;
@@ -489,16 +535,8 @@ pub fn parity_mobs() -> Result<bool> {
     // ends, exactly how the single-session gate always ran.
     let vport = vanilla_port();
     let vworker = std::thread::spawn(move || -> Result<_> {
-        let one = {
-            let _server = vanilla::boot(&pin, &jar, vport)?;
-            std::thread::sleep(Duration::from_secs(2));
-            run_session(vport, protocol)?
-        };
-        let two = {
-            let _server = vanilla::boot(&pin, &jar, vport)?;
-            std::thread::sleep(Duration::from_secs(2));
-            run_session2(vport, protocol)?
-        };
+        let one = vanilla_session_capped(&pin, &jar, vport, protocol, run_session)?;
+        let two = vanilla_session_capped(&pin, &jar, vport, protocol, run_session2)?;
         Ok((one, two))
     });
     let vdeadline = std::time::Instant::now() + Duration::from_secs(560);
@@ -527,24 +565,8 @@ pub fn parity_mobs() -> Result<bool> {
     };
     let dport = doppel_port();
     let worker = std::thread::spawn(move || -> Result<_> {
-        let one = {
-            let mut child = spawn_doppel()?;
-            wait_for_port(dport, Duration::from_secs(30))?;
-            std::thread::sleep(Duration::from_secs(2));
-            let pkts = run_session(dport, protocol)?;
-            let _ = child.kill();
-            let _ = child.wait();
-            pkts
-        };
-        let two = {
-            let mut child = spawn_doppel()?;
-            wait_for_port(dport, Duration::from_secs(30))?;
-            std::thread::sleep(Duration::from_secs(2));
-            let pkts = run_session2(dport, protocol)?;
-            let _ = child.kill();
-            let _ = child.wait();
-            pkts
-        };
+        let one = doppel_session_capped(dport, protocol, &spawn_doppel, run_session)?;
+        let two = doppel_session_capped(dport, protocol, &spawn_doppel, run_session2)?;
         Ok((one, two))
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(560);
