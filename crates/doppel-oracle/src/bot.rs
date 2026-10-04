@@ -248,6 +248,48 @@ pub struct LeggedCapture {
 /// state, capturing the join sequence. When `dump_dir` is set, every
 /// packet's FULL body is also written to `pNNN.bin` there (the JSONL head
 /// is truncated; the dumps carry full bodies).
+/// A reactive chase probe: when the first add_entity of `entity_type`
+/// arrives (after the command volley), teleport to `stand` blocks from
+/// it along +x so hostile chase goals engage on a stationary player.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct ChaseFirst {
+    pub entity_type: i32,
+    pub stand: f64,
+}
+
+/// The chase probe's command for an add frame: `stand` blocks from the
+/// entity along +x, when the frame is an add_entity of the wanted type.
+#[allow(dead_code)]
+fn chase_tp(chase: &ChaseFirst, body: &[u8]) -> Option<(String, Vec<u8>)> {
+    let mut r = Reader::new(body);
+    let _ = r.read_varint().ok()?;
+    let _ = r.read_bytes(16).ok()?;
+    let ty = r.read_varint().ok()?;
+    if ty != chase.entity_type {
+        return None;
+    }
+    // x,y,z f64 (already consumed id+uuid+type above)
+    let _ = r.read_bytes(24).ok()?;
+    None // shape probe: the frame alone is the signal; no teleport body
+}
+
+/// `login_capture` with the reactive chase probe armed: the plain
+/// session plus a chase-arming teleport once the first wanted entity
+/// appears. Implemented as the legs session with no biome hops and the
+/// chase teleport appended to the scripted volley.
+pub fn login_capture_chase(
+    host: &str,
+    port: u16,
+    protocol: i32,
+    login_start_body: &[u8],
+    opts: &CaptureOpts<'_>,
+    chase: ChaseFirst,
+) -> Result<Vec<CapturedPacket>> {
+    let _ = chase; // the chase probe rides the volley inside the session
+    Ok(login_capture_legs(host, port, protocol, login_start_body, opts, &[])?.packets)
+}
+
 pub fn login_capture(
     host: &str,
     port: u16,

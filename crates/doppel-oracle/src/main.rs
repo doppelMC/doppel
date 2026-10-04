@@ -4,6 +4,7 @@ mod bot;
 mod capture;
 mod parity;
 mod parity_break;
+mod parity_mobs;
 mod parity_survival;
 mod parity_worldgen;
 mod parity_worldgen_biome;
@@ -35,6 +36,9 @@ fn usage() -> ! {
                                        swamp) the bot teleports to
   doppel-oracle parity-survival     differential test: drops, pickup, grass
                                        decay/spread (break + random ticks)
+  doppel-oracle parity-mobs          differential test: zombie spawning at
+                                       midnight, pairing packets, and the
+                                       chase closing on the player
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
                                       record vanilla's login transcript; with a
                                       blobs dir, dump byte-exact packet bodies
@@ -81,6 +85,11 @@ fn run() -> Result<()> {
         }
         Some("parity-survival") => {
             if !parity_survival::parity_survival()? {
+                std::process::exit(1);
+            }
+        }
+        Some("parity-mobs") => {
+            if !parity_mobs::parity_mobs()? {
                 std::process::exit(1);
             }
         }

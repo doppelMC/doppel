@@ -6,8 +6,12 @@ pub mod blobs;
 pub mod dig;
 pub mod game;
 pub mod inventory;
+pub mod living;
+pub mod pathing;
 pub mod placement;
+pub mod spawning;
 pub mod wire;
+pub mod zombie;
 
 #[cfg(test)]
 mod piston_tests;
@@ -457,8 +461,12 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                     });
                 }
             }
-            // Spawner gamerules silence the reference's mobs; nothing to
-            // spawn here, but the reply must come.
+            // --- mob hooks (living.rs / spawning.rs) ---
+            if let Some(inbound) = mob_command(conn, &parts) {
+                return Some(inbound);
+            }
+            // The other spawner gamerules silence monster families this
+            // build does not spawn; the reply must still come.
             if parts.len() == 3
                 && parts[0] == "gamerule"
                 && parts[1].starts_with("spawn_")
@@ -553,6 +561,39 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         }
         _ => None,
     }
+}
+
+/// The mob-hook command parses: the part of the command volley that
+/// living.rs and spawning.rs answer. `spawn_mobs` leads the generic
+/// `spawn_*` noop parse so the real gate wins the race.
+fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
+    // `gamerule spawn_mobs <bool>`: the natural-spawn gate.
+    if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "spawn_mobs" {
+        let enabled = parts[2].parse::<bool>().ok()?;
+        return Some(game::Inbound::SpawnMobs { conn, enabled });
+    }
+    // `time set <word|ticks>`: the day clock the darkness and burn
+    // checks read.
+    if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
+        let ticks = match parts[2] {
+            "day" => 1000,
+            "noon" => 6000,
+            "night" => 13000,
+            "midnight" => 18000,
+            word => word.parse::<u64>().ok()? % 24000,
+        };
+        return Some(game::Inbound::TimeSet { conn, ticks });
+    }
+    // `difficulty <word>`: peaceful removes monsters.
+    if parts.len() == 2 && parts[0] == "difficulty" {
+        let peaceful = match parts[1] {
+            "peaceful" => true,
+            "easy" | "normal" | "hard" => false,
+            _ => return None,
+        };
+        return Some(game::Inbound::SetDifficulty { conn, peaceful });
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
