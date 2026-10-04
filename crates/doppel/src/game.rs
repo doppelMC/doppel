@@ -2293,7 +2293,12 @@ impl Game {
                     let wire = flat.generate(cx, cz);
                     drop(w);
                     slot.insert(CachedChunk { wire, version: 0 });
-                    return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
+                    // The filled cache slot serves a plain re-entry.
+                    let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone())
+                    else {
+                        anyhow::bail!("chunk cached but no world to reload it");
+                    };
+                    return self.load_chunk(&world, &blobs, cx, cz);
                 }
             };
             let reference = blobs.play.iter().find_map(|(id, body)| {
