@@ -260,7 +260,6 @@ pub struct ChaseFirst {
 
 /// The chase probe's command for an add frame: `stand` blocks from the
 /// entity along +x, when the frame is an add_entity of the wanted type.
-#[allow(dead_code)]
 fn chase_tp(chase: &ChaseFirst, body: &[u8]) -> Option<(String, Vec<u8>)> {
     let mut r = Reader::new(body);
     let _ = r.read_varint().ok()?;
@@ -269,15 +268,19 @@ fn chase_tp(chase: &ChaseFirst, body: &[u8]) -> Option<(String, Vec<u8>)> {
     if ty != chase.entity_type {
         return None;
     }
-    // x,y,z f64 (already consumed id+uuid+type above)
-    let _ = r.read_bytes(24).ok()?;
-    None // shape probe: the frame alone is the signal; no teleport body
+    let x = r.read_f64().ok()?;
+    let y = r.read_f64().ok()?;
+    let z = r.read_f64().ok()?;
+    let cmd = format!("tp @s {:.1} {:.1} {:.1}", x + chase.stand, y, z);
+    let mut cbody = Vec::new();
+    doppel_protocol::write_string(&mut cbody, &cmd);
+    Some((cmd, cbody))
 }
 
-/// `login_capture` with the reactive chase probe armed: the plain
-/// session plus a chase-arming teleport once the first wanted entity
-/// appears. Implemented as the legs session with no biome hops and the
-/// chase teleport appended to the scripted volley.
+/// `login_capture` with the reactive chase probe armed: once the
+/// scripted volley completes and the first add_entity of the wanted type
+/// arrives, teleport `stand` blocks from it along +x so hostile chase
+/// goals engage on a stationary player.
 pub fn login_capture_chase(
     host: &str,
     port: u16,
@@ -286,8 +289,16 @@ pub fn login_capture_chase(
     opts: &CaptureOpts<'_>,
     chase: ChaseFirst,
 ) -> Result<Vec<CapturedPacket>> {
-    let _ = chase; // the chase probe rides the volley inside the session
-    Ok(login_capture_legs(host, port, protocol, login_start_body, opts, &[])?.packets)
+    login_capture_legs_chase(
+        host,
+        port,
+        protocol,
+        login_start_body,
+        opts,
+        &[],
+        Some(chase),
+    )
+    .map(|c| c.packets)
 }
 
 pub fn login_capture(
@@ -311,6 +322,26 @@ pub fn login_capture_legs(
     login_start_body: &[u8],
     opts: &CaptureOpts<'_>,
     locate_biomes: &[&str],
+) -> Result<LeggedCapture> {
+    login_capture_legs_chase(
+        host,
+        port,
+        protocol,
+        login_start_body,
+        opts,
+        locate_biomes,
+        None,
+    )
+}
+
+fn login_capture_legs_chase(
+    host: &str,
+    port: u16,
+    protocol: i32,
+    login_start_body: &[u8],
+    opts: &CaptureOpts<'_>,
+    locate_biomes: &[&str],
+    chase: Option<ChaseFirst>,
 ) -> Result<LeggedCapture> {
     let idle_timeout = opts.idle_timeout();
     let max_packets = opts.max_packets();
@@ -344,6 +375,7 @@ pub fn login_capture_legs(
     let mut packs_answered = false;
     let mut play_started = false;
     let mut commands_pending = !commands.is_empty();
+    let mut chase_done = false;
     let mut next_cmd = 0usize;
     let raw_packets = opts.raw_packets;
     let mut raw_sent = false;
@@ -581,6 +613,18 @@ pub fn login_capture_legs(
             } else {
                 // Volley complete: back to the session's idle threshold.
                 conn.get_ref().set_read_timeout(Some(idle_timeout))?;
+                // Chase probe: after the scripted volley, teleport to the
+                // first wanted entity so chase goals engage (the pacing
+                // code's idle timeout stays authoritative).
+                if !chase_done && play_started && !commands_pending && next_cmd >= commands.len() {
+                    if let (Some(chase), 0x01) = (&chase, id) {
+                        if let Some((cmd, cbody)) = chase_tp(chase, &body) {
+                            conn.write_packet(0x07, &cbody)?;
+                            note = Some(format!("chase: {cmd}"));
+                            chase_done = true;
+                        }
+                    }
+                }
                 if !raw_sent && !raw_packets.is_empty() {
                     raw_sent = true;
                     for (id, body) in raw_packets {
