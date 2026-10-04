@@ -755,58 +755,7 @@ impl Game {
                 z,
                 sent,
                 tx,
-            } => {
-                self.outbounds.insert(conn, tx);
-                // Register the viewer index for chunks the join burst
-                // already delivered — without this, block broadcasts skip
-                // players who never triggered movement streaming.
-                for chunk in &sent {
-                    self.viewers.entry(*chunk).or_default().push(conn);
-                }
-                // --- persistence hooks (persistence.rs) ---
-                // Saved player state restores before any join state goes
-                // out: position, rotation, game mode, inventory.
-                let saved = self.load_saved_player(&name);
-                let (x, y, z, yaw, pitch) = match &saved {
-                    Some(data) => (data.pos[0], data.pos[1], data.pos[2], data.yaw, data.pitch),
-                    None => (x, y, z, 0.0, 0.0),
-                };
-                let entity_id = self.next_entity_id;
-                self.next_entity_id += 1;
-                self.players.insert(
-                    conn,
-                    Player {
-                        name,
-                        x,
-                        y,
-                        z,
-                        yaw,
-                        pitch,
-                        center: None,
-                        sent: sent.into_iter().collect(),
-                        teleport_id: 1,
-                        pending_keep_alive: None,
-                        keep_alive_idle: Instant::now(),
-                        inv: Default::default(),
-                        menu: Default::default(),
-                        entity_id,
-                        dig: Default::default(),
-                    },
-                );
-                if let Some(data) = saved {
-                    if let Some(p) = self.players.get_mut(&conn) {
-                        p.inv.creative = data.game_mode == 1;
-                        for slot in data.inventory {
-                            if let Some(stack) = crate::persistence::saved_to_stack(&slot) {
-                                p.inv.inventory.set(slot.slot as usize, Some(stack));
-                            }
-                        }
-                    }
-                }
-                // --- tracker hooks (tracker.rs) ---
-                // The newcomer pairs with every entity already in range.
-                self.track_player_view(conn);
-            }
+            } => self.handle_joined(conn, name, x, y, z, sent, tx),
             Inbound::Moved {
                 conn,
                 x,
@@ -940,24 +889,7 @@ impl Game {
             Inbound::ContainerClose { conn, container_id } => {
                 self.client_closed_container(conn, container_id)
             }
-            Inbound::Left { conn } => {
-                // --- containers hooks (containers.rs) ---
-                // The carried stack of an open menu drops with the player.
-                self.close_menu(conn, false, true);
-                // --- tracker hooks (tracker.rs) ---
-                self.track_player_left(conn);
-                // --- persistence hooks (persistence.rs) ---
-                self.save_player_data(conn);
-                let Some(p) = self.players.remove(&conn) else {
-                    return;
-                };
-                self.outbounds.remove(&conn);
-                for chunk in p.sent {
-                    if let Some(v) = self.viewers.get_mut(&chunk) {
-                        v.retain(|c| *c != conn);
-                    }
-                }
-            }
+            Inbound::Left { conn } => self.handle_left(conn),
             Inbound::TickStep { conn, steps } => {
                 // Run the stepped ticks inline: commands queued behind this
                 // event in the same channel batch land on later ticks,
@@ -975,6 +907,93 @@ impl Game {
             Inbound::TickFreeze { conn, frozen } => {
                 self.frozen = frozen;
                 self.send_command_feedback(conn);
+            }
+        }
+    }
+
+    /// The join event: register the connection, restore saved player
+    /// state when the store has it, and pair the newcomer with every
+    /// tracked entity.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_joined(
+        &mut self,
+        conn: ConnId,
+        name: String,
+        x: f64,
+        y: f64,
+        z: f64,
+        sent: Vec<(i32, i32)>,
+        tx: Sender<Outbound>,
+    ) {
+        self.outbounds.insert(conn, tx);
+        // Register the viewer index for chunks the join burst
+        // already delivered — without this, block broadcasts skip
+        // players who never triggered movement streaming.
+        for chunk in &sent {
+            self.viewers.entry(*chunk).or_default().push(conn);
+        }
+        // --- persistence hooks (persistence.rs) ---
+        // Saved player state restores before any join state goes
+        // out: position, rotation, game mode, inventory.
+        let saved = self.load_saved_player(&name);
+        let (x, y, z, yaw, pitch) = match &saved {
+            Some(data) => (data.pos[0], data.pos[1], data.pos[2], data.yaw, data.pitch),
+            None => (x, y, z, 0.0, 0.0),
+        };
+        let entity_id = self.next_entity_id;
+        self.next_entity_id += 1;
+        self.players.insert(
+            conn,
+            Player {
+                name,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+                center: None,
+                sent: sent.into_iter().collect(),
+                teleport_id: 1,
+                pending_keep_alive: None,
+                keep_alive_idle: Instant::now(),
+                inv: Default::default(),
+                menu: Default::default(),
+                entity_id,
+                dig: Default::default(),
+            },
+        );
+        if let Some(data) = saved {
+            if let Some(p) = self.players.get_mut(&conn) {
+                p.inv.creative = data.game_mode == 1;
+                for slot in data.inventory {
+                    if let Some(stack) = crate::persistence::saved_to_stack(&slot) {
+                        p.inv.inventory.set(slot.slot as usize, Some(stack));
+                    }
+                }
+            }
+        }
+        // --- tracker hooks (tracker.rs) ---
+        // The newcomer pairs with every entity already in range.
+        self.track_player_view(conn);
+    }
+
+    /// The disconnect event: drop the menu, untrack, save the player's
+    /// state, and forget the viewer index.
+    fn handle_left(&mut self, conn: ConnId) {
+        // --- containers hooks (containers.rs) ---
+        // The carried stack of an open menu drops with the player.
+        self.close_menu(conn, false, true);
+        // --- tracker hooks (tracker.rs) ---
+        self.track_player_left(conn);
+        // --- persistence hooks (persistence.rs) ---
+        self.save_player_data(conn);
+        let Some(p) = self.players.remove(&conn) else {
+            return;
+        };
+        self.outbounds.remove(&conn);
+        for chunk in p.sent {
+            if let Some(v) = self.viewers.get_mut(&chunk) {
+                v.retain(|c| *c != conn);
             }
         }
     }
