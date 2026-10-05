@@ -425,6 +425,184 @@ mod tests {
         }
     }
 
+    /// Copies a directory tree (the test's world fixture).
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let src = entry.path();
+            let dst = to.join(entry.file_name());
+            if src.is_dir() {
+                copy_tree(&src, &dst);
+            } else if entry.file_name() != "session.lock" {
+                std::fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+
+    /// A copy of the local vanilla run world, when one exists.
+    fn vanilla_world_copy(tag: &str) -> Option<std::path::PathBuf> {
+        let root = doppel_protocol::find_repo_root()
+            .expect("repo root")
+            .join("target/vanilla/run/world");
+        if !root.is_dir() {
+            return None;
+        }
+        let copy =
+            std::env::temp_dir().join(format!("doppel-persist-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&copy);
+        copy_tree(&root, &copy);
+        Some(copy)
+    }
+
+    /// The captured reference blob set, when one exists.
+    fn reference_blobs() -> Option<Arc<crate::blobs::Blobs>> {
+        let dir = doppel_protocol::find_repo_root()
+            .expect("repo root")
+            .join("target/vanilla/blobs");
+        if !dir.join("manifest.json").is_file() {
+            return None;
+        }
+        Some(Arc::new(crate::blobs::load(&dir).expect("blob set")))
+    }
+
+    /// A game over the given root, with the reference blobs attached when
+    /// they exist.
+    fn game_over_with_reference(
+        root: &std::path::Path,
+        blobs: Option<Arc<crate::blobs::Blobs>>,
+    ) -> (Game, std::sync::mpsc::Sender<Inbound>) {
+        let pins = doppel_protocol::find_repo_root()
+            .expect("repo root")
+            .join("pins/blocks.json");
+        let registry = BlockRegistry::load(&pins).expect("registry pins");
+        let world = WorldState {
+            dir: WorldDir::open(root).expect("region dir"),
+            boot: seeded_boot(&registry),
+            root: root.to_path_buf(),
+            level: Default::default(),
+            level_readonly: false,
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Inbound>();
+        let game = Game::new(rx, Some(Arc::new(Mutex::new(world))), blobs);
+        (game, tx)
+    }
+
+    /// Parses every stored chunk in every region file of a world root;
+    /// returns (files, chunks, failure strings).
+    fn scan_regions(root: &std::path::Path) -> (usize, usize, Vec<String>) {
+        let region = doppel_world::anvil_write::region_dir(root);
+        let (mut files, mut chunks, mut failures) = (0, 0, Vec::new());
+        for entry in std::fs::read_dir(&region).expect("region dir") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mca") {
+                continue;
+            }
+            files += 1;
+            let region = doppel_world::Region::open(&path).expect("open region");
+            for z in 0..32usize {
+                for x in 0..32usize {
+                    match region.chunk(x, z) {
+                        Ok(Some(_)) => chunks += 1,
+                        Ok(None) => {}
+                        Err(e) => failures.push(format!("{} ({x},{z}): {e:#}", path.display())),
+                    }
+                }
+            }
+        }
+        (files, chunks, failures)
+    }
+
+    /// (r) Chunks the flat path generates inside an existing vanilla
+    /// region file, plus an edited captured chunk, save and reload with
+    /// every stored chunk still parsing. Runs with the reference blobs
+    /// attached when they exist, so captured chunks take the learn path
+    /// the live server uses.
+    #[test]
+    fn generated_chunks_reload_in_vanilla_region() {
+        let Some(root) = vanilla_world_copy("vanilla-region") else {
+            return;
+        };
+        let blobs = reference_blobs();
+        let (mut g, _tx) = game_over_with_reference(&root, blobs.clone());
+        // (20,20) sits inside the existing r.0.0 region but has no stored
+        // chunk; loading it runs the flat fallback.
+        assert!(g.ensure_chunk_loaded(20, 20), "flat chunk generates");
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 325,
+            y: -60,
+            z: 325,
+            name: "minecraft:stone".into(),
+        });
+        // A walking line of generated chunks across region boundaries,
+        // including a negative-coordinate region.
+        for &(cx, cz) in &[(1i32, 0i32), (33, 0), (65, 1), (-33, 5)] {
+            assert!(g.ensure_chunk_loaded(cx, cz), "flat chunk ({cx},{cz})");
+            g.handle(Inbound::Setblock {
+                conn: 0,
+                x: cx * 16 + 2,
+                y: -60,
+                z: cz * 16 + 2,
+                name: "minecraft:stone".into(),
+            });
+        }
+        // (0,0) is a stored vanilla chunk; editing it rewrites a slot that
+        // already carries a payload, through the reference conversion when
+        // blobs are attached.
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 3,
+            y: -60,
+            z: 5,
+            name: "minecraft:stone".into(),
+        });
+        g.flush_connections();
+        assert!(g.persistence.dirty.chunks.contains(&(20, 20)));
+        g.flush_all();
+        assert!(g.persistence.dirty.chunks.is_empty(), "everything flushes");
+        drop(g);
+
+        let (files, chunks, failures) = scan_regions(&root);
+        eprintln!(
+            "[vanilla-region] blobs={}, {files} files, {chunks} chunks, {} failures",
+            blobs.is_some(),
+            failures.len()
+        );
+        for f in failures.iter().take(10) {
+            eprintln!("[vanilla-region] {f}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {chunks} chunks fail to parse",
+            failures.len()
+        );
+
+        let (mut g2, _tx2) = game_over_with_reference(&root, blobs);
+        assert!(g2.ensure_chunk_loaded(20, 20), "generated chunk reloads");
+        assert_eq!(
+            g2.get_block(325, -60, 325),
+            Some(("minecraft:stone".into(), "".into())),
+            "generated-chunk edit survives"
+        );
+        for &(cx, cz) in &[(1i32, 0i32), (33, 0), (65, 1)] {
+            assert!(g2.ensure_chunk_loaded(cx, cz), "chunk ({cx},{cz}) reloads");
+        }
+        // Capture precedence masks edits inside the blob area (the
+        // reference wins over storage on reload); only edits outside it
+        // read back.
+        assert!(
+            g2.ensure_chunk_loaded(-33, 5),
+            "negative-region chunk reloads"
+        );
+        assert_eq!(
+            g2.get_block(-33 * 16 + 2, -60, 5 * 16 + 2),
+            Some(("minecraft:stone".into(), "".into())),
+            "negative-region edit survives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// (a) Blocks placed and removed through the engine survive a save
     /// and a fresh boot over the same directory.
     #[test]

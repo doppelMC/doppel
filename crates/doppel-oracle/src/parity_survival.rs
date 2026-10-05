@@ -28,12 +28,20 @@ const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
 /// Local-run overrides for machines where another server holds a default
-/// port; CI uses the defaults.
+/// port; CI uses the defaults. An overridden port implies a private
+/// vanilla run directory, whose boot-time wipe would otherwise hit the
+/// shared one.
 fn vanilla_port() -> u16 {
-    std::env::var("SURVIVAL_VANILLA_PORT")
+    match std::env::var("SURVIVAL_VANILLA_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(VANILLA_PORT)
+    {
+        Some(port) => {
+            vanilla::default_run_dir("survival");
+            port
+        }
+        None => VANILLA_PORT,
+    }
 }
 
 /// The doppel-side override twin.

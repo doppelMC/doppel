@@ -112,7 +112,7 @@ pub(crate) fn capture_clean_blobs(
     if pristine_world.exists() {
         std::fs::remove_dir_all(pristine_world)?;
     }
-    let world = crate::vanilla::vanilla_dir()?.join("run").join("world");
+    let world = crate::vanilla::run_world()?;
     anyhow::ensure!(world.is_dir(), "vanilla world dir missing after boot");
     // session.lock stays OS-locked by the live server on Windows and is
     // meaningless to a reader; skip it.

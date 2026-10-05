@@ -267,11 +267,7 @@ pub fn parity_login() -> Result<bool> {
     // Pre-verify the Anvil -> wire pipeline against every captured chunk:
     // learn the palette maps from (wire, anvil) pairs, rebuild each chunk
     // from storage, and require byte-identical output BEFORE the live test.
-    let world_dir = root
-        .join("target")
-        .join("vanilla")
-        .join("run")
-        .join("world");
+    let world_dir = vanilla::run_world()?;
     let mut anvil_ok = 0usize;
     let mut anvil_total = 0usize;
     if world_dir.is_dir() {
@@ -441,11 +437,7 @@ pub fn parity_walk() -> Result<bool> {
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
     let blobs_dir = root.join("target").join("vanilla").join("blobs");
-    let world_dir = root
-        .join("target")
-        .join("vanilla")
-        .join("run")
-        .join("world");
+    let world_dir = vanilla::run_world()?;
     let v_dump = root.join("target").join("walk-vanilla");
     let d_dump = root.join("target").join("walk-doppel");
     for dir in [&v_dump, &d_dump] {
@@ -622,7 +614,7 @@ fn capture_clean_blobs(
     if pristine_world.exists() {
         std::fs::remove_dir_all(pristine_world)?;
     }
-    let world = crate::vanilla::vanilla_dir()?.join("run").join("world");
+    let world = crate::vanilla::run_world()?;
     anyhow::ensure!(world.is_dir(), "vanilla world dir missing after boot");
     copy_dir(&world, pristine_world)?;
     // A stale lock file means nothing to a reader.

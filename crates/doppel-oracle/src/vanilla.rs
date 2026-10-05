@@ -17,6 +17,32 @@ pub fn vanilla_dir() -> Result<PathBuf> {
     Ok(find_repo_root()?.join("target").join("vanilla"))
 }
 
+/// The vanilla run directory: VANILLA_RUN_DIR when set, the shared
+/// default otherwise. The boot below wipes this directory, so local
+/// runs that share the machine with another gate or a live server
+/// point it somewhere private.
+pub fn run_dir() -> Result<PathBuf> {
+    match std::env::var_os("VANILLA_RUN_DIR") {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => Ok(vanilla_dir()?.join("run")),
+    }
+}
+
+/// The world directory inside the vanilla run directory.
+pub fn run_world() -> Result<PathBuf> {
+    Ok(run_dir()?.join("world"))
+}
+
+/// Gives a gate a private run directory unless one is already set.
+pub fn default_run_dir(tag: &str) {
+    if std::env::var_os("VANILLA_RUN_DIR").is_none() {
+        let dir = vanilla_dir()
+            .map(|base| base.join(format!("run-{tag}")))
+            .unwrap_or_else(|_| PathBuf::from(format!("run-{tag}")));
+        std::env::set_var("VANILLA_RUN_DIR", dir);
+    }
+}
+
 /// Downloads the pinned server jar if absent (and verifies its SHA-1).
 pub fn ensure_jar(pin: &Pin) -> Result<PathBuf> {
     let dir = vanilla_dir()?;
@@ -192,7 +218,7 @@ fn boot_with_properties(
         );
     }
 
-    let run_dir = vanilla_dir()?.join("run");
+    let run_dir = run_dir()?;
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir).context("cleaning vanilla run dir")?;
     }

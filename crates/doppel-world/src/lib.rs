@@ -223,6 +223,49 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Scans a world's region files (DOPPEL_SCAN_WORLD, default the local
+    /// run world); every stored chunk must parse. Prints the first
+    /// failing file, chunk, and error.
+    #[test]
+    fn scan_run_world_regions() {
+        let root = std::env::var("DOPPEL_SCAN_WORLD")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/vanilla/run/world")
+            });
+        if !root.is_dir() {
+            eprintln!("[scan] {} absent, skipping", root.display());
+            return;
+        }
+        let region = crate::anvil_write::region_dir(&root);
+        let mut files = 0;
+        let mut chunks = 0;
+        let mut failures = 0;
+        for entry in std::fs::read_dir(&region).expect("read region dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mca") {
+                continue;
+            }
+            files += 1;
+            let region = Region::open(&path).expect("open region");
+            for z in 0..32usize {
+                for x in 0..32usize {
+                    match region.chunk(x, z) {
+                        Ok(Some(_)) => chunks += 1,
+                        Ok(None) => {}
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("[scan] {} chunk ({x},{z}): {e:#}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("[scan] {files} files, {chunks} chunks, {failures} failures");
+        assert_eq!(failures, 0, "{failures} chunks fail to parse");
+    }
+
     /// Builds a one-chunk region file in memory and reads it back.
     #[test]
     fn roundtrip_minimal_region() {
