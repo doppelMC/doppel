@@ -565,7 +565,7 @@ pub fn probe_play_facts() -> Result<bool> {
     let probe_raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(22, 100, 10, 200))];
     let login = capture::login_start_c("Doppel");
     let worker = std::thread::spawn(move || {
-        play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &probe_raw)
+        play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &probe_raw, None)
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
@@ -635,8 +635,9 @@ pub fn probe_play_facts() -> Result<bool> {
         std::thread::sleep(Duration::from_secs(2));
     }
     let login = capture::login_start_c("Doppelist");
-    let worker =
-        std::thread::spawn(move || play_capture(PROBE_PORT, protocol, &login, &mode_cmds, &[]));
+    let worker = std::thread::spawn(move || {
+        play_capture(PROBE_PORT, protocol, &login, &mode_cmds, &[], None)
+    });
     // Session B is informational: keep its tail short.
     let deadline = std::time::Instant::now() + Duration::from_secs(75);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
@@ -669,6 +670,7 @@ fn play_capture(
     login_body: &[u8],
     commands: &[String],
     raw_packets: &[(i32, Vec<u8>)],
+    wait_chunk: Option<(i32, i32)>,
 ) -> Result<Vec<bot::CapturedPacket>> {
     use doppel_protocol::{write_string, Conn, Reader};
     const REPLY_WINDOW: Duration = Duration::from_secs(5);
@@ -706,6 +708,7 @@ fn play_capture(
     let mut play_started = false;
     let mut raw_sent_at: Option<std::time::Instant> = None;
     let mut next_cmd = 0usize;
+    let mut chunk_seen = wait_chunk.is_none();
     let mut batch_feedback_due = false;
     while raw_sent_at.is_none_or(|at| std::time::Instant::now() < at + AFTER_RAW) {
         let (id, body) = match conn.read_packet() {
@@ -757,6 +760,25 @@ fn play_capture(
         if !play_started {
             continue;
         }
+        if let (Some(want), false) = (wait_chunk, chunk_seen) {
+            if id == 0x2e && body.len() >= 8 {
+                let cx = i32::from_be_bytes(body[0..4].try_into().unwrap());
+                let cz = i32::from_be_bytes(body[4..8].try_into().unwrap());
+                if (cx, cz) == want {
+                    // The server only sends a chunk to a player tracking
+                    // it, so its arrival proves the tracking the section
+                    // broadcasts depend on.
+                    chunk_seen = true;
+                    if next_cmd == 1 {
+                        let mut b = Vec::new();
+                        write_string(&mut b, commands[next_cmd].as_str());
+                        conn.write_packet(0x07, &b)?;
+                        next_cmd += 1;
+                        conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
+                    }
+                }
+            }
+        }
         match id {
             0x2d => conn.write_packet(0x1c, &body)?, // keep-alive echo
             0x0b if !body.is_empty() => {
@@ -791,6 +813,11 @@ fn play_capture(
                 conn.write_packet(0x00, &ack)?;
             }
             0x7c if next_cmd > 0 => {
+                if next_cmd == 1 && !chunk_seen {
+                    // The teleport's reply arrived before the waited
+                    // chunk; hold the volley until the chunk lands.
+                    continue;
+                }
                 if next_cmd < commands.len() {
                     let mut b = Vec::new();
                     write_string(&mut b, commands[next_cmd].as_str());
@@ -814,12 +841,23 @@ fn play_capture(
             write_string(&mut b, commands[0].as_str());
             conn.write_packet(0x07, &b)?;
             next_cmd = 1;
-            conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
+            // With a chunk to wait for, the settle window replaces the
+            // reply pacing until the chunk lands (commands[0] is the
+            // teleport that triggers the stream).
+            let window = if wait_chunk.is_some() {
+                Duration::from_secs(20)
+            } else {
+                REPLY_WINDOW
+            };
+            conn.get_ref().set_read_timeout(Some(window))?;
         }
-        if raw_sent_at.is_some() {
-            let armed = raw_sent_at.unwrap_or_else(std::time::Instant::now);
-            let left = armed + AFTER_RAW - std::time::Instant::now();
-            conn.get_ref().set_read_timeout(Some(left))?;
+        if let Some(armed) = raw_sent_at {
+            // Saturating: the deadline can pass between the loop check
+            // and here, and a zero timeout is an error, not a wait.
+            let left = (armed + AFTER_RAW).saturating_duration_since(std::time::Instant::now());
+            if !left.is_zero() {
+                conn.get_ref().set_read_timeout(Some(left))?;
+            }
         }
     }
     if raw_sent_at.is_some() {
@@ -942,9 +980,9 @@ pub fn parity_play() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    wait_for_port(dport, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(8));
-    let worker = std::thread::spawn(move || run_play_sessions(DOPPEL_PORT, protocol));
+    let worker = std::thread::spawn(move || run_play_sessions(dport, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -1113,7 +1151,7 @@ fn run_play_sessions(
         (0x42, bot::build_use_item_on_top(26, 100, 12, 101)),
     ];
     let login = capture::login_start_c("Doppel");
-    let on = play_capture(port, protocol, &login, &build, &on_raw)
+    let on = play_capture(port, protocol, &login, &build, &on_raw, Some((2, 0)))
         .context("play session 1 (flips on)")?;
     // Let the world settle: the piston lands and the wire stills before
     // the second session's flips arrive.
@@ -1141,8 +1179,15 @@ fn run_play_sessions(
         (0x42, bot::build_use_item_on_top(26, 100, 12, 103)),
     ];
     let login = capture::login_start_c("Doppelist");
-    let off = play_capture(port, protocol, &login, &off_commands, &off_raw)
-        .context("play session 2 (flips off)")?;
+    let off = play_capture(
+        port,
+        protocol,
+        &login,
+        &off_commands,
+        &off_raw,
+        Some((2, 0)),
+    )
+    .context("play session 2 (flips off)")?;
 
     Ok((on, off))
 }
