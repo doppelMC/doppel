@@ -548,7 +548,7 @@ pub fn probe_play_facts() -> Result<bool> {
         "setblock 25 100 14 minecraft:stone".to_string(),
         "setblock 23 100 14 minecraft:sticky_piston[extended=false,facing=east]".to_string(),
         "setblock 22 100 14 minecraft:lever[face=floor,facing=north,powered=false]".to_string(),
-        "tp @s 24 103 12".to_string(),
+        "tp @s 22 102 10".to_string(),
         "tick freeze".to_string(),
         "tick step 2".to_string(),
         "setblock 22 100 10 minecraft:lever[face=floor,facing=north,powered=true]".to_string(),
@@ -562,9 +562,15 @@ pub fn probe_play_facts() -> Result<bool> {
         "tick unfreeze".to_string(),
     ]
     .to_vec();
+    let probe_raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(22, 100, 10, 200))];
     let login = capture::login_start_c("Doppel");
-    let worker =
-        std::thread::spawn(move || play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &[]));
+    let worker = std::thread::spawn(move || {
+        play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &probe_raw)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let a = if worker.is_finished() {
         worker
             .join()
@@ -580,10 +586,22 @@ pub fn probe_play_facts() -> Result<bool> {
             .context("capturing piston session after close")?
     };
     println!("[probe] piston session: {} frames", a.len());
+    let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
+    for p in a.iter().filter(|p| p.id >= 0) {
+        *hist.entry(p.id).or_default() += 1;
+    }
+    println!(
+        "[probe] piston ids: {}",
+        hist.iter()
+            .map(|(id, n)| format!("{id:#04x}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     for p in a.iter().filter(|p| p.id >= 0) {
         match p.id {
             0x07 => println!("[probe] block_event: {}", p.head_hex),
             0x08 | 0x56 => println!("[probe] write 0x{:02x}: {}", p.id, p.head_hex),
+            0x04 => println!("[probe] block_changed_ack: {}", p.head_hex),
             _ => {}
         }
     }
@@ -918,7 +936,7 @@ pub fn parity_play() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", dport.to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -926,9 +944,9 @@ pub fn parity_play() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(dport, Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(8));
-    let worker = std::thread::spawn(move || run_play_sessions(dport, protocol));
+    let worker = std::thread::spawn(move || run_play_sessions(DOPPEL_PORT, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));

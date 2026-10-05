@@ -375,6 +375,46 @@ fn piston_three_block_push_leaves_one_block_each() {
     assert_eq!(at(&g, 24, 100, 10), "minecraft:air[]", "head removed");
 }
 
+/// Breaking the middle wire of a staircase clears the surviving wires'
+/// stale diagonal connections (the removed state's indirect shape fan).
+#[test]
+fn wire_removal_clears_diagonal_connections() {
+    let (mut g, rx) = harness();
+    for c in [
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+        "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 12 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 13 100 10 minecraft:stone",
+        "setblock 13 101 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+    ] {
+        cmd(&mut g, c);
+        g.tick_once_for_test();
+    }
+    cmd(
+        &mut g,
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=true]",
+    );
+    for _ in 0..4 {
+        tick(&mut g, &rx);
+    }
+    // The step's up-connection forms while the wire exists.
+    assert!(
+        at(&g, 12, 100, 10).contains("east=up"),
+        "staircase up forms: {}",
+        at(&g, 12, 100, 10)
+    );
+    // Break the step wire: the surviving wire below loses its up side.
+    cmd(&mut g, "setblock 13 101 10 minecraft:air");
+    for _ in 0..4 {
+        tick(&mut g, &rx);
+    }
+    assert!(
+        !at(&g, 12, 100, 10).contains("east=up"),
+        "stale up side cleared after removal: {}",
+        at(&g, 12, 100, 10)
+    );
+}
+
 /// Sticky pull: the block two ahead comes back with the head.
 #[test]
 fn sticky_piston_pulls() {

@@ -1289,6 +1289,8 @@ impl Game {
         let cz = z.div_euclid(16);
         let sec_index = (y.div_euclid(16) + 4) as usize;
         let idx = local_yzx(x, y, z);
+        let old = self.get_block(x, y, z);
+        let was_wire = matches!(&old, Some((n, _)) if n == "minecraft:redstone_wire");
         if self.get_state_id(x, y, z) == Some(state) {
             return;
         }
@@ -1337,13 +1339,18 @@ impl Game {
         // A wire write also pushes the reference's indirect shape fan:
         // the diagonal wires beside each connected side re-derive their
         // shape (`updateIndirectNeighbourShapes`).
-        if self
+        let is_wire = self
             .registry
             .as_ref()
             .and_then(|r| r.state_of(state))
-            .is_some_and(|(n, _)| n == "minecraft:redstone_wire")
-        {
+            .is_some_and(|(n, _)| n == "minecraft:redstone_wire");
+        if is_wire {
+            // The new wire's own connections fan to its diagonals.
             self.wire_indirect_shape_fan(x, y, z);
+        } else if let Some((_, props)) = old.filter(|_| was_wire) {
+            // A removed wire fans from the connections it had (the
+            // reference runs the old state's indirect shape fan).
+            self.wire_indirect_shape_fan_props(x, y, z, &props);
         }
         // --- containers hooks (containers.rs) ---
         // A successful write re-syncs the block-entity map with the block.
@@ -1355,10 +1362,18 @@ impl Game {
     /// not a wire, the wires one above and one below that neighbor hear a
     /// directional shape update from the opposite side.
     fn wire_indirect_shape_fan(&mut self, x: i32, y: i32, z: i32) {
-        let Some((_, props)) = self.get_block(x, y, z) else {
+        let Some((n, props)) = self.get_block(x, y, z) else {
             return;
         };
-        let conn = wire::Connections::from_props(&props);
+        if !wire::is_wire(&n) {
+            return;
+        }
+        self.wire_indirect_shape_fan_props(x, y, z, &props);
+    }
+
+    /// The fan for one wire's stored connections.
+    fn wire_indirect_shape_fan_props(&mut self, x: i32, y: i32, z: i32, props: &str) {
+        let conn = wire::Connections::from_props(props);
         type Target = ((i32, i32, i32), (i32, i32, i32));
         let mut targets: Vec<Target> = Vec::new();
         for d in wire::Dir::HORIZONTAL {
@@ -1872,7 +1887,8 @@ impl Game {
                 BLOCK_PISTON
             },
         );
-        let (px, py, pz) = (e.pos.0 as f64, e.pos.1 as f64 + 0.5, e.pos.2 as f64 + 0.5);
+        // The reference measures from the raw block coordinates.
+        let (px, py, pz) = (e.pos.0 as f64, e.pos.1 as f64, e.pos.2 as f64);
         let conns: Vec<ConnId> = self
             .players
             .iter()
