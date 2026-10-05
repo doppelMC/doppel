@@ -33,13 +33,12 @@ impl Default for LevelMeta {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 struct SpawnNbt {
-    #[serde(default = "overworld")]
     dimension: String,
+    #[serde(deserialize_with = "pos_any_array")]
     pos: fastnbt::IntArray,
-    #[serde(default)]
     yaw: f32,
-    #[serde(default)]
     pitch: f32,
 }
 
@@ -56,6 +55,28 @@ impl Default for SpawnNbt {
 
 fn overworld() -> String {
     "minecraft:overworld".into()
+}
+
+/// The reference writes the spawn position as a typed int array; the
+/// earlier doppel writer emitted an int list. Both shapes load.
+fn pos_any_array<'de, D>(deserializer: D) -> Result<fastnbt::IntArray, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let value = fastnbt::Value::deserialize(deserializer)?;
+    let ints = match value {
+        fastnbt::Value::IntArray(a) => a.into_inner(),
+        fastnbt::Value::List(items) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                fastnbt::Value::Int(i) => Some(i),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(fastnbt::IntArray::new(ints))
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -201,6 +222,33 @@ mod tests {
         std::fs::copy(&path, root.join("level.dat")).unwrap();
         let meta = load(&root).unwrap().expect("vanilla level.dat parses");
         assert_eq!(meta.spawn, (0, -60, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn level_parses_a_list_written_position() {
+        // The earlier doppel writer emitted the position as an int list;
+        // those worlds still load.
+        let mut spawn = std::collections::HashMap::new();
+        spawn.insert(
+            "pos".to_string(),
+            fastnbt::Value::List(vec![
+                fastnbt::Value::Int(7),
+                fastnbt::Value::Int(-60),
+                fastnbt::Value::Int(9),
+            ]),
+        );
+        let mut data = std::collections::HashMap::new();
+        data.insert("spawn".to_string(), fastnbt::Value::Compound(spawn));
+        let mut root = std::collections::HashMap::new();
+        root.insert("Data".to_string(), fastnbt::Value::Compound(data));
+        let nbt = fastnbt::to_bytes(&root).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&nbt).unwrap();
+        let root = dir("list");
+        std::fs::write(root.join("level.dat"), enc.finish().unwrap()).unwrap();
+        let meta = load(&root).unwrap().expect("list-written level.dat parses");
+        assert_eq!(meta.spawn, (7, -60, 9));
         let _ = std::fs::remove_dir_all(&root);
     }
 
