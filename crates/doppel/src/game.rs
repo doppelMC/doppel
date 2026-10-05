@@ -244,6 +244,8 @@ pub(crate) struct Player {
     /// The highest interaction sequence awaiting its block_changed_ack
     /// (one coalesced ack per listener tick, like the reference).
     pub(crate) ack_block_changes: Option<i32>,
+    /// The offline profile UUID the tab-list broadcasts key on.
+    pub(crate) uuid: [u8; 16],
 }
 
 /// One cached, versioned chunk. `wire` is the sendable form; block
@@ -812,6 +814,7 @@ impl Game {
                 }
                 let entity_id = self.next_entity_id;
                 self.next_entity_id += 1;
+                let uuid = crate::blobs::offline_uuid(&name);
                 self.players.insert(
                     conn,
                     Player {
@@ -831,6 +834,7 @@ impl Game {
                         entity_id,
                         dig: Default::default(),
                         ack_block_changes: None,
+                        uuid,
                     },
                 );
                 // --- tracker hooks (tracker.rs) ---
@@ -1009,26 +1013,19 @@ impl Game {
                 self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
             }
             Inbound::GameMode { conn, mode } => {
-                // The reference's wire order, three packets: the mode
-                // change itself syncs abilities (changeGameModeForPlayer
-                // calls onUpdateAbilities), then setGameMode sends
-                // game_event followed by the abilities again.
-                let flags = {
+                // The reference's wire order, five frames: the mode
+                // change itself syncs abilities and broadcasts the
+                // UPDATE_GAME_MODE info update to every player
+                // (changeGameModeForPlayer), then setGameMode sends
+                // game_event followed by the abilities again, and the
+                // command answers its feedback last. A same-mode switch
+                // is refused before any of it: nothing reaches the wire,
+                // not even the command feedback.
+                let (flags, uuid) = {
                     let Some(p) = self.players.get_mut(&conn) else {
                         return;
                     };
-                    // A same-mode switch changes nothing on the wire.
                     if p.inv.mode == mode {
-                        let name = match mode {
-                            GameMode::Survival => "Survival",
-                            GameMode::Creative => "Creative",
-                            GameMode::Adventure => "Adventure",
-                            GameMode::Spectator => "Spectator",
-                        };
-                        self.send_command_feedback(
-                            conn,
-                            &format!("Set own game mode to {name} Mode"),
-                        );
                         return;
                     }
                     p.inv.mode = mode;
@@ -1039,10 +1036,15 @@ impl Game {
                     } else if mode == GameMode::Spectator {
                         p.inv.flying = true;
                     }
-                    mode.ability_flags(p.inv.flying)
+                    (mode.ability_flags(p.inv.flying), p.uuid)
                 };
                 let abilities = crate::inventory::encode_player_abilities(flags, 0.05, 0.1);
                 self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
+                let info = crate::inventory::encode_player_info_update_game_mode(&uuid, mode.id());
+                let conns: Vec<ConnId> = self.players.keys().copied().collect();
+                for c in conns {
+                    self.send(c, crate::inventory::PACKET_PLAYER_INFO_UPDATE, &info);
+                }
                 self.send(
                     conn,
                     crate::inventory::PACKET_GAME_EVENT,
@@ -1052,13 +1054,10 @@ impl Game {
                     ),
                 );
                 self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
-                let name = match mode {
-                    GameMode::Survival => "Survival",
-                    GameMode::Creative => "Creative",
-                    GameMode::Adventure => "Adventure",
-                    GameMode::Spectator => "Spectator",
-                };
-                self.send_command_feedback(conn, &format!("Set own game mode to {name} Mode"));
+                self.send_command_feedback(
+                    conn,
+                    &format!("Set own game mode to {} Mode", mode.name()),
+                );
             }
             Inbound::Give { conn, item, count } => {
                 self.give_item(conn, &item, count);
@@ -1363,7 +1362,7 @@ impl Game {
         // new state's: a wire-to-wire write runs both, a removal only
         // the old, a placement only the new.
         if was_wire {
-            if let Some((_, props)) = old.filter(|_| was_wire) {
+            if let Some((_, props)) = old {
                 self.wire_indirect_shape_fan_props(x, y, z, &props);
             }
         }
@@ -2717,6 +2716,7 @@ impl Game {
                 entity_id,
                 dig: Default::default(),
                 ack_block_changes: None,
+                uuid: crate::blobs::offline_uuid("bot"),
             },
         );
         for c in chunks {

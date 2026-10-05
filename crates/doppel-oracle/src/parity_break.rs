@@ -911,7 +911,7 @@ fn block_events_at(pkts: &[bot::CapturedPacket], at: (i32, i32, i32)) -> Vec<Vec
 /// The game_event and abilities frames, in stream order.
 fn mode_frames(pkts: &[bot::CapturedPacket]) -> Vec<(i32, Vec<u8>)> {
     pkts.iter()
-        .filter(|p| matches!(p.id, 0x27 | 0x41))
+        .filter(|p| matches!(p.id, 0x27 | 0x41) || (p.id == 0x47 && p.head_hex.starts_with("04")))
         .map(|p| (p.id, hex::decode(&p.head_hex).unwrap_or_default()))
         .collect()
 }
@@ -1075,22 +1075,56 @@ pub fn parity_play() -> Result<bool> {
     // The oracle-pinned forms, so a both-sides regression cannot pass.
     let survival = || vec![0x00, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd];
     let creative = || vec![0x0d, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd];
+    let info = |mode: u8| {
+        let mut b = vec![0x04, 0x01];
+        b.extend_from_slice(&[
+            0xc8, 0x2d, 0x9a, 0x9e, 0xf1, 0xaa, 0x33, 0xeb, 0x93, 0x28, 0x3c, 0xc5, 0xd6, 0x79,
+            0x78, 0x42,
+        ]);
+        b.push(mode);
+        b
+    };
     let expect = vec![
         // The join burst's own pair (replayed blobs on both servers).
         (0x41i32, survival()),
         (0x27, vec![0x0d, 0x00, 0x00, 0x00, 0x00]),
-        // gamemode creative: abilities, game_event, abilities.
+        // gamemode creative: abilities, info update, game_event,
+        // abilities.
         (0x41, creative()),
+        (0x47, info(1)),
         (0x27, vec![0x03, 0x3f, 0x80, 0x00, 0x00]),
         (0x41, creative()),
         // gamemode survival.
         (0x41, survival()),
+        (0x47, info(0)),
         (0x27, vec![0x03, 0x00, 0x00, 0x00, 0x00]),
         (0x41, survival()),
     ];
     if vm != expect {
         failures.push(format!(
             "vanilla gamemode frames differ from the pinned forms: {vm:02x?}"
+        ));
+    }
+    // The raw same-mode flip after the volley must stay wire-silent.
+    let post_marker_modes = |pk: &[bot::CapturedPacket]| -> usize {
+        let marker = pk.iter().rposition(|p| p.id == 0x7c).map_or(0, |m| m + 1);
+        pk.iter()
+            .skip(marker)
+            .filter(|p| {
+                matches!(p.id, 0x27 | 0x41) || (p.id == 0x47 && p.head_hex.starts_with("04"))
+            })
+            .count()
+    };
+    let v_post = post_marker_modes(&v_off);
+    let d_post = post_marker_modes(&d_off);
+    if v_post != 0 {
+        failures.push(format!(
+            "vanilla emitted {v_post} mode frame(s) after the raw same-mode flip"
+        ));
+    }
+    if d_post != v_post {
+        failures.push(format!(
+            "same-mode flip silence: doppel {d_post} mode frame(s) vs vanilla {v_post}"
         ));
     }
 
@@ -1183,10 +1217,16 @@ fn run_play_sessions(
         "time set night".to_string(),
     ]
     .to_vec();
+    let mut same_mode = Vec::new();
+    doppel_protocol::write_string(&mut same_mode, "gamemode survival");
     let off_raw: Vec<(i32, Vec<u8>)> = vec![
         (0x2c, Vec::new()),
         (0x42, bot::build_use_item_on_top(30, 100, 10, 102)),
         (0x42, bot::build_use_item_on_top(26, 100, 12, 103)),
+        // The player already switched back to survival: the reference
+        // refuses a same-mode switch before any packet, feedback
+        // included.
+        (0x07, same_mode),
     ];
     let login = capture::login_start_c("Doppelist");
     let off = play_capture(

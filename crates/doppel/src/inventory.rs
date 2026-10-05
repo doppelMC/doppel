@@ -45,6 +45,9 @@ pub const PACKET_GAME_EVENT: i32 = 0x27;
 /// `player_abilities`: the join capture sends the survival form
 /// (flags 0, 0.05, 0.1) right after login and change_difficulty.
 pub const PACKET_PLAYER_ABILITIES: i32 = 0x41;
+/// `player_info_update`: a mode switch broadcasts the UPDATE_GAME_MODE
+/// action to every player between the two abilities packets.
+pub const PACKET_PLAYER_INFO_UPDATE: i32 = 0x47;
 
 /// The four game modes, registry-id order (the `game_event` param).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -68,6 +71,16 @@ impl GameMode {
     /// The creative flag the inventory, placement, and dig paths gate on.
     pub fn is_creative(self) -> bool {
         self == GameMode::Creative
+    }
+
+    /// The capitalized name the gamemode command feedback carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            GameMode::Survival => "Survival",
+            GameMode::Creative => "Creative",
+            GameMode::Adventure => "Adventure",
+            GameMode::Spectator => "Spectator",
+        }
     }
 
     pub fn parse(name: &str) -> Option<GameMode> {
@@ -119,6 +132,17 @@ pub fn encode_player_abilities(flags: u8, flying_speed: f32, walk_speed: f32) ->
     b.push(flags);
     b.extend_from_slice(&flying_speed.to_be_bytes());
     b.extend_from_slice(&walk_speed.to_be_bytes());
+    b
+}
+
+/// `player_info_update` body for one UPDATE_GAME_MODE entry: the action
+/// bitset (bit 2), the entry count, the player's UUID, the mode id.
+pub fn encode_player_info_update_game_mode(uuid: &[u8; 16], mode_id: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(19);
+    b.push(0x04);
+    b.push(0x01);
+    b.extend_from_slice(uuid);
+    doppel_protocol::write_varint(&mut b, mode_id);
     b
 }
 
@@ -2093,10 +2117,12 @@ mod tests {
     }
 
     /// The gamemode packets, byte for byte and in wire order: abilities,
-    /// game_event (mode id), abilities again.
+    /// player_info_update (UPDATE_GAME_MODE), game_event (mode id),
+    /// abilities again, the command feedback.
     #[test]
     fn gamemode_sends_game_event_then_abilities() {
         let (mut g, rx) = harness();
+        let uuid = g.players.get(&0).expect("player").uuid;
         g.handle(Inbound::GameMode {
             conn: 0,
             mode: crate::game::GameMode::Creative,
@@ -2108,6 +2134,7 @@ mod tests {
             order,
             vec![
                 PACKET_PLAYER_ABILITIES,
+                PACKET_PLAYER_INFO_UPDATE,
                 PACKET_GAME_EVENT,
                 PACKET_PLAYER_ABILITIES,
                 0x7c
@@ -2126,12 +2153,19 @@ mod tests {
             0xcd,
         ];
         assert_eq!(frames[0].1, creative_abilities, "leading abilities bytes");
+        let mut creative_info = vec![0x04, 0x01];
+        creative_info.extend_from_slice(&uuid);
+        creative_info.push(1);
         assert_eq!(
-            frames[1].1,
+            frames[1].1, creative_info,
+            "UPDATE_GAME_MODE info update bytes"
+        );
+        assert_eq!(
+            frames[2].1,
             vec![GAME_EVENT_CHANGE_GAME_MODE, 0x3f, 0x80, 0x00, 0x00],
             "creative game_event bytes"
         );
-        assert_eq!(frames[2].1, creative_abilities, "trailing abilities bytes");
+        assert_eq!(frames[3].1, creative_abilities, "trailing abilities bytes");
 
         g.handle(Inbound::GameMode {
             conn: 0,
@@ -2144,6 +2178,7 @@ mod tests {
             order,
             vec![
                 PACKET_PLAYER_ABILITIES,
+                PACKET_PLAYER_INFO_UPDATE,
                 PACKET_GAME_EVENT,
                 PACKET_PLAYER_ABILITIES,
                 0x7c
@@ -2151,15 +2186,49 @@ mod tests {
             "wire order (the reply trails)"
         );
         assert_eq!(
-            frames[1].1,
+            frames[2].1,
             vec![GAME_EVENT_CHANGE_GAME_MODE, 0, 0, 0, 0],
             "survival game_event bytes"
+        );
+        let mut survival_info = vec![0x04, 0x01];
+        survival_info.extend_from_slice(&uuid);
+        survival_info.push(0);
+        assert_eq!(
+            frames[1].1, survival_info,
+            "survival UPDATE_GAME_MODE bytes"
         );
         assert_eq!(
             frames[0].1,
             vec![0, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd],
             "survival abilities bytes"
         );
+    }
+
+    /// The UPDATE_GAME_MODE broadcast reaches every connected player,
+    /// not just the player whose mode changed.
+    #[test]
+    fn gamemode_info_update_reaches_every_player() {
+        use crate::game::Outbound;
+        use std::sync::mpsc::channel;
+        let (mut g, rx) = harness();
+        let (tx2, rx2) = channel();
+        g.join_viewer_for_test(1, &[(0, 0)], tx2);
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        let mut saw = [false, false];
+        for (rx, slot) in [(&rx, 0), (&rx2, 1)] {
+            while let Ok(f) = rx.try_recv() {
+                if let Outbound::Frame { id, .. } = f {
+                    if id == PACKET_PLAYER_INFO_UPDATE {
+                        saw[slot] = true;
+                    }
+                }
+            }
+        }
+        assert!(saw[0] && saw[1], "both players see the info update");
     }
 
     /// Every queued frame as (id, body).
@@ -2198,8 +2267,8 @@ mod tests {
         assert!(!g.player_inv_state_for_test(0).expect("player").flying);
     }
 
-    /// A same-mode switch sends only the feedback: no abilities, no
-    /// game_event.
+    /// A same-mode switch sends nothing at all: the reference refuses
+    /// the change before any packet or command feedback.
     #[test]
     fn same_mode_switch_sends_no_mode_packets() {
         let (mut g, rx) = harness();
@@ -2214,15 +2283,11 @@ mod tests {
             mode: crate::game::GameMode::Creative,
         });
         g.flush_connections();
-        let mut mode_frames = 0;
-        while let Ok(f) = rx.try_recv() {
-            if let Outbound::Frame { id, .. } = f {
-                if id == PACKET_GAME_EVENT || id == PACKET_PLAYER_ABILITIES {
-                    mode_frames += 1;
-                }
-            }
+        let mut frames = 0;
+        while rx.try_recv().is_ok() {
+            frames += 1;
         }
-        assert_eq!(mode_frames, 0, "a same-mode switch is wire-silent");
+        assert_eq!(frames, 0, "a same-mode switch is wire-silent");
     }
 
     /// The parse side of the flight toggle.
