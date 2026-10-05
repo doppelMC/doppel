@@ -142,13 +142,14 @@ pub enum Inbound {
         conn: ConnId,
         enabled: bool,
     },
-    /// `summon <kind> <x> <y> <z>`: the deterministic spawn driver.
+    /// `summon <kind> [x y z]`: the deterministic spawn driver. Without
+    /// coordinates the mob spawns at the sender's feet.
     Summon {
         conn: ConnId,
         kind: String,
-        x: f64,
-        y: f64,
-        z: f64,
+        x: Option<f64>,
+        y: Option<f64>,
+        z: Option<f64>,
     },
     /// `difficulty <word>`: peaceful removes monsters.
     SetDifficulty {
@@ -1112,8 +1113,17 @@ impl Game {
                 y,
                 z,
             } => {
-                self.spawn_named(&kind, x, y, z);
-                self.send_command_feedback(conn, &format!("Summoned {kind}"));
+                let (px, py, pz) = self
+                    .players
+                    .get(&conn)
+                    .map(|p| (p.x, p.y, p.z))
+                    .unwrap_or((0.0, 0.0, 0.0));
+                let at = (x.unwrap_or(px), y.unwrap_or(py), z.unwrap_or(pz));
+                if self.spawn_named(&kind, at.0, at.1, at.2) {
+                    self.send_command_feedback(conn, &format!("Summoned {kind}"));
+                } else {
+                    self.send_command_feedback(conn, &format!("Unable to summon {kind}"));
+                }
             }
             _ => {}
         }

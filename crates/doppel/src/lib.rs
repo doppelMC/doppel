@@ -711,8 +711,18 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
         };
         return Some(game::Inbound::TimeSet { conn, value });
     }
-    // `summon <kind> <x> <y> <z>`: the mobs gate's deterministic
-    // spawn driver.
+    // `summon <kind> [x y z]`: the mobs gate's deterministic spawn
+    // driver; the bare form spawns at the sender. Kind names carry no
+    // namespace by default.
+    if parts.len() == 2 && parts[0] == "summon" {
+        return Some(game::Inbound::Summon {
+            conn,
+            kind: namespaced(parts[1]),
+            x: None,
+            y: None,
+            z: None,
+        });
+    }
     if parts.len() == 5 && parts[0] == "summon" {
         if let (Ok(x), Ok(y), Ok(z)) = (
             parts[2].parse::<f64>(),
@@ -721,10 +731,10 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
         ) {
             return Some(game::Inbound::Summon {
                 conn,
-                kind: parts[1].to_string(),
-                x,
-                y,
-                z,
+                kind: namespaced(parts[1]),
+                x: Some(x),
+                y: Some(y),
+                z: Some(z),
             });
         }
     }
@@ -738,6 +748,15 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
         return Some(game::Inbound::SetDifficulty { conn, peaceful });
     }
     None
+}
+
+/// Applies the default `minecraft:` namespace to a bare identifier.
+fn namespaced(name: &str) -> String {
+    if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    }
 }
 
 // ---------------------------------------------------------------------------

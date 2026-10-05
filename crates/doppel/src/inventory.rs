@@ -451,6 +451,15 @@ pub fn item_id(name: &str) -> Option<i32> {
     item_table().id_of(name)
 }
 
+/// Reverse lookup over the full registry pin.
+pub fn item_name_full(id: i32) -> Option<String> {
+    item_table()
+        .by_name
+        .iter()
+        .find(|(_, v)| **v == id)
+        .map(|(k, _)| k.clone())
+}
+
 /// Reverse lookup over the curated subset (block-entity NBT writes item
 /// names, not ids; full-registry reverse lookup arrives with the pin's
 /// consumers).

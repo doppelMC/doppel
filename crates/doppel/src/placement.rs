@@ -456,6 +456,21 @@ pub fn block_item_form(item: i32) -> Option<(&'static str, Form)> {
 }
 
 impl Game {
+    /// The block an item places: the curated families first (their forms
+    /// carry per-family geometry), then any item whose name is a block
+    /// in the registry places with its default state. Items that are
+    /// not blocks resolve to None.
+    fn block_form_for_item(&self, item: i32) -> Option<(String, Form)> {
+        if let Some((block, form)) = block_item_form(item) {
+            return Some((block.to_string(), form));
+        }
+        let name = crate::inventory::item_name_full(item)?;
+        let known = self.registry.as_ref()?.state_id(&name, "").is_some();
+        known.then_some((name, Form::Plain))
+    }
+}
+
+impl Game {
     /// Serverbound use_item_on: resolve the held block item against the
     /// clicked face, place it, and spend one item (survival). The parse
     /// and the per-family geometry live in placement.rs.
@@ -498,7 +513,7 @@ impl Game {
                     .inv
                     .inventory
                     .get(selected)
-                    .is_some_and(|s| crate::placement::block_item_form(s.item()).is_some());
+                    .is_some_and(|s| self.block_form_for_item(s.item()).is_some());
                 if main_holds_block {
                     return;
                 }
@@ -509,7 +524,7 @@ impl Game {
                 .inventory
                 .get(slot)
                 .as_ref()
-                .and_then(|s| crate::placement::block_item_form(s.item()))
+                .and_then(|s| self.block_form_for_item(s.item()))
             else {
                 eprintln!(
                     "[game] use_item_on at ({x},{y},{z}) face {face}: no block item in slot {slot}"
@@ -518,7 +533,7 @@ impl Game {
             };
             (slot, block, form, p.yaw, p.pitch, p.inv.creative)
         };
-        let Some(spec) = form.spec(block, face, yaw, pitch) else {
+        let Some(spec) = form.spec(&block, face, yaw, pitch) else {
             eprintln!("[game] use_item_on: no form for {block} face {face}");
             return;
         };

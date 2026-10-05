@@ -118,7 +118,7 @@ pub fn monsters_burn(t: u64) -> bool {
 
 impl Game {
     /// The named-kind summon: the mobs gate's deterministic driver.
-    pub(crate) fn spawn_named(&mut self, kind: &str, x: f64, y: f64, z: f64) {
+    pub(crate) fn spawn_named(&mut self, kind: &str, x: f64, y: f64, z: f64) -> bool {
         let mob: Option<Box<dyn MobKind>> = match kind {
             "minecraft:zombie" => Some(Box::new(Zombie::new())),
             "minecraft:skeleton" => Some(Box::new(Skeleton::new())),
@@ -126,8 +126,12 @@ impl Game {
             "minecraft:spider" => Some(Box::new(Spider::new())),
             _ => None,
         };
-        if let Some(mob) = mob {
-            self.spawn_mob(x, y, z, mob);
+        match mob {
+            Some(mob) => {
+                self.spawn_mob(x, y, z, mob);
+                true
+            }
+            None => false,
         }
     }
 
@@ -510,9 +514,9 @@ mod tests {
         g.handle(Inbound::Summon {
             conn: 0,
             kind: "minecraft:skeleton".into(),
-            x: 8.5,
-            y: 100.0,
-            z: 0.5,
+            x: Some(8.5),
+            y: Some(100.0),
+            z: Some(0.5),
         });
         for _ in 0..180 {
             g.tick_once_for_test();
@@ -529,9 +533,9 @@ mod tests {
         g.handle(Inbound::Summon {
             conn: 0,
             kind: "minecraft:spider".into(),
-            x: 44.5,
-            y: 100.0,
-            z: 8.5,
+            x: Some(44.5),
+            y: Some(100.0),
+            z: Some(8.5),
         });
         for _ in 0..90 {
             g.tick_once_for_test();
@@ -548,9 +552,9 @@ mod tests {
         g.handle(Inbound::Summon {
             conn: 0,
             kind: "minecraft:creeper".into(),
-            x: 4.5,
-            y: 100.0,
-            z: 36.5,
+            x: Some(4.5),
+            y: Some(100.0),
+            z: Some(36.5),
         });
         for _ in 0..140 {
             g.tick_once_for_test();
