@@ -158,7 +158,7 @@ pub fn encode_float_data(entity_id: i32, accessor: u8, value: f32) -> Vec<u8> {
 }
 
 /// Entity-data serializer ids (registration order): BOOLEAN.
-pub const SER_BOOLEAN: i32 = 10;
+pub const SER_BOOLEAN: i32 = 8;
 
 /// `set_entity_data` for an int entry (the swell direction). Int
 /// values ride the entity-data channel as varints.
@@ -208,19 +208,20 @@ pub fn encode_update_attributes(entity_id: i32, attrs: &[(i32, f64)]) -> Vec<u8>
     body
 }
 
-/// `move_entity_pos`: id, three 1/4096-block shorts, on-ground.
+/// `move_entity_pos`: id, the properties varint (on-ground bit 0, step
+/// count 0), then the linear delta in 1/4096-block units.
 pub fn encode_move_pos(entity_id: i32, dx: i64, dy: i64, dz: i64, on_ground: bool) -> Vec<u8> {
-    let mut body = Vec::with_capacity(9);
+    let mut body = Vec::with_capacity(10);
     write_varint(&mut body, entity_id);
+    write_varint(&mut body, i32::from(on_ground));
     body.extend_from_slice(&(dx as i16).to_be_bytes());
     body.extend_from_slice(&(dy as i16).to_be_bytes());
     body.extend_from_slice(&(dz as i16).to_be_bytes());
-    body.push(u8::from(on_ground));
     body
 }
 
-/// `move_entity_pos_rot`: the delta shorts plus the packed rotations.
-/// The yaw/pitch byte order carries a TODO until the gate pins it.
+/// `move_entity_pos_rot`: the properties varint, the delta shorts, then
+/// the packed rotations. No trailing on-ground byte.
 pub fn encode_move_pos_rot(
     entity_id: i32,
     dx: i64,
@@ -232,22 +233,22 @@ pub fn encode_move_pos_rot(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(11);
     write_varint(&mut body, entity_id);
+    write_varint(&mut body, i32::from(on_ground));
     body.extend_from_slice(&(dx as i16).to_be_bytes());
     body.extend_from_slice(&(dy as i16).to_be_bytes());
     body.extend_from_slice(&(dz as i16).to_be_bytes());
     body.push(yaw);
     body.push(pitch);
-    body.push(u8::from(on_ground));
     body
 }
 
-/// `move_entity_rot`: id, packed yaw, packed pitch, on-ground.
+/// `move_entity_rot`: id, packed yaw, packed pitch. No on-ground byte.
 pub fn encode_move_rot(entity_id: i32, yaw: u8, pitch: u8, on_ground: bool) -> Vec<u8> {
+    let _ = on_ground;
     let mut body = Vec::with_capacity(6);
     write_varint(&mut body, entity_id);
     body.push(yaw);
     body.push(pitch);
-    body.push(u8::from(on_ground));
     body
 }
 
