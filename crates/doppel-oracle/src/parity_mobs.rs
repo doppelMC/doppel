@@ -571,7 +571,7 @@ pub fn parity_mobs() -> Result<bool> {
     }
     let protocol = pin.protocol.unwrap_or(0);
 
-    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world, vanilla_port())?;
 
     // Vanilla reference sessions, one boot per scenario: a session
     // whose bot dies never idles out (keep-alives keep the read loop

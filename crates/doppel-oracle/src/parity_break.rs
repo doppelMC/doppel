@@ -106,8 +106,9 @@ pub(crate) fn capture_clean_blobs(
     jar: &std::path::Path,
     blobs_dir: &std::path::Path,
     pristine_world: &std::path::Path,
+    port: u16,
 ) -> Result<()> {
-    let server = vanilla::boot(pin, jar, VANILLA_PORT)?;
+    let server = vanilla::boot(pin, jar, port)?;
     std::thread::sleep(Duration::from_secs(2));
     if pristine_world.exists() {
         std::fs::remove_dir_all(pristine_world)?;
@@ -1457,7 +1458,7 @@ pub fn parity_break() -> Result<bool> {
     let protocol = pin.protocol.unwrap_or(0);
 
     // 1. Clean blobs + pristine world.
-    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world, VANILLA_PORT)?;
 
     // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
     // idle timers, so the phase carries its own wall-clock bound: closing

@@ -1286,7 +1286,7 @@ fn run_survival_sessions() -> Result<SurvivalSessions> {
     }
     let protocol = pin.protocol.unwrap_or(0);
 
-    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world, vanilla_port())?;
 
     // Vanilla reference sessions; the deadline ends the idle-fed
     // captures, and with them the random tick window. The peaceful boot
