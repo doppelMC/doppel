@@ -2413,12 +2413,12 @@ impl Game {
                     let wire = flat.generate(cx, cz);
                     drop(w);
                     slot.insert(CachedChunk { wire, version: 0 });
-                    // The filled cache slot serves a plain re-entry.
-                    let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone())
-                    else {
+                    // The filled cache slot serves a plain re-entry; the
+                    // reference blobs are optional on this path.
+                    let Some(world) = self.world.clone() else {
                         anyhow::bail!("chunk cached but no world to reload it");
                     };
-                    return self.load_chunk(&world, Some(&blobs), cx, cz);
+                    return self.load_chunk(&world, self.blobs.as_ref(), cx, cz);
                 }
             };
             let reference = blobs.and_then(|blobs| {
