@@ -863,7 +863,6 @@ impl MenuSession {
 /// Per-player inventory state: the inventory itself, the always-open
 /// inventory menu's session (containerId 0), and the materials flag
 /// gating CLONE / clone-drags.
-#[derive(Default)]
 pub struct PlayerInvState {
     pub inventory: PlayerInventory,
     /// The inventory menu's click session.
@@ -876,9 +875,26 @@ pub struct PlayerInvState {
     pub flying: bool,
     /// `abilities.mayfly`: granted by creative and spectator.
     pub mayfly: bool,
+    /// The current mode; a same-mode switch sends nothing but the
+    /// command feedback (the reference's changeGameModeForPlayer).
+    pub mode: GameMode,
     /// Slots changed outside a click (a placement's spent stack, a drop)
     /// awaiting the per-tick menu broadcast.
     pub pending_sync: std::collections::BTreeSet<usize>,
+}
+
+impl Default for PlayerInvState {
+    fn default() -> Self {
+        PlayerInvState {
+            inventory: PlayerInventory::default(),
+            session: MenuSession::default(),
+            creative: false,
+            flying: false,
+            mayfly: false,
+            mode: GameMode::Survival,
+            pending_sync: std::collections::BTreeSet::new(),
+        }
+    }
 }
 
 /// The slot access a menu's click engine runs against: menu slot ids
@@ -2180,6 +2196,33 @@ mod tests {
             flying: false,
         });
         assert!(!g.player_inv_state_for_test(0).expect("player").flying);
+    }
+
+    /// A same-mode switch sends only the feedback: no abilities, no
+    /// game_event.
+    #[test]
+    fn same_mode_switch_sends_no_mode_packets() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        while rx.try_recv().is_ok() {}
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        let mut mode_frames = 0;
+        while let Ok(f) = rx.try_recv() {
+            if let Outbound::Frame { id, .. } = f {
+                if id == PACKET_GAME_EVENT || id == PACKET_PLAYER_ABILITIES {
+                    mode_frames += 1;
+                }
+            }
+        }
+        assert_eq!(mode_frames, 0, "a same-mode switch is wire-silent");
     }
 
     /// The parse side of the flight toggle.

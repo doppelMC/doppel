@@ -1017,6 +1017,21 @@ impl Game {
                     let Some(p) = self.players.get_mut(&conn) else {
                         return;
                     };
+                    // A same-mode switch changes nothing on the wire.
+                    if p.inv.mode == mode {
+                        let name = match mode {
+                            GameMode::Survival => "Survival",
+                            GameMode::Creative => "Creative",
+                            GameMode::Adventure => "Adventure",
+                            GameMode::Spectator => "Spectator",
+                        };
+                        self.send_command_feedback(
+                            conn,
+                            &format!("Set own game mode to {name} Mode"),
+                        );
+                        return;
+                    }
+                    p.inv.mode = mode;
                     p.inv.creative = mode.is_creative();
                     p.inv.mayfly = matches!(mode, GameMode::Creative | GameMode::Spectator);
                     if !p.inv.mayfly {
@@ -1344,13 +1359,16 @@ impl Game {
             .as_ref()
             .and_then(|r| r.state_of(state))
             .is_some_and(|(n, _)| n == "minecraft:redstone_wire");
+        // The reference runs the old state's indirect fan and then the
+        // new state's: a wire-to-wire write runs both, a removal only
+        // the old, a placement only the new.
+        if was_wire {
+            if let Some((_, props)) = old.filter(|_| was_wire) {
+                self.wire_indirect_shape_fan_props(x, y, z, &props);
+            }
+        }
         if is_wire {
-            // The new wire's own connections fan to its diagonals.
             self.wire_indirect_shape_fan(x, y, z);
-        } else if let Some((_, props)) = old.filter(|_| was_wire) {
-            // A removed wire fans from the connections it had (the
-            // reference runs the old state's indirect shape fan).
-            self.wire_indirect_shape_fan_props(x, y, z, &props);
         }
         // --- containers hooks (containers.rs) ---
         // A successful write re-syncs the block-entity map with the block.
