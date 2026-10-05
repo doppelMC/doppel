@@ -142,6 +142,14 @@ pub enum Inbound {
         conn: ConnId,
         enabled: bool,
     },
+    /// `summon <kind> <x> <y> <z>`: the deterministic spawn driver.
+    Summon {
+        conn: ConnId,
+        kind: String,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
     /// `difficulty <word>`: peaceful removes monsters.
     SetDifficulty {
         conn: ConnId,
@@ -274,7 +282,7 @@ pub struct Game {
     /// not have, built from the same registry pins.
     flat: Option<doppel_world::worldgen::FlatGenerator>,
     /// Monotonic game tick.
-    tick: u64,
+    pub(crate) tick: u64,
     /// Day time in ticks, set by `time set` and carried by set_time.
     pub(crate) day_time: i64,
     /// Scheduled actions: fire at tick T with a behavior tag.
@@ -313,6 +321,9 @@ pub struct Game {
     // --- persistence hooks (persistence.rs) ---
     /// Dirty-chunk tracking and the autosave cadence.
     pub(crate) persistence: crate::persistence::Persistence,
+    // --- projectile hooks (projectile.rs) ---
+    /// Live arrows.
+    pub(crate) projectiles: crate::projectile::ProjectileState,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -464,6 +475,7 @@ impl Game {
             mobs: Default::default(),
             spawning: Default::default(),
             persistence: Default::default(),
+            projectiles: Default::default(),
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -720,7 +732,13 @@ impl Game {
         let (Some(world), blobs) = (self.world.clone(), self.blobs.clone()) else {
             return false;
         };
-        self.load_chunk(&world, blobs.as_ref(), cx, cz).is_ok()
+        match self.load_chunk(&world, blobs.as_ref(), cx, cz) {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("[game] chunk ({cx},{cz}) load failed: {e:#}");
+                false
+            }
+        }
     }
 
     /// The next entity id from the shared counter.
@@ -843,7 +861,7 @@ impl Game {
             }
             // --- survival hooks (entities.rs) ---
             // --- mob hooks (living.rs / spawning.rs) ---
-            Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } => {
+            Inbound::SpawnMobs { .. } | Inbound::SetDifficulty { .. } | Inbound::Summon { .. } => {
                 self.apply_mob_command(event);
             }
             // --- placement hooks (placement.rs) ---
@@ -1072,7 +1090,7 @@ impl Game {
     }
 
     /// The mob-hook commands: apply the state, then acknowledge; the
-    /// three share one reply path and differ only in their writes.
+    /// four share one reply path and differ only in their writes.
     fn apply_mob_command(&mut self, event: Inbound) {
         match event {
             Inbound::SpawnMobs { conn, enabled } => {
@@ -1085,6 +1103,17 @@ impl Game {
                 self.spawning.peaceful = peaceful;
                 let what = if peaceful { "Peaceful" } else { "Normal" };
                 self.send_command_feedback(conn, &format!("Set difficulty to {what}"));
+            }
+
+            Inbound::Summon {
+                conn,
+                kind,
+                x,
+                y,
+                z,
+            } => {
+                self.spawn_named(&kind, x, y, z);
+                self.send_command_feedback(conn, &format!("Summoned {kind}"));
             }
             _ => {}
         }
@@ -2364,16 +2393,33 @@ impl Game {
     ) -> anyhow::Result<&CachedChunk> {
         if let std::collections::btree_map::Entry::Vacant(slot) = self.chunks.entry((cx, cz)) {
             let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(anvil) = w.dir.chunk(cx, cz)? else {
-                // No stored chunk: fall back to flat generation so
-                // streaming extends past whatever the world has saved.
-                let Some(flat) = &self.flat else {
-                    anyhow::bail!("chunk not generated and flat fallback unavailable");
-                };
-                let wire = flat.generate(cx, cz);
-                drop(w);
-                slot.insert(CachedChunk { wire, version: 0 });
-                return Ok(self.chunks.get(&(cx, cz)).expect("present: inserted above"));
+            let stored = w.dir.chunk(cx, cz)?;
+            // Stored chunks below the full status are worldgen stubs
+            // with no terrain; a live server would finish generating
+            // them on demand, so the flat generator stands in.
+            let anvil = match stored {
+                Some(chunk)
+                    if chunk
+                        .status
+                        .trim_start_matches("minecraft:")
+                        .eq_ignore_ascii_case("full") =>
+                {
+                    chunk
+                }
+                _ => {
+                    let Some(flat) = &self.flat else {
+                        anyhow::bail!("chunk not generated and flat fallback unavailable");
+                    };
+                    let wire = flat.generate(cx, cz);
+                    drop(w);
+                    slot.insert(CachedChunk { wire, version: 0 });
+                    // The filled cache slot serves a plain re-entry.
+                    let (Some(world), Some(blobs)) = (self.world.clone(), self.blobs.clone())
+                    else {
+                        anyhow::bail!("chunk cached but no world to reload it");
+                    };
+                    return self.load_chunk(&world, Some(&blobs), cx, cz);
+                }
             };
             let reference = blobs.and_then(|blobs| {
                 blobs.play.iter().find_map(|(id, body)| {

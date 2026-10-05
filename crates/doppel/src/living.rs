@@ -27,9 +27,10 @@ pub const PACKET_MOVE_ENTITY_ROT: i32 = 0x39;
 /// `rotate_head`: registration order 86. TODO wire-verify at the gate.
 pub const PACKET_ROTATE_HEAD: i32 = 0x55;
 /// `set_equipment`: registration order 105. Bare mobs send none (the
-/// packet only carries non-empty slots); the id stays pinned.
-#[allow(dead_code)]
+/// packet only carries non-empty slots).
 pub const PACKET_SET_EQUIPMENT: i32 = 0x68;
+/// Equipment slot ordinals (declaration order): main hand.
+pub const EQUIP_MAIN_HAND: u8 = 0;
 /// `update_attributes`: registration order 135. TODO wire-verify at the
 /// gate.
 pub const PACKET_UPDATE_ATTRIBUTES: i32 = 0x86;
@@ -37,6 +38,15 @@ pub const PACKET_UPDATE_ATTRIBUTES: i32 = 0x86;
 /// `minecraft:zombie` in the entity-type registry (registration order
 /// 155, 0-based). TODO wire-verify at the gate.
 pub const ENTITY_TYPE_ZOMBIE: i32 = 154;
+/// `minecraft:skeleton` (registration order 119, 0-based).
+/// TODO wire-verify at the gate.
+pub const ENTITY_TYPE_SKELETON: i32 = 118;
+/// `minecraft:creeper` (registration order 33, 0-based).
+/// TODO wire-verify at the gate.
+pub const ENTITY_TYPE_CREEPER: i32 = 32;
+/// `minecraft:spider` (registration order 128, 0-based).
+/// TODO wire-verify at the gate.
+pub const ENTITY_TYPE_SPIDER: i32 = 127;
 
 // ---------------------------------------------------------------------
 // Entity data and attributes
@@ -44,6 +54,8 @@ pub const ENTITY_TYPE_ZOMBIE: i32 = 154;
 
 /// Entity-data serializer ids (registration order): BYTE.
 pub const SER_BYTE: i32 = 0;
+/// Entity-data serializer ids (registration order): INT.
+pub const SER_INT: i32 = 1;
 /// Entity-data serializer ids (registration order): FLOAT.
 pub const SER_FLOAT: i32 = 3;
 /// The base entity flags accessor; bit 0x01 = on fire.
@@ -52,11 +64,21 @@ pub const DATA_ENTITY_FLAGS: u8 = 0;
 pub const DATA_LIVING_HEALTH: u8 = 9;
 /// The mob flags accessor; bit 0x04 = aggressive.
 pub const DATA_MOB_FLAGS: u8 = 15;
+/// The wall-crawler's flag byte accessor (bit 0x01 = climbing).
+pub const DATA_CLIMBING_FLAGS: u8 = 16;
+/// The creeper's swell-direction accessor (INT: -1 shrinking, 1
+/// swelling).
+pub const DATA_SWELL_DIR: u8 = 16;
 
 /// `movement_speed` in the attribute registry (alphabetical
 /// registration); wire-verified: the reference's zombie snapshot carries
 /// it alone (default-valued attributes are omitted).
 pub const ATTR_MOVEMENT_SPEED: i32 = 26;
+/// `max_health` in the attribute registry (alphabetical registration).
+/// TODO wire-verify at the gate.
+pub const ATTR_MAX_HEALTH: i32 = 23;
+/// The max-health attribute's registry default; the pairing omits it.
+const DEFAULT_MAX_HEALTH: f32 = 20.0;
 /// A player's full health bar; mob melee damage beyond it means the
 /// player is down and no longer a target.
 const PLAYER_HEALTH: f32 = 20.0;
@@ -89,8 +111,6 @@ const V_MIN: f64 = 0.003;
 const JUMP_POWER: f64 = 0.42;
 /// Ticks between jump control firings.
 const JUMP_DELAY: i32 = 10;
-/// Forward input per unit speed modifier at the default attribute.
-const BASE_SPEED: f64 = 0.23;
 /// Mob tracking range: clientTrackingRange 8 chunks.
 pub const MOB_TRACK_RANGE: f64 = 128.0;
 /// Movement sync cadence: the tracker updateInterval for mob types.
@@ -117,6 +137,10 @@ const DESPAWN_ROLL: u64 = 800;
 const DEATH_TICKS: i32 = 20;
 /// Body-yaw turn cap per tick (the move control's 90 degrees).
 const TURN_RATE: f32 = 90.0;
+/// Player eye height above the feet.
+pub const PLAYER_EYE: f64 = 1.62;
+/// The climb rise per tick while pressed against a wall.
+const CLIMB_RISE: f64 = 0.2;
 
 // ---------------------------------------------------------------------
 // Wire encoders
@@ -129,6 +153,32 @@ pub fn encode_float_data(entity_id: i32, accessor: u8, value: f32) -> Vec<u8> {
     body.push(accessor);
     write_varint(&mut body, SER_FLOAT);
     body.extend_from_slice(&value.to_be_bytes());
+    body.push(0xff);
+    body
+}
+
+/// Entity-data serializer ids (registration order): BOOLEAN.
+pub const SER_BOOLEAN: i32 = 10;
+
+/// `set_entity_data` for an int entry (the swell direction). Int
+/// values ride the entity-data channel as varints.
+pub fn encode_int_data(entity_id: i32, accessor: u8, value: i32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(10);
+    write_varint(&mut body, entity_id);
+    body.push(accessor);
+    write_varint(&mut body, SER_INT);
+    write_varint(&mut body, value);
+    body.push(0xff);
+    body
+}
+
+/// `set_entity_data` for a boolean entry.
+pub fn encode_boolean_data(entity_id: i32, accessor: u8, value: bool) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    write_varint(&mut body, entity_id);
+    body.push(accessor);
+    write_varint(&mut body, SER_BOOLEAN);
+    body.push(u8::from(value));
     body.push(0xff);
     body
 }
@@ -236,9 +286,52 @@ pub fn encode_damage_event(entity_id: i32, damage_type: i32, cause: i32, direct:
     body
 }
 
+/// `set_equipment`: id, then (slot byte, stack) pairs; the 0x80 bit on
+/// the slot byte marks a following entry.
+pub fn encode_equipment(entity_id: i32, slots: &[(u8, &crate::inventory::ItemStack)]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + slots.len() * 6);
+    write_varint(&mut body, entity_id);
+    for (i, (slot, stack)) in slots.iter().enumerate() {
+        let more = if i + 1 < slots.len() { 0x80 } else { 0x00 };
+        body.push(slot | more);
+        crate::inventory::encode_item_stack(&mut body, Some(stack));
+    }
+    body
+}
+
 /// Degrees packed to the wire byte: `deg * 256 / 360`.
 pub fn pack_degrees(deg: f32) -> u8 {
     (deg * 256.0 / 360.0) as i8 as u8
+}
+
+/// Whether the sight line between two eye points is clear.
+pub(crate) fn visible(world: &Game, from: (f64, f64, f64), to: (f64, f64, f64)) -> bool {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    let steps = (dist * 2.0).ceil() as i32;
+    for s in 1..steps {
+        let t = s as f64 / steps as f64;
+        let (x, y, z) = (from.0 + dx * t, from.1 + dy * t, from.2 + dz * t);
+        if block_solid(world, x.floor() as i32, y.floor() as i32, z.floor() as i32) {
+            return false;
+        }
+    }
+    true
+}
+
+/// An eye position `eye` blocks above the feet.
+pub(crate) fn eye_at(eye: f64, pos: (f64, f64, f64)) -> (f64, f64, f64) {
+    (pos.0, pos.1 + eye, pos.2)
+}
+
+/// The look angles from an eye point toward a target point.
+pub(crate) fn look_angles(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f32, f32) {
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    let horiz = (dx * dx + dz * dz).sqrt();
+    (
+        (-dx).atan2(dz).to_degrees() as f32,
+        -dy.atan2(horiz).to_degrees() as f32,
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -444,6 +537,400 @@ impl Default for GoalSelector {
 }
 
 // ---------------------------------------------------------------------
+// Shared goals
+// ---------------------------------------------------------------------
+
+/// The local brightness ratio: the darkened sky light over 15, zero
+/// under cover (block light stays unmodeled).
+pub(crate) fn brightness(world: &Game, body: &MobBody) -> f64 {
+    let eye = (
+        body.x.floor() as i32,
+        (body.y + 1.0) as i32,
+        body.z.floor() as i32,
+    );
+    if world.sky_exposed(eye.0, eye.1, eye.2) {
+        (15 - crate::spawning::sky_darken(world.spawning.day_time)).max(0) as f64 / 15.0
+    } else {
+        0.0
+    }
+}
+
+/// The idle stroll: a random nearby column on a roll.
+pub(crate) struct IdleStrollGoal {
+    range: i64,
+    chance: u64,
+    give_up: i32,
+    speed: f64,
+}
+
+impl IdleStrollGoal {
+    pub(crate) fn new(range: i64, chance: u64, give_up: i32, speed: f64) -> IdleStrollGoal {
+        IdleStrollGoal {
+            range,
+            chance,
+            give_up,
+            speed,
+        }
+    }
+}
+
+impl Goal for IdleStrollGoal {
+    fn flags(&self) -> GoalFlags {
+        GoalFlags::MOVE
+    }
+
+    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        if ctx.body.no_action_time >= 100 {
+            return false;
+        }
+        if ctx.below(self.chance) != 0 {
+            return false;
+        }
+        let span = (self.range * 2 + 1) as u64;
+        let x = ctx.body.x + (ctx.below(span) as f64 - self.range as f64);
+        let z = ctx.body.z + (ctx.below(span) as f64 - self.range as f64);
+        ctx.body.nav.move_to(x, z, self.speed);
+        true
+    }
+
+    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        ctx.body.nav.in_progress() && ctx.body.nav.tick_age(self.give_up)
+    }
+}
+
+/// Look at the nearest visible player inside the range.
+pub(crate) struct WatchPlayerGoal {
+    range: f64,
+    chance: u64,
+    remaining: i32,
+    duration: i32,
+    conn: Option<ConnId>,
+}
+
+impl WatchPlayerGoal {
+    pub(crate) fn new(range: f64, chance: u64) -> WatchPlayerGoal {
+        WatchPlayerGoal {
+            range,
+            chance,
+            remaining: 0,
+            duration: 0,
+            conn: None,
+        }
+    }
+}
+
+impl Goal for WatchPlayerGoal {
+    fn flags(&self) -> GoalFlags {
+        GoalFlags::LOOK
+    }
+
+    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        if ctx.below(self.chance) != 0 {
+            return false;
+        }
+        let Some((conn, pos)) = ctx.nearest_player(self.range) else {
+            return false;
+        };
+        if !visible(ctx.world, eye_of(ctx.body), eye_at(PLAYER_EYE, pos)) {
+            return false;
+        }
+        self.conn = Some(conn);
+        self.duration = 20 + ctx.below(20) as i32;
+        true
+    }
+
+    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        self.remaining > 0
+            && self.conn.is_some_and(|c| {
+                ctx.player_pos(c).is_some_and(|p| {
+                    let (dx, dy, dz) = (p.0 - ctx.body.x, p.1 - ctx.body.y, p.2 - ctx.body.z);
+                    dx * dx + dy * dy + dz * dz < (self.range + 1.0) * (self.range + 1.0)
+                })
+            })
+    }
+
+    fn start(&mut self, _ctx: &mut GoalCtx) {
+        self.remaining = self.duration;
+    }
+
+    fn stop(&mut self, ctx: &mut GoalCtx) {
+        ctx.body.look = None;
+    }
+
+    fn tick(&mut self, ctx: &mut GoalCtx) {
+        self.remaining -= 1;
+        if let Some(conn) = self.conn {
+            if let Some(pos) = ctx.player_pos(conn) {
+                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, pos)));
+            }
+        }
+    }
+}
+
+/// A random horizontal glance.
+pub(crate) struct GlanceGoal {
+    chance: u64,
+    remaining: i32,
+    duration: i32,
+    want: (f32, f32),
+}
+
+impl GlanceGoal {
+    pub(crate) fn new(chance: u64) -> GlanceGoal {
+        GlanceGoal {
+            chance,
+            remaining: 0,
+            duration: 0,
+            want: (0.0, 0.0),
+        }
+    }
+}
+
+impl Goal for GlanceGoal {
+    fn flags(&self) -> GoalFlags {
+        GoalFlags::MOVE.union(GoalFlags::LOOK)
+    }
+
+    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        if ctx.below(self.chance) != 0 {
+            return false;
+        }
+        self.want = (ctx.below(360) as f32, 0.0);
+        self.duration = 20 + ctx.below(20) as i32;
+        true
+    }
+
+    fn can_continue_to_use(&mut self, _ctx: &mut GoalCtx) -> bool {
+        self.remaining > 0
+    }
+
+    fn start(&mut self, _ctx: &mut GoalCtx) {
+        self.remaining = self.duration;
+    }
+
+    fn stop(&mut self, ctx: &mut GoalCtx) {
+        ctx.body.look = None;
+    }
+
+    fn tick(&mut self, ctx: &mut GoalCtx) {
+        self.remaining -= 1;
+        ctx.body.look = Some(self.want);
+    }
+}
+
+/// Target the nearest visible player inside the follow range; drop it
+/// when unseen or out of range. The light floor, when set, keeps the
+/// goal from starting in bright places.
+pub(crate) struct NearestPlayerTargetGoal {
+    scan_every: i32,
+    unseen_limit: i32,
+    follow_range: f64,
+    hostile_below: Option<f64>,
+    scan_in: i32,
+    unseen: i32,
+}
+
+impl NearestPlayerTargetGoal {
+    pub(crate) fn new(
+        scan_every: i32,
+        unseen_limit: i32,
+        follow_range: f64,
+        hostile_below: Option<f64>,
+    ) -> NearestPlayerTargetGoal {
+        NearestPlayerTargetGoal {
+            scan_every,
+            unseen_limit,
+            follow_range,
+            hostile_below,
+            scan_in: 0,
+            unseen: 0,
+        }
+    }
+}
+
+impl Goal for NearestPlayerTargetGoal {
+    fn flags(&self) -> GoalFlags {
+        GoalFlags::TARGET
+    }
+
+    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        if self.scan_in > 0 {
+            self.scan_in -= 1;
+            return false;
+        }
+        self.scan_in = self.scan_every;
+        if self
+            .hostile_below
+            .is_some_and(|limit| brightness(ctx.world, ctx.body) >= limit)
+        {
+            return false;
+        }
+        let Some((conn, pos)) = ctx.nearest_player(self.follow_range) else {
+            return false;
+        };
+        if !visible(ctx.world, eye_of(ctx.body), eye_at(PLAYER_EYE, pos)) {
+            return false;
+        }
+        self.unseen = 0;
+        ctx.body.target = Some(conn);
+        true
+    }
+
+    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        let Some(conn) = ctx.body.target else {
+            return false;
+        };
+        let Some(pos) = ctx.player_pos(conn) else {
+            return false;
+        };
+        let (dx, dy, dz) = (pos.0 - ctx.body.x, pos.1 - ctx.body.y, pos.2 - ctx.body.z);
+        if dx * dx + dy * dy + dz * dz > self.follow_range * self.follow_range {
+            return false;
+        }
+        if visible(ctx.world, eye_of(ctx.body), eye_at(PLAYER_EYE, pos)) {
+            self.unseen = 0;
+        } else {
+            self.unseen += 1;
+        }
+        self.unseen <= self.unseen_limit
+    }
+
+    fn stop(&mut self, ctx: &mut GoalCtx) {
+        ctx.body.target = None;
+    }
+}
+
+/// The melee approach: chase the target, look at it, hit inside the
+/// reach once the cooldown spends. Approaches without hitting when
+/// `hits` is false.
+pub(crate) struct ChaseHitGoal {
+    reach: f64,
+    follow_range: f64,
+    hits: bool,
+    check_in: i32,
+    cooldown: i32,
+    target: Option<ConnId>,
+    last_path: (f64, f64),
+}
+
+impl ChaseHitGoal {
+    pub(crate) fn new(reach: f64, follow_range: f64, hits: bool) -> ChaseHitGoal {
+        ChaseHitGoal {
+            reach,
+            follow_range,
+            hits,
+            check_in: 0,
+            cooldown: 0,
+            target: None,
+            last_path: (0.0, 0.0),
+        }
+    }
+}
+
+/// Attack cooldown, in ticks (the 20-tick interval halved).
+const MELEE_COOLDOWN: i32 = 10;
+
+impl Goal for ChaseHitGoal {
+    fn flags(&self) -> GoalFlags {
+        GoalFlags::MOVE.union(GoalFlags::LOOK)
+    }
+
+    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        if self.check_in > 0 {
+            self.check_in -= 1;
+            return false;
+        }
+        self.check_in = MELEE_COOLDOWN;
+        let Some(conn) = ctx.body.target else {
+            return false;
+        };
+        self.target = ctx.player_pos(conn).map(|_| conn);
+        self.target.is_some()
+    }
+
+    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
+        let Some(conn) = self.target else {
+            return false;
+        };
+        if ctx.body.target != Some(conn) {
+            return false;
+        }
+        match ctx.player_pos(conn) {
+            Some((x, y, z)) => {
+                let (dx, dy, dz) = (x - ctx.body.x, y - ctx.body.y, z - ctx.body.z);
+                dx * dx + dy * dy + dz * dz <= self.follow_range * self.follow_range
+            }
+            None => false,
+        }
+    }
+
+    fn start(&mut self, ctx: &mut GoalCtx) {
+        self.cooldown = MELEE_COOLDOWN;
+        ctx.body.melee_active = true;
+        if let Some((x, _, z)) = ctx.body.target.and_then(|conn| ctx.player_pos(conn)) {
+            self.last_path = (x, z);
+            ctx.body.nav.move_to(x, z, 1.0);
+        }
+    }
+
+    fn stop(&mut self, ctx: &mut GoalCtx) {
+        ctx.body.melee_active = false;
+        ctx.body.look = None;
+        ctx.body.nav.stop();
+        self.target = None;
+    }
+
+    fn tick(&mut self, ctx: &mut GoalCtx) {
+        self.cooldown -= 1;
+        let Some(conn) = self.target.or(ctx.body.target) else {
+            return;
+        };
+        let Some((px, py, pz)) = ctx.player_pos(conn) else {
+            return;
+        };
+        ctx.body.look = Some(look_angles(
+            eye_of(ctx.body),
+            eye_at(PLAYER_EYE, (px, py, pz)),
+        ));
+        // Re-path when the target moved a block or on the 5% roll.
+        let moved = (px - self.last_path.0) * (px - self.last_path.0)
+            + (pz - self.last_path.1) * (pz - self.last_path.1);
+        if moved >= 1.0 || ctx.below(20) == 0 {
+            self.last_path = (px, pz);
+            ctx.body.nav.retarget(px, pz, 1.0);
+        }
+        if !self.hits || self.cooldown > 0 {
+            return;
+        }
+        let (dy, horiz) = (
+            py + PLAYER_EYE - eye_of(ctx.body).1,
+            ((px - ctx.body.x) * (px - ctx.body.x) + (pz - ctx.body.z) * (pz - ctx.body.z)).sqrt(),
+        );
+        if horiz >= self.reach || dy.abs() > 2.5 {
+            return;
+        }
+        if !visible(
+            ctx.world,
+            eye_of(ctx.body),
+            eye_at(PLAYER_EYE, (px, py, pz)),
+        ) {
+            return;
+        }
+        ctx.body.pending_hit = Some(conn);
+        self.cooldown = MELEE_COOLDOWN;
+    }
+
+    fn requires_every_tick(&self) -> bool {
+        true
+    }
+}
+
+/// The mob eye position at the kind's eye height.
+pub(crate) fn eye_of(body: &MobBody) -> (f64, f64, f64) {
+    (body.x, body.y + body.eye, body.z)
+}
+
+// ---------------------------------------------------------------------
 // Mob state
 // ---------------------------------------------------------------------
 
@@ -455,12 +942,26 @@ pub trait MobKind: Send {
     fn half_width(&self) -> f64;
     /// Hitbox height.
     fn height(&self) -> f64;
+    /// Eye height above the feet.
+    fn eye(&self) -> f64;
     /// The movement-speed attribute.
     fn base_speed(&self) -> f64;
     /// The attack-damage attribute.
     fn attack_damage(&self) -> f32;
     /// The follow-range attribute.
     fn follow_range(&self) -> f64;
+    /// Whether the navigator climbs walls.
+    fn can_climb(&self) -> bool {
+        false
+    }
+    /// The max-health attribute.
+    fn max_health(&self) -> f32 {
+        20.0
+    }
+    /// The equipment a fresh spawn carries: (slot ordinal, stack).
+    fn equipment(&self) -> Option<(u8, crate::inventory::ItemStack)> {
+        None
+    }
     /// Registers the behavior and target goals at their priorities.
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector);
     /// The per-tick kind hook (daylight burning and kin).
@@ -477,6 +978,8 @@ pub struct MobBody {
     pub vx: f64,
     pub vy: f64,
     pub vz: f64,
+    /// Eye height above the feet (the kind's).
+    pub eye: f64,
     /// Body yaw, degrees.
     pub yaw: f32,
     /// Head yaw, degrees.
@@ -512,6 +1015,20 @@ pub struct MobBody {
     pub melee_active: bool,
     /// A melee hit awaiting the wire send.
     pub pending_hit: Option<ConnId>,
+    /// A bow shot awaiting the spawn: the target and the draw power.
+    pub pending_shot: Option<(ConnId, f64)>,
+    /// A detonation awaiting the blast: the radius.
+    pub pending_blast: Option<f64>,
+    /// Whether the last move clipped horizontally.
+    pub horiz_collided: bool,
+    /// The climbing state (the wall-crawler's metadata bit).
+    pub climbing: bool,
+    /// The swell direction: -1 shrinking, 1 swelling (the creeper).
+    pub swell_dir: i32,
+    /// The fuse counter (the creeper).
+    pub fuse: i32,
+    /// An instant removal without the death animation.
+    pub discard: bool,
 }
 
 impl MobBody {
@@ -524,6 +1041,7 @@ impl MobBody {
             vx: 0.0,
             vy: 0.0,
             vz: 0.0,
+            eye: 1.74,
             yaw: 0.0,
             head_yaw: 0.0,
             pitch: 0.0,
@@ -544,6 +1062,13 @@ impl MobBody {
             target: None,
             melee_active: false,
             pending_hit: None,
+            pending_shot: None,
+            pending_blast: None,
+            horiz_collided: false,
+            climbing: false,
+            swell_dir: -1,
+            fuse: 0,
+            discard: false,
         }
     }
 }
@@ -572,6 +1097,10 @@ pub struct Mob {
     sync_phase: i64,
     /// The last sent entity/mob flag bytes.
     sent_flags: (u8, u8),
+    /// The last sent climbing state.
+    sent_climbing: bool,
+    /// The last sent swell direction.
+    sent_swell: i32,
 }
 
 impl Mob {
@@ -588,10 +1117,14 @@ impl Mob {
         let mut goals = GoalSelector::new();
         let mut targets = GoalSelector::new();
         kind.register_goals(&mut goals, &mut targets);
-        let max_health = 20.0;
+        let max_health = kind.max_health();
+        let (climb, eye) = (kind.can_climb(), kind.eye());
+        let mut body = MobBody::new(id, x, y, z, max_health);
+        body.eye = eye;
+        body.nav.set_climb(climb);
         Mob {
             uuid,
-            body: MobBody::new(id, x, y, z, max_health),
+            body,
             kind,
             goals,
             targets,
@@ -608,6 +1141,8 @@ impl Mob {
             teleport_delay: 0,
             sync_phase: 0,
             sent_flags: (0, 0),
+            sent_climbing: false,
+            sent_swell: -1,
         }
     }
 
@@ -620,11 +1155,15 @@ impl Mob {
         (z ^ (z >> 31)) % n
     }
 
-    /// The spawn pairing: add_entity, the health datum, the
-    /// movement-speed attribute (the reference omits default-valued
-    /// attributes; no equipment packet for bare mobs).
+    /// The spawn pairing: add_entity, the health datum, the attribute
+    /// snapshot (the reference omits default-valued attributes), then
+    /// the equipment a kind carries.
     pub fn pairing_frames(&self) -> Vec<(i32, Vec<u8>)> {
-        vec![
+        let mut attrs = vec![(ATTR_MOVEMENT_SPEED, self.kind.base_speed())];
+        if self.kind.max_health() != DEFAULT_MAX_HEALTH {
+            attrs.push((ATTR_MAX_HEALTH, self.kind.max_health() as f64));
+        }
+        let mut frames = vec![
             (
                 PACKET_ADD_ENTITY,
                 encode_add_entity(
@@ -647,12 +1186,16 @@ impl Mob {
             ),
             (
                 PACKET_UPDATE_ATTRIBUTES,
-                encode_update_attributes(
-                    self.body.id,
-                    &[(ATTR_MOVEMENT_SPEED, self.kind.base_speed())],
-                ),
+                encode_update_attributes(self.body.id, &attrs),
             ),
-        ]
+        ];
+        if let Some((slot, stack)) = self.kind.equipment() {
+            frames.push((
+                PACKET_SET_EQUIPMENT,
+                encode_equipment(self.body.id, &[(slot, &stack)]),
+            ));
+        }
+        frames
     }
 
     /// Damage plus knockback under the partial-hit rule; returns true
@@ -714,10 +1257,18 @@ pub struct OutFrame {
 /// One ground movement step: input accel along the body yaw, axis-
 /// separated collision with a 1-block step-up and jump, gravity,
 /// friction, and the small-vector clamp.
-fn step_mob(world: &Game, body: &mut MobBody, half: f64, height: f64, forward: f64) {
+fn step_mob(
+    world: &Game,
+    body: &mut MobBody,
+    half: f64,
+    height: f64,
+    base_speed: f64,
+    forward: f64,
+) {
+    body.horiz_collided = false;
     if forward > 0.0 {
-        let speed = forward * BASE_SPEED;
-        let accel = speed * BASE_SPEED;
+        let speed = forward * base_speed;
+        let accel = speed * base_speed;
         let yaw = body.yaw.to_radians() as f64;
         body.vx += -yaw.sin() * accel;
         body.vz += yaw.cos() * accel;
@@ -756,6 +1307,7 @@ fn step_mob(world: &Game, body: &mut MobBody, half: f64, height: f64, forward: f
             body.y = (feet_y + 1) as f64;
             continue;
         }
+        body.horiz_collided = true;
         if body.on_ground && body.jump_cooldown == 0 {
             body.vy = body.vy.max(JUMP_POWER);
             body.jump_cooldown = JUMP_DELAY;
@@ -902,6 +1454,17 @@ impl Game {
         let mut removed: Vec<usize> = Vec::new();
         let mut mobs = std::mem::take(&mut self.mobs.mobs);
         for (i, mob) in mobs.iter_mut().enumerate() {
+            if mob.body.discard {
+                frames.push(OutFrame {
+                    x: mob.body.x,
+                    y: mob.body.y,
+                    z: mob.body.z,
+                    id: PACKET_REMOVE_ENTITIES,
+                    body: encode_remove_entities(&[mob.body.id]),
+                });
+                removed.push(i);
+                continue;
+            }
             if mob.body.death_time > 0 {
                 if mob.body.death_time == 1 {
                     frames.push(OutFrame {
@@ -938,6 +1501,12 @@ impl Game {
             }
             self.mob_ai(mob, &mut frames);
         }
+        let mut blasts: Vec<(i32, f64, f64, f64, f64)> = Vec::new();
+        for mob in mobs.iter_mut() {
+            if let Some(radius) = mob.body.pending_blast.take() {
+                blasts.push((mob.body.id, mob.body.x, mob.body.y, mob.body.z, radius));
+            }
+        }
         if removed.is_empty() {
             self.mobs.mobs = mobs;
         } else {
@@ -948,6 +1517,15 @@ impl Game {
                 }
             }
             self.mobs.mobs = kept;
+        }
+        // The detonations the fuses reached: they run with the mob
+        // list whole, so the blast sees every mob, and the spent
+        // creeper leaves without a corpse.
+        for (id, x, y, z, radius) in blasts {
+            self.explode_at(x, y, z, radius, id);
+            if let Some(mob) = self.mobs.mobs.iter_mut().find(|m| m.body.id == id) {
+                mob.body.discard = true;
+            }
         }
         for frame in &frames {
             self.send_within(
@@ -1064,6 +1642,23 @@ impl Game {
         mob.rand = rand;
         mob.goals = goals;
         mob.targets = targets;
+        // A bow shot the goal queued: the skeleton module aims and
+        // spawns the arrow.
+        if let Some((conn, power)) = mob.body.pending_shot.take() {
+            let (x, y, z, eye, zid) = (
+                mob.body.x,
+                mob.body.y,
+                mob.body.z,
+                mob.body.eye,
+                mob.body.id,
+            );
+            let target = self.players.get(&conn).map(|p| (p.x, p.y, p.z));
+            if let Some(target) = target {
+                let mut seed = mob.rand;
+                crate::skeleton::fire_shot(self, x, y, z, eye, zid, target, power, &mut seed);
+                mob.rand = seed;
+            }
+        }
         // A melee hit the goal queued: damage_event to the target plus
         // the shared hurt_animation, and the damage counts toward the
         // target's health bar.
@@ -1101,7 +1696,12 @@ impl Game {
         if over > 75.0 {
             mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, over - 75.0);
         }
-        // Move control: face the wanted position, walk forward.
+        // Move control: run the navigation housekeeping, face the
+        // wanted waypoint, walk forward.
+        let (bx, by, bz, bground) = (mob.body.x, mob.body.y, mob.body.z, mob.body.on_ground);
+        mob.body
+            .nav
+            .nav_tick(bx, by, bz, bground, &|x, y, z| block_solid(self, x, y, z));
         let mut forward = 0.0f64;
         if let Some((tx, tz, modifier)) = mob.body.nav.wanted() {
             mob.body.yaw = rotate_towards(
@@ -1116,7 +1716,15 @@ impl Game {
         }
         let half = mob.kind.half_width();
         let height = mob.kind.height();
-        step_mob(self, &mut mob.body, half, height, forward);
+        let base_speed = mob.kind.base_speed();
+        step_mob(self, &mut mob.body, half, height, base_speed, forward);
+        // The wall-crawl rule: pressed into a wall, the body rises.
+        if mob.kind.can_climb() {
+            mob.body.climbing = mob.body.horiz_collided && mob.body.nav.in_progress();
+            if mob.body.climbing {
+                mob.body.vy = mob.body.vy.max(CLIMB_RISE);
+            }
+        }
         mob_sync(mob, frames);
     }
 }
@@ -1252,6 +1860,29 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                 body: encode_float_data(mob.body.id, DATA_LIVING_HEALTH, mob.body.health),
             });
             mob.sent_health = mob.body.health.to_bits();
+        }
+        // The creeper's swell direction rides its own accessor.
+        if mob.body.swell_dir != mob.sent_swell {
+            frames.push(OutFrame {
+                x: mob.body.x,
+                y: mob.body.y,
+                z: mob.body.z,
+                id: PACKET_SET_ENTITY_DATA,
+                body: encode_int_data(mob.body.id, DATA_SWELL_DIR, mob.body.swell_dir),
+            });
+            mob.sent_swell = mob.body.swell_dir;
+        }
+        // The wall-crawler's climbing bit rides its own accessor.
+        if mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing {
+            let value = if mob.body.climbing { 0x01 } else { 0x00 };
+            frames.push(OutFrame {
+                x: mob.body.x,
+                y: mob.body.y,
+                z: mob.body.z,
+                id: PACKET_SET_ENTITY_DATA,
+                body: encode_byte_data(mob.body.id, DATA_CLIMBING_FLAGS, value),
+            });
+            mob.sent_climbing = mob.body.climbing;
         }
     }
 }
@@ -1533,7 +2164,7 @@ mod tests {
         // Face +x, straight at the shelf edge.
         b.yaw = -90.0;
         for _ in 0..40 {
-            step_mob(&g, &mut b, 0.3, 1.95, 1.0);
+            step_mob(&g, &mut b, 0.3, 1.95, 0.23, 1.0);
         }
         assert!(b.x > 6.9, "onto the shelf, x = {}", b.x);
         assert!((b.y - 101.0).abs() < 0.01, "on the shelf top, y = {}", b.y);
@@ -1544,7 +2175,7 @@ mod tests {
         let (g, _rx) = harness(false);
         let mut b = MobBody::new(5, 5.5, 110.0, 8.5, 20.0);
         for _ in 0..40 {
-            step_mob(&g, &mut b, 0.3, 1.95, 0.0);
+            step_mob(&g, &mut b, 0.3, 1.95, 0.23, 0.0);
         }
         assert!(b.on_ground);
         assert!((b.y - 100.0).abs() < 0.01, "feet on the grass, y = {}", b.y);

@@ -452,3 +452,544 @@ Open wire TODOs until the gate observes vanilla: zombie type id 154,
 attribute registry ids (max_health 23), the packet ids 0x68/0x2b/
 0x19/0x22/0x55/0x86/0x39, and the exact update_attributes entry set
 at pairing (predicted: only max_health 20.0).
+
+# Wave 2 research: skeleton, creeper, spider, arrows, explosions
+
+Same rules as wave 1: facts below come from the decompiled 26.3
+reference under `scratch/vanilla-decomp/game/net/minecraft/`; engine
+code carries none of these identifiers. Constants land in engine code
+as plain numbers with the value in a short present-tense comment.
+
+## 10. Wire ids and registry ids
+
+### Packet ids (verified method)
+
+The clientbound play ids follow the registration chain in
+`network/protocol/game/GameProtocols.java`: the bundle delimiter
+holds id 0, then each `addPacket` in chain order takes 1, 2, 3, ...
+Counting that chain reproduces every pinned id in this repo
+(add_entity 0x01, block_update 0x08, damage_event 0x19,
+entity_position_sync 0x23, set_entity_data 0x65, remove_entities
+0x4e, rotate_head 0x55, section_blocks_update 0x56,
+set_entity_motion 0x67, set_equipment 0x68, update_attributes 0x86,
+player_position 0x49, take_item_entity 0x7f, set_time 0x73,
+level_chunk_with_light 0x2e - 20+ anchors, zero misses), so the
+method is sound. New for wave 2:
+
+- explode: 0x24 (registration 36)
+- set_equipment: 0x68 (registration 104; pinned in wave 1)
+
+### Entity-type registry ids
+
+Counted the same way as ZOMBIE_TYPE = 154: 0-based index into the
+`world/entity/EntityTypeIds.java` creation order (item = 72 and
+zombie = 154 cross-check).
+
+| type | id |
+|------|----|
+| arrow | 6 |
+| creeper | 32 |
+| skeleton | 118 |
+| spider | 127 |
+
+### Item registry ids
+
+The repo's curated item table (`crates/doppel/src/inventory.rs`)
+already carries `minecraft:bow` = 1008 and `minecraft:arrow` = 1009;
+both were pinned there from the captured registries and survive the
+survival gate, so they are the source of truth for wave 2.
+
+## 11. Metadata indices and serializers
+
+The accessor index continues the parent class count: base entity 8
+accessors (0..7), living 7 more (8..14, health at 9), mob 1 more
+(15, the mob flags byte). Counting the `defineId` declarations in
+each subclass:
+
+| mob | accessor | serializer | default | meaning |
+|-----|----------|-----------|---------|---------|
+| creeper | 16 | 1 (INT) | -1 | swell direction: -1 shrinking, 1 swelling |
+| creeper | 17 | 10 (BOOLEAN) | false | powered (charged by lightning) |
+| creeper | 18 | 10 (BOOLEAN) | false | ignited (flint and steel) |
+| spider | 16 | 0 (BYTE) | 0 | bit 0x01 = climbing |
+| skeleton | 16 | 10 (BOOLEAN) | false | freezing conversion |
+
+Defaults mean the pairing data carries health alone for all three
+mobs (the creeper's swell starts at -1, its default); the swell and
+climb entries go out later as dirty data when they flip.
+
+Arrow metadata (accessors after the base 8): flags byte at 8 (bit 1
+critical, bit 2 no-physics), pierce level byte at 9, in-ground
+boolean at 10, tipped-arrow color int at 11.
+
+## 12. The set_equipment packet
+
+Layout (`ClientboundSetEquipmentPacket`): entity id varint, then a
+list of (slot byte, item stack) pairs. The slot byte carries the
+slot ordinal in bits 0..6 and 0x80 set on every entry except the
+last. Slot ordinals (`world/entity/EquipmentSlot.java` declaration
+order): main hand 0, offhand 1, feet 2, legs 3, chest 4, head 5,
+body 6, saddle 7. The item stack is the same optional-stack encoding
+the item entity uses (count varint; when nonzero: item id varint,
+added-components count varint, removed-components count varint).
+
+Pairing order (`server/level/ServerEntity.sendPairingData`):
+add_entity, set_entity_data (non-default values), update_attributes
+(syncable attributes with live instances), set_equipment (non-empty
+slots in slot-ordinal order), passengers, leash. A skeleton pairs
+health 20.0 (accessor 9 FLOAT), movement_speed 0.25 (attribute id
+26), then set_equipment with exactly one entry: byte 0x00 (main
+hand, no continuation bit) then the bow stack (count 1, item 1008,
+0, 0).
+
+## 13. Skeleton
+
+### Type and attributes
+
+0.6 wide, 1.99 tall, eye 1.74, tracking range 8 chunks, sync
+interval 3, monster category, not peaceful. Attributes:
+movement_speed 0.25, attack_damage 2.0 (the monster default), max
+health 20, follow_range 32 (the default; the zombie's 35 is a
+zombie override). Undead: burns in daylight exactly like the zombie
+(same timeline window, same brightness ratio and roll).
+
+### Goal table
+
+| priority | goal | flags | notes |
+|----------|------|-------|-------|
+| 2 | restrict sun | MOVE | no light engine; omitted |
+| 3 | flee sun | MOVE | no light engine; omitted |
+| 3 | avoid wolves | MOVE | no wolves; omitted |
+| 4 | ranged bow attack | MOVE+LOOK | interval 20 hard / 40 otherwise, radius 15 |
+| 5 | water-avoiding stroll | MOVE | speed 1.0 |
+| 6 | look at player | LOOK | range 8 |
+| 6 | random look | MOVE+LOOK | |
+| target 1 | hurt-by | TARGET | omitted (no player attacks on mobs yet) |
+| target 2 | nearest player, must see | TARGET | range 32 |
+
+There is no float goal on the skeleton (the zombie has none either);
+swimming is the navigation's canFloat flag. The bow goal is added by
+the weapon reassessment at construction: holding a bow registers the
+ranged goal at 4.
+
+### Ranged bow attack
+
+Every tick (requires-every-tick):
+
+- If squared distance > 225 (15^2) or seen ticks < 20: pathfind to
+  the target at speed 1.0; strafe counter resets to -1.
+- Else stop the navigation and count strafe ticks. Every 20 strafe
+  ticks each of clockwise and backwards flips with 30% chance.
+- Strafe magnitudes 0.5 forward, 0.5 sideways at speed factor 0.25
+  (the strafe move-control path). Backwards (forward -0.5) whenever
+  squared distance < 225 * 0.25 = 56.25 (inside 7.5 blocks);
+  forwards again beyond 225 * 0.75 (13.0 blocks).
+- Draw: after the attack cooldown (20 ticks hard difficulty, 40
+  otherwise) expires with the target seen (seen ticks >= -60), start
+  drawing; release after 20 drawn ticks. Power at release = 1.0
+  (the charge curve saturates: t/20 -> (t^2+2t)/3 = 1 at t=20).
+  Release fires the arrow and resets the cooldown.
+- Line of sight bookkeeping: seen ticks +1 with sight, -1 without;
+  stop drawing at seen ticks < -60.
+
+### The shot
+
+Arrow spawns at the skeleton's eye Y minus 0.1 (feet + 1.74 - 0.1).
+Aim: horizontal delta to the target, vertical delta to the target's
+one-third height (feet + 0.333) plus horizontal distance * 0.2 (the
+gravity lead). Launch speed 1.6, uncertainty 14 - 4 * difficulty id
+(easy 10): each velocity component gains a triangle(0, 0.0172275 *
+uncertainty) jitter before the speed scaling. Arrow base damage =
+power * 2.0 + triangle(0.11 * difficulty id, 0.57425) (mean 2.11 on
+easy); a hit deals ceil(speed * base damage).
+
+## 14. Arrow flight
+
+Per tick (`world/entity/projectile/arrow/AbstractArrow.java`):
+
+1. Move by the current velocity, clipped against block collision
+   along the segment.
+2. Air drag: velocity *= 0.99 (water: 0.6 horizontal).
+3. Gravity: velocity.y -= 0.05, after the drag.
+4. Rotation follows the velocity vector (atan2).
+
+Block hit: the arrow stops dead (velocity zero), pulls back 0.05
+along each movement sign, marks in-ground, then despawns after 1200
+ticks. Entity hit: damage ceil(length * base damage) via the arrow
+damage type (alphabetical registry id 0; mob_attack's 28 is the
+same counting), knockback 0.4 along the arrow's horizontal flight
+direction, then the arrow discards. On the wire: add_entity carries
+the owner entity id in the trailing data varint (the skeleton's id;
+0 when ownerless); movement syncs at interval 20 with a 4-chunk
+tracking range; arrows track deltas (set_entity_motion when
+velocity changes).
+
+Type facts: 0.5 wide and tall, MISC category, tracking range 4
+chunks, update interval 20, no loot.
+
+## 15. Creeper
+
+### Type and attributes
+
+0.6 wide, 1.7 tall (eye 1.445, the 0.85 default), tracking range 8,
+interval 3, monster, not peaceful. movement_speed 0.25, attack
+damage 2.0 (never used: the melee goal exists only to close
+distance), max health 20, follow range 32.
+
+### Goal table
+
+| priority | goal | flags | notes |
+|----------|------|-------|-------|
+| 1 | float | JUMP | inert without fluids |
+| 2 | swell | MOVE | stops navigation; drives the fuse |
+| 3 | avoid ocelots/cats | MOVE | no cats; omitted |
+| 4 | melee approach | MOVE+LOOK | closes distance, deals no damage |
+| 5 | water-avoiding stroll | MOVE | speed 0.8 |
+| 6 | look at player | LOOK | range 8 |
+| 6 | random look | MOVE+LOOK | |
+| target 1 | nearest player, must see | TARGET | range 32 |
+| target 2 | hurt-by | TARGET | omitted |
+
+### Swell and fuse
+
+The swell goal takes MOVE and stops the navigation when active.
+
+- Starts (canUse) when the swell direction is already positive or
+  the target is alive within squared distance 9.0 (3 blocks).
+- Each tick (every tick): target gone or dead -> direction -1;
+  squared distance > 49.0 (7 blocks, the cancel range) -> -1; no
+  line of sight -> -1; else direction +1.
+- The fuse counter (swell) moves by the direction each tick, floor
+  0, and the explosion fires when it reaches 30 (the max swell; the
+  reference "fuse" is 30 ticks). A fall adds up to
+  (fall distance * 1.5) capped at 25.
+- Metadata: accessor 16 (INT) carries the direction value itself
+  (-1 / 0 / 1), not the counter. It flips to 1 when the swell
+  starts, back to -1 when the target escapes.
+
+### Explosion
+
+At fuse end the creeper explodes with radius 3 (powered: 6) as a mob
+explosion and discards immediately (no death animation, no corpse:
+the entity is dead=true and removed in the same tick; clients see
+remove_entities). With mob_griefing true (default) and
+mob_explosion_drop_decay false (default) the block interaction is
+plain destroy.
+
+## 16. Explosion mechanics
+
+### Block destruction
+
+Ray grid (`world/level/ServerExplosion.calculateExplodedPositions`):
+a 16x16x16 grid where only the surface cells cast rays (any
+coordinate 0 or 15): 16^3 - 14^3 = 1352 rays.
+
+Per ray:
+
+- Direction: cell / 15 * 2 - 1 per axis, normalized.
+- Starting power: radius * (0.7 + random * 0.6).
+- Step length 0.3; power decays 0.22500001 per step.
+- Per cell entered: power -= (resistance + 0.3) * 0.3 where
+  resistance is the block's explosion resistance (fluids count when
+  present; air and empty fluid skip the resistance read entirely).
+  If power > 0 after the read, the cell joins the destroy set (the
+  creeper path has no per-block veto).
+- The ray ends when power <= 0.
+
+Resistance values come from the block's `strength`: the builder
+default is 0.0, the one-argument form sets destroy time and
+explosion resistance to the same number, and the two-argument form
+splits them (grass_block 0.6, dirt 0.5, stone 1.5/6.0, bedrock
+-1/3.6e6). On the flat world the floor is grass at 0.6, so a floor
+cell costs (0.6 + 0.3) * 0.3 = 0.27 power; air cells cost only the
+0.225 per-step decay. With no block-resistance pin in this repo,
+wave 2 approximates: air 0.0, every other block 0.6 (the flat
+world's floor value); the approximation is documented here and the
+gate asserts structure, not exact crater shape.
+
+Destroy set -> block updates: the reference shuffles the set, drops
+items (this build drops nothing for explosions), sets air. The wire
+carries block_update / section_blocks_update exactly like setblock
+(0x08 single, 0x56 per section per tick).
+
+### Entity damage and knockback
+
+Entities within radius * 2 of the center (AABB test):
+
+- dist = sqrt(distanceToSqr(center)) / (radius * 2); skip when > 1.
+- exposure = seen percent: sample points on a 2x-per-block grid
+  over the entity's box ((2w+1) x (2h+1) x (2d+1) points, offset
+  half a step on x and z); a point counts when the clip to the
+  center hits no collider. exposure = hits / count. On the flat
+  world an unobstructed player reads 1.0.
+- damage = (p^2 + p) / 2 * 7 * (radius * 2) + 1 where
+  p = (1 - dist) * exposure. Radius 3 point blank: about 24.
+- knockback power = (1 - dist) * exposure * 1.0 (the living
+  multiplier; explosion knockback resistance is a separate 0.0
+  attribute), direction = normalize(eye position - center), applied
+  as a velocity push. Survivors take the damage event. The damage
+  type: the mob-explosion source carries a direct and an indirect
+  cause entity; when both exist the registry entry is the
+  entity-attribution one. Alphabetical damage-type ids (the same
+  ordering that gives mob_attack 28): arrow 0, explosion 9,
+  mob_projectile 30, player_attack 34, entity-attributed explosion
+  35. TODO wire-verify at the gate.
+
+### The explode packet (0x24)
+
+Fields in order: center (3 doubles), radius (float), destroyed block
+count (varint), optional player knockback (boolean, then 3 doubles
+when present; only the receiving player's own knockback), explosion
+particle (the large-explosion particle when radius >= 2), explosion
+sound (a registry holder), the weighted block-particle list (two
+entries: poof 0.5, smoke 1.0), play-sound boolean. Sent to players
+within 64 blocks of the center. The particle and sound ids are not
+pinned in this repo; the gate observes vanilla's bytes and doppel
+matches the prefix it can verify (center, radius, count) while the
+tail is pinned from the capture during phase 2.
+
+## 17. Spider
+
+### Type and attributes
+
+1.4 wide, 0.9 tall, eye 0.65, tracking range 8, interval 3,
+monster, not peaceful. movement_speed 0.3, max health 16, attack
+damage 2.0, follow range 32. The spider is the only wave 2 mob
+whose max health sits off the 20.0 default, so its pairing
+update_attributes carries two entries: max_health (id 23) 16.0 and
+movement_speed (id 26) 0.3. Skeleton and creeper carry
+movement_speed alone (0.25).
+
+### Goal table
+
+| priority | goal | flags | notes |
+|----------|------|-------|-------|
+| 1 | float | JUMP | inert without fluids |
+| 2 | avoid armadillos | MOVE | no armadillos; omitted |
+| 3 | leap at target | JUMP+MOVE | 2..4 blocks, 1/3 roll, vy 0.4 |
+| 4 | melee attack (long memory) | MOVE+LOOK | speed 1.0 |
+| 5 | water-avoiding stroll | MOVE | speed 0.8 |
+| 6 | look at player | LOOK | range 8 |
+| 6 | random look | MOVE+LOOK | |
+| target 1 | hurt-by | TARGET | omitted |
+| target 2 | nearest player, must see | TARGET | only when local brightness < 0.5 |
+| target 3 | nearest iron golem | TARGET | no golems; omitted |
+
+Light gating: the target goal refuses while the local
+light-dependent brightness >= 0.5; the attack goal, once running,
+drops the target on a 1/100 roll per tick while bright. Wave 2
+approximates brightness with the sky-exposure + sky-darken model
+the zombie's burn uses (dark when the darkened brightness < 0.5);
+at midnight under open sky both read hostile.
+
+The leap: fires from the ground at 2..4 blocks (squared 4..16) on a
+1-in-3 roll per full check, velocity = horizontal-normalized *
+0.4 + 0.2 * current velocity, vy 0.4.
+
+### Climbing
+
+The climbing bit (accessor 16, bit 0x01) sets whenever the spider
+horizontally collides, every tick. Climbing spiders climb at
+0.2/tick vertical while pressing into a wall (the ladder rule); the
+navigation is the wall-climber: when a path ends without reaching
+the target column, the move control walks straight at the target
+position, and wall contact plus the climb flag carries the spider
+up. Wave 2 models this as: the climb capability on the navigator
+enables a straight-up neighbor in the A* grid, and the movement
+rule gives the body 0.2/tick vertical rise while horizontally
+colliding with the climb bit set.
+
+### Spawn footprint
+
+Spawn placement is the same ON_GROUND type as the zombie, but the
+no-collision AABB test uses the spider's 1.4-wide box, so a spider
+needs the wider clearance (this is the footprint check; the
+reference applies it through the generic spawn AABB test).
+
+## 18. Spawn weights (plains, 26.3)
+
+The plains monster list (`data/worldgen/BiomeDefaultFeatures.java`,
+plains -> commonSpawnWithZombieHorse -> monsters(90, 5, 5, 100)),
+registration order:
+
+| entry | weight | pack size |
+|-------|--------|-----------|
+| spider | 100 | 4..4 |
+| zombie | 90 | 4..4 |
+| zombie villager | 5 | 1..1 |
+| zombie horse | 5 | 1..1 |
+| skeleton | 100 | 4..4 |
+| creeper | 100 | 4..4 |
+| slime | 100 | 4..4 |
+| enderman | 10 | 1..4 |
+| witch | 5 | 1..1 |
+
+Total weight 515 (bats and glow squid ride other categories). The
+weighted pick draws once in [0, total) and walks the list in
+registration order. Wave 2 implements spider 100, zombie 90,
+skeleton 100, creeper 100 over a 390 total (the unimplemented
+entries keep their reference weights in this table; the deviation -
+their weight drops from the draw - is the same shape as wave 1's
+zombie-only 90). Light and ground rules are exactly the zombie's
+(monster darkness test, ON_GROUND placement); nothing new arrives
+with these three types beyond the spider footprint.
+
+## 19. A* navigation seam design (wave 2)
+
+### What stays
+
+The `Nav` seam in `crates/doppel/src/pathing.rs` keeps its public
+surface unchanged: `move_to(x, z, modifier)`, `retarget(x, z,
+modifier)`, `stop()`, `wanted() -> Option<(x, z, modifier)>`,
+`arrived(x, z)`, `in_progress()`, `tick_age(limit) -> bool`. The
+move control in `living.rs` still consumes `wanted()` each tick:
+face the returned position, walk forward at the modifier, stop when
+`arrived`. Nothing outside pathing.rs changes its call shape.
+
+### What moves inside
+
+`Nav` grows an optional path state:
+
+- `path: Option<Vec<(i32, i32, i32)>>` - the waypoint list, integer
+  block positions, start exclusive (the first entry is the next
+  waypoint).
+- `idx: usize` - the index of the current waypoint.
+- `climb: bool` - the per-mob capability flag (spider true).
+- `blocker: Option<BlockQuery>` - the world read.
+
+`wanted()` returns the CURRENT waypoint center: (x + 0.5, y, z +
+0.5) of `path[idx]`, falling back to the raw want when no path
+exists (straight-line walking, the wave 1 behavior, when the grid
+says no path or the target is one block out).
+
+### The block query
+
+```rust
+type BlockQuery<'a> = &'a dyn Fn(i32, i32, i32) -> bool;
+```
+
+`solid(x, y, z) -> bool`: true when the cell blocks a walker.
+`move_to` and `retarget` take the query as a parameter (the goals
+have `ctx.world` in hand), or `Nav` stores it per call: the goals
+call `nav.move_to(x, z, m, &|x,y,z| block_solid(ctx.world,x,y,z))`.
+Unit tests pass a closure over a `HashMap<(i32,i32,i32),()>` or a
+2D grid, no `Game` needed. The search itself lives in a free
+function `find_path(query, from: (i32,i32,i32), to: (i32,i32,i32),
+climb: bool, budget) -> Option<Vec<...>>` so it is testable in
+isolation.
+
+### The grid
+
+A node (x, y, z) is walkable when solid(x, y-1, z) (floor) and
+!solid(x, y, z) and !solid(x, y+1, z) (feet and head clear). A
+2-tall mob fits a 2-air-gap; this build's mobs are all <= 1.99
+tall.
+
+Neighbors, in cost terms:
+
+- 4-directional flat: dx or dz = +/-1, same y, cost 1.0.
+- Jump-up-one: neighbor y+1 with (x, y+2, z) and (x, y+3, z) clear
+  (headroom over the jump) and the target cell walkable, cost 1.5.
+- Drop: y-n for n in 1..=4, the landing cell walkable, every
+  intermediate cell non-solid, cost 1.0 + 0.5 * n (the bounded
+  fall height 4 covers the flat world's shelves; drops deeper than
+  4 are not taken).
+- Climb-up (climb flag only): y+1 directly above the current node
+  with (x, y+1..y+2, z) passable at the wall face, cost 2.0 -
+  used only when the flat/jump neighbors are blocked, modeling the
+  spider walking up a wall. A climb node needs a solid wall: the
+  cell in the horizontal direction of approach must be solid at the
+  node's head height.
+
+Heuristic: manhattan distance + |dy| (admissible against the
+neighbor costs above); the search pops by f = g + h. Node store: a
+`HashMap<(i32,i32,i32), Node>` with a `BinaryHeap` frontier keyed
+by (f, tie-break insertion counter) - deterministic order.
+
+Budgets: a node cap (default 400 expansions, near the reference's
+own visited-node budget for a 35-block follow range at ~16 nodes
+per block) and a range cap: chebyshev distance from start > 48
+prunes. Budget exhaustion returns the best partial path toward the
+target (the reference keeps its best node's path when it runs out),
+or none when nothing better than the start was reached.
+
+### Waypoint consumption
+
+`wanted()` advances `idx` when the mob's current block column
+equals the waypoint's column (the same 0.5-block radius `arrived`
+uses, at the waypoint's y +/- 1.5 for step-ups and drops). When
+`idx` passes the end, `wanted()` returns none and `stop()` fires:
+`arrived()` already handles the "reached the final column" case
+and goals fall back on their give-up logic through `tick_age`.
+
+### Recompute triggers
+
+`retarget(x, z, modifier)` recomputes when the new target column
+sits more than 1 block from the current path's end (the reference
+repaths when the target moved >= 1 block); otherwise it just
+replaces the raw want. A periodic recheck every 20 ticks of an
+active path (the reference's recompute cadence) re-runs the search
+when the path's next node became unwalkable (a block was placed on
+the route). Stuck detection: when a path is active and horizontal
+progress stays under 0.06 blocks (one walking step) for 40 ticks,
+recompute; after 3 consecutive stuck recomputes without progress,
+stop the navigation (`in_progress()` false) so goals give up.
+
+### Spider climb flag
+
+`MobKind` gains nothing: the spider's constructor passes
+`climb = true` into its `Nav` at spawn (a one-line hook in the
+mob's own module, or a `fn can_climb(&self) -> bool` default-false
+method on `MobKind` - the fn method, so `spawn_mob` can wire it in
+`Mob::new` without the goals seeing it).
+
+### Unit tests (all on hand-built grids, no Game)
+
+1. straight path: flat floor, assert the waypoint list and that
+   `wanted()` walks it in order.
+2. one-block obstacle: a single raised block between start and
+   goal, assert the path hops it (a y+1 node appears).
+3. drop: a two-block ledge between start and goal on the far side,
+   assert the drop node and its extra cost (the path prefers the
+   drop over a long way around).
+4. no path: the goal fully enclosed, assert none within budget.
+5. recompute after target moves: path to A, retarget to B 3 blocks
+   from A, assert a fresh search ran (waypoints changed).
+6. recompute after a block placement: path exists, a wall lands on
+   the next waypoint, the periodic recheck finds a new route
+   around.
+7. wall between start and goal: a 5-tall wall with a gap at one
+   end, assert the route goes around (no jump nodes).
+8. climb path: a 3-tall wall between start and goal; with the
+   climb flag the route goes over the top; without it, none within
+   budget (or the way around when one exists).
+
+### Wiring (plan steps 3, 8)
+
+The zombie's chase and stroll goals already call `move_to` /
+`retarget`; they gain the block-query argument. `living.rs`'s move
+control is unchanged. The shared helpers (`visible`, `eye_at`,
+`look_angles`) move from `zombie.rs` to `living.rs` as
+`pub(crate)` free functions with the eye height passed in; the
+zombie, skeleton, creeper and spider modules import them.
+
+## 20. Wave 2 deviations, documented
+
+- No light engine: the spider's hostility gate uses the same
+  sky-exposure + sky-darken approximation as the burn check. The
+  skeleton's restrict-sun and flee-sun goals are omitted (they need
+  block light and a sun direction model); the daylight burn stays.
+- No player attacks on mobs: hurt-by target goals stay omitted
+  (wave 1 already omits them for the zombie).
+- No fluid physics for mobs: float goals are inert; drowning and
+  water walking do not exist.
+- Explosion drops: mob explosions destroy blocks without item drops
+  (the break system's drop path is break-action driven; wiring
+  explosion drops is out of wave 2 scope per the plan's file
+  boundaries).
+- Block resistance: approximated (section 16) until a resistance
+  pin exists.
+- Arrow pickup: skeletons' arrows are pickup-disallowed (the
+  reference default for mob arrows); no ground pickup modeling.
+- The skeleton's freeze conversion (stray) accessor stays at its
+  default; no powder snow exists.

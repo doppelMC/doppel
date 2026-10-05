@@ -4,9 +4,12 @@
 //! positions with the +-6 jitter, and validates each position against
 //! the player distances, the ground shape, and the darkness test.
 
+use crate::creeper::Creeper;
 use crate::game::entities::block_solid;
 use crate::game::Game;
 use crate::living::MobKind;
+use crate::skeleton::Skeleton;
+use crate::spider::Spider;
 use crate::zombie::Zombie;
 
 /// Monsters per 289 spawnable chunks (the full square at radius 8).
@@ -27,8 +30,14 @@ const PACK_SIZE: i32 = 4;
 const CLUSTER_CAP: i32 = 4;
 /// Jitter width per pack member.
 const JITTER: u64 = 6;
-/// Total spawn-list weight; the zombie slice is the only entry.
-const LIST_WEIGHT: u64 = 90;
+/// Total spawn-list weight: spider 100, zombie 90, skeleton 100,
+/// creeper 100 (the implemented slice of the plains monster list).
+const LIST_WEIGHT: u64 = 390;
+/// The spider's weight band and the zombie's.
+const SPIDER_WEIGHT: u64 = 100;
+const ZOMBIE_WEIGHT: u64 = 90;
+/// The skeleton's weight band.
+const SKELETON_WEIGHT: u64 = 100;
 
 /// Spawner and world-time state owned by the game thread.
 pub(crate) struct SpawnState {
@@ -108,6 +117,20 @@ pub fn monsters_burn(t: u64) -> bool {
 // ---------------------------------------------------------------------
 
 impl Game {
+    /// The named-kind summon: the mobs gate's deterministic driver.
+    pub(crate) fn spawn_named(&mut self, kind: &str, x: f64, y: f64, z: f64) {
+        let mob: Option<Box<dyn MobKind>> = match kind {
+            "minecraft:zombie" => Some(Box::new(Zombie::new())),
+            "minecraft:skeleton" => Some(Box::new(Skeleton::new())),
+            "minecraft:creeper" => Some(Box::new(Creeper::new())),
+            "minecraft:spider" => Some(Box::new(Spider::new())),
+            _ => None,
+        };
+        if let Some(mob) = mob {
+            self.spawn_mob(x, y, z, mob);
+        }
+    }
+
     /// The monster-category natural spawn pass, per spawnable chunk:
     /// cap gate, random start column, conductor abort, then the pack
     /// loop with the jitter and the position checks.
@@ -154,6 +177,7 @@ impl Game {
         let mut px = x;
         let mut pz = z;
         let mut cluster = 0;
+        let mut pick = 0u64;
         for _ in 0..GROUPS {
             // The group-size roll, spent before the members.
             let _size = self.spawning.draw(PACK_SIZE as u64);
@@ -170,21 +194,19 @@ impl Game {
                     // The weighted-entry pick and its count resample,
                     // spent at the first distance-valid position.
                     picked = true;
-                    let _pick = self.spawning.draw(LIST_WEIGHT);
+                    pick = self.spawning.draw(LIST_WEIGHT);
                     let _count = self.spawning.draw(1);
                 }
                 if self.mobs.mobs.len() as u64 >= cap {
                     return;
                 }
-                if !self.spawn_ground_ok(px, y, pz) || !self.spawn_dark_ok(px, y, pz, day) {
+                let kind = make_kind(pick);
+                if !self.spawn_ground_ok(px, y, pz, kind.half_width())
+                    || !self.spawn_dark_ok(px, y, pz, day)
+                {
                     continue;
                 }
-                self.spawn_mob(
-                    px as f64 + 0.5,
-                    y as f64,
-                    pz as f64 + 0.5,
-                    Box::new(Zombie::new()) as Box<dyn MobKind>,
-                );
+                self.spawn_mob(px as f64 + 0.5, y as f64, pz as f64 + 0.5, kind);
                 cluster += 1;
             }
         }
@@ -214,11 +236,24 @@ impl Game {
         any_near
     }
 
-    /// The ground rules: solid below, the cell and the one above clear.
-    fn spawn_ground_ok(&self, x: i32, y: i32, z: i32) -> bool {
-        block_solid(self, x, y - 1, z)
+    /// The ground rules: solid below, the cell and the one above
+    /// clear, and the body's corner columns clear for wide types.
+    fn spawn_ground_ok(&self, x: i32, y: i32, z: i32, half: f64) -> bool {
+        if !(block_solid(self, x, y - 1, z)
             && !block_solid(self, x, y, z)
-            && !block_solid(self, x, y + 1, z)
+            && !block_solid(self, x, y + 1, z))
+        {
+            return false;
+        }
+        let cx = x as f64 + 0.5;
+        let cz = z as f64 + 0.5;
+        for (dx, dz) in [(-half, -half), (half, -half), (-half, half), (half, half)] {
+            let (qx, qz) = ((cx + dx) as i32, (cz + dz) as i32);
+            if block_solid(self, qx, y, qz) || block_solid(self, qx, y + 1, qz) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The darkness test: the raw sky draw, the block-light ceiling,
@@ -234,6 +269,19 @@ impl Game {
         // Check 3: the darkened brightness against the sample.
         let brightness = (raw_sky - sky_darken(day)).max(0);
         brightness <= self.spawning.draw(8) as i32
+    }
+}
+
+/// The weighted-entry pick over the implemented bands, in list order.
+fn make_kind(pick: u64) -> Box<dyn MobKind> {
+    if pick < SPIDER_WEIGHT {
+        Box::new(Spider::new())
+    } else if pick < SPIDER_WEIGHT + ZOMBIE_WEIGHT {
+        Box::new(Zombie::new())
+    } else if pick < SPIDER_WEIGHT + ZOMBIE_WEIGHT + SKELETON_WEIGHT {
+        Box::new(Skeleton::new())
+    } else {
+        Box::new(Creeper::new())
     }
 }
 
@@ -423,6 +471,302 @@ mod tests {
     }
 
     #[test]
+    fn weighted_pick_covers_all_four_kinds() {
+        use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};
+        let ty = |pick: u64| make_kind(pick).type_id();
+        assert_eq!(ty(0), ENTITY_TYPE_SPIDER);
+        assert_eq!(ty(99), ENTITY_TYPE_SPIDER);
+        assert_eq!(ty(100), ENTITY_TYPE_ZOMBIE);
+        assert_eq!(ty(189), ENTITY_TYPE_ZOMBIE);
+        assert_eq!(ty(190), ENTITY_TYPE_SKELETON);
+        assert_eq!(ty(289), ENTITY_TYPE_SKELETON);
+        assert_eq!(ty(290), ENTITY_TYPE_CREEPER);
+        assert_eq!(ty(389), ENTITY_TYPE_CREEPER);
+    }
+
+    /// The wave-2 summon scenario, in process: the same command shape
+    /// the mobs gate drives, with the gate's structural assertions.
+    #[test]
+    fn summon_scenario_matches_the_gate_checks() {
+        use crate::explosion::PACKET_EXPLODE;
+        use crate::game::entities::{
+            PACKET_ADD_ENTITY, PACKET_REMOVE_ENTITIES, PACKET_SET_ENTITY_MOTION,
+        };
+        use crate::living::{
+            ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER, PACKET_SET_EQUIPMENT,
+        };
+        use crate::projectile::ENTITY_TYPE_ARROW;
+        let (mut g, rx) = world();
+        g.spawning.day_time = 18000;
+        g.spawning.spawn_mobs = false;
+        // The scripted volley: skeleton, retreat, spider, retreat,
+        // creeper, blast.
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:skeleton".into(),
+            x: 8.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        for _ in 0..180 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 44.5,
+            y: 100.0,
+            z: 0.5,
+        });
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:spider".into(),
+            x: 44.5,
+            y: 100.0,
+            z: 8.5,
+        });
+        for _ in 0..90 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 36.5,
+        });
+        for _ in 0..20 {
+            g.tick_once_for_test();
+        }
+        g.handle(Inbound::Summon {
+            conn: 0,
+            kind: "minecraft:creeper".into(),
+            x: 4.5,
+            y: 100.0,
+            z: 36.5,
+        });
+        for _ in 0..140 {
+            g.tick_once_for_test();
+        }
+        g.flush_connections();
+        let frames = drain(&rx);
+        // The add types.
+        let mut types = std::collections::BTreeSet::new();
+        let mut equipment_ids = Vec::new();
+        for (id, body) in &frames {
+            if *id != PACKET_ADD_ENTITY {
+                continue;
+            }
+            let (x, y, z, ty) = spawn_decode(body);
+            types.insert(ty);
+            let _ = (x, y, z);
+            if ty == ENTITY_TYPE_SKELETON {
+                equipment_ids.push(entity_id_of(body));
+            }
+        }
+        for want in [
+            ENTITY_TYPE_SKELETON,
+            ENTITY_TYPE_SPIDER,
+            ENTITY_TYPE_CREEPER,
+            ENTITY_TYPE_ARROW,
+        ] {
+            assert!(types.contains(&want), "missing add type {want}: {types:?}");
+        }
+        // The skeleton's main-hand equipment.
+        assert!(
+            frames.iter().any(|(id, b)| {
+                *id == PACKET_SET_EQUIPMENT
+                    && equipment_ids.contains(&entity_id_of(b))
+                    && b[entity_header_len(b)] == 0
+            }),
+            "the skeleton pairs with the main-hand bow"
+        );
+        // The arrow flies: motion or position packets reference it.
+        let arrow_id = frames
+            .iter()
+            .find_map(|(id, b)| {
+                if *id == PACKET_ADD_ENTITY && spawn_decode(b).3 == ENTITY_TYPE_ARROW {
+                    Some(entity_id_of(b))
+                } else {
+                    None
+                }
+            })
+            .expect("the arrow add");
+        let arrow_moves = frames.iter().any(|(id, b)| {
+            (*id == PACKET_SET_ENTITY_MOTION
+                || *id == crate::game::entities::PACKET_MOVE_ENTITY_POS
+                || *id == crate::game::entities::PACKET_ENTITY_POSITION_SYNC)
+                && entity_id_of(b) == arrow_id
+        });
+        assert!(arrow_moves, "the arrow sends movement");
+        // The creeper swells, detonates, and leaves no corpse.
+        let creeper_id = frames
+            .iter()
+            .find_map(|(id, b)| {
+                if *id == PACKET_ADD_ENTITY && spawn_decode(b).3 == ENTITY_TYPE_CREEPER {
+                    Some(entity_id_of(b))
+                } else {
+                    None
+                }
+            })
+            .expect("the creeper add");
+        let swelled = frames.iter().any(|(id, b)| {
+            *id == crate::game::entities::PACKET_SET_ENTITY_DATA
+                && entity_id_of(b) == creeper_id
+                && b[entity_header_len(b)] == 16
+        });
+        assert!(swelled, "the swell datum goes out");
+        assert!(
+            frames.iter().any(|(id, _)| *id == PACKET_EXPLODE),
+            "the explosion packet goes out"
+        );
+        assert!(
+            frames.iter().any(|(id, _)| *id == PACKET_REMOVE_ENTITIES),
+            "the creeper is removed"
+        );
+        let updates = frames
+            .iter()
+            .filter(|(id, _)| *id == 0x08 || *id == 0x56)
+            .count();
+        assert!(updates > 0, "the blast clears blocks");
+    }
+
+    /// The entity id leading a packet body.
+    fn entity_id_of(body: &[u8]) -> i32 {
+        let mut i = 0usize;
+        let mut v = 0i32;
+        let mut shift = 0;
+        loop {
+            let b = body[i];
+            i += 1;
+            v |= ((b & 0x7f) as i32) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return v;
+            }
+        }
+    }
+
+    /// The byte length of the leading entity-id varint.
+    fn entity_header_len(body: &[u8]) -> usize {
+        let mut i = 0usize;
+        while body[i] & 0x80 != 0 {
+            i += 1;
+        }
+        i + 1
+    }
+
+    /// The (x, y, z, type) of an add_entity body.
+    fn spawn_decode(body: &[u8]) -> (f64, f64, f64, i32) {
+        let mut i = entity_header_len(body) + 16;
+        let mut ty = 0i32;
+        let mut shift = 0;
+        loop {
+            let b = body[i];
+            i += 1;
+            ty |= ((b & 0x7f) as i32) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        let rd = |i: usize| f64::from_be_bytes(body[i..i + 8].try_into().unwrap());
+        (rd(i), rd(i + 8), rd(i + 16), ty)
+    }
+
+    /// Reads the streamed-world chunk under the scenario-two summons,
+    /// when a local vanilla capture exists. The flat fallback and the
+    /// uncaptured-anvil path must both read a solid floor.
+    #[test]
+    fn streamed_chunks_hold_the_floor() {
+        let root = doppel_protocol::find_repo_root().expect("repo root");
+        let pristine = root
+            .join("target")
+            .join("vanilla")
+            .join("pristine-world-mobs");
+        let blobs_dir = root.join("target").join("vanilla").join("blobs-mobs");
+        if !pristine.is_dir() || !blobs_dir.is_dir() {
+            return;
+        }
+        let (_tx, rx) = mpsc::channel::<Inbound>();
+        let mut world = crate::WorldState {
+            dir: doppel_world::WorldDir::open(&pristine).expect("world dir"),
+            boot: Default::default(),
+            root: pristine.clone(),
+            level: Default::default(),
+            level_readonly: false,
+        };
+        let blobs = crate::blobs::load(&blobs_dir).expect("blobs");
+        // The join replay's learning, replayed here: every captured
+        // chunk that exists on disk teaches the palette map.
+        let mut learned = 0usize;
+        for (id, body) in blobs.play.iter() {
+            if *id != 0x2e {
+                continue;
+            }
+            if let Ok(chunk) = doppel_world::WireChunk::decode(body) {
+                if let Ok(Some(anvil)) = world.dir.chunk(chunk.x, chunk.z) {
+                    world.boot.learn(&chunk, &anvil);
+                    learned += 1;
+                }
+            }
+        }
+        eprintln!("[probe] learned {learned} reference chunks");
+        let mut g = Game::new(
+            rx,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(world))),
+            Some(std::sync::Arc::new(blobs)),
+        );
+        assert!(g.registry_for_test());
+        for &(x, z) in &[(100i32, 100i32), (160, 100), (100, 160), (96, 96)] {
+            let cx = x.div_euclid(16);
+            let cz = z.div_euclid(16);
+            assert!(g.ensure_chunk_loaded(cx, cz), "chunk ({cx},{cz}) loads");
+            let label = g.block_label_for_test(x, -61, z);
+            eprintln!("[probe] ({x},{z}) floor label: {label}");
+            assert!(
+                label.starts_with("minecraft:grass") || label.starts_with("minecraft:dirt"),
+                "floor at ({x},-61,{z}) reads {label}"
+            );
+            assert!(
+                crate::game::entities::block_solid(&g, x, -61, z),
+                "floor at ({x},-61,{z}) reads solid"
+            );
+        }
+    }
+
+    #[test]
+    fn midnight_spawns_all_four_kinds() {
+        use crate::living::{ENTITY_TYPE_CREEPER, ENTITY_TYPE_SKELETON, ENTITY_TYPE_SPIDER};
+        let (mut g, rx) = world();
+        g.spawning.day_time = 18000;
+        g.spawning.time_running = true;
+        for _ in 0..2000 {
+            g.tick_once_for_test();
+        }
+        let frames = drain(&rx);
+        let types: std::collections::BTreeSet<i32> = spawn_positions(&frames)
+            .into_iter()
+            .map(|(_, _, _, t)| t)
+            .collect();
+        for want in [
+            ENTITY_TYPE_ZOMBIE,
+            ENTITY_TYPE_SKELETON,
+            ENTITY_TYPE_CREEPER,
+            ENTITY_TYPE_SPIDER,
+        ] {
+            assert!(types.contains(&want), "missing type {want} in {types:?}");
+        }
+    }
+
+    #[test]
     fn midnight_spawns_zombies_within_the_rules() {
         let (mut g, rx) = world();
         g.spawning.day_time = 18000;
@@ -432,17 +776,13 @@ mod tests {
         }
         let frames = drain(&rx);
         let spawns = spawn_positions(&frames);
-        assert!(
-            spawns.iter().any(|(_, _, _, ty)| *ty == ENTITY_TYPE_ZOMBIE),
-            "zombies appear at midnight"
-        );
+        assert!(!spawns.is_empty(), "monsters appear at midnight");
         assert!(!g.mobs.mobs.is_empty(), "the mob list holds the survivors");
         assert!(
             g.mobs.mobs.len() as u64 <= category_cap(25),
             "the cluster stays under the category cap"
         );
-        for (x, y, z, ty) in &spawns {
-            assert_eq!(*ty, ENTITY_TYPE_ZOMBIE, "only zombies spawn");
+        for (x, y, z, _ty) in &spawns {
             assert!(
                 (x - x.floor() - 0.5).abs() < 1.0e-9,
                 "x at the block center: {x}"

@@ -3,14 +3,19 @@
 //! captured from the vanilla oracle.
 
 pub mod blobs;
+pub mod creeper;
 pub mod dig;
+pub mod explosion;
 pub mod game;
 pub mod inventory;
 pub mod living;
 pub mod pathing;
 pub mod persistence;
 pub mod placement;
+pub mod projectile;
+pub mod skeleton;
 pub mod spawning;
+pub mod spider;
 pub mod wire;
 pub mod zombie;
 
@@ -705,6 +710,23 @@ fn mob_command(conn: game::ConnId, parts: &[&str]) -> Option<game::Inbound> {
             word => word.parse::<i64>().ok()? % 24000,
         };
         return Some(game::Inbound::TimeSet { conn, value });
+    }
+    // `summon <kind> <x> <y> <z>`: the mobs gate's deterministic
+    // spawn driver.
+    if parts.len() == 5 && parts[0] == "summon" {
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            parts[2].parse::<f64>(),
+            parts[3].parse::<f64>(),
+            parts[4].parse::<f64>(),
+        ) {
+            return Some(game::Inbound::Summon {
+                conn,
+                kind: parts[1].to_string(),
+                x,
+                y,
+                z,
+            });
+        }
     }
     // `difficulty <word>`: peaceful removes monsters.
     if parts.len() == 2 && parts[0] == "difficulty" {

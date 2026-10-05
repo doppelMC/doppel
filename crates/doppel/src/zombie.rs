@@ -1,11 +1,11 @@
 //! The zombie: an undead melee mob that targets the nearest visible
 //! player, strolls and looks around while idle, and burns in daylight.
 
-use crate::game::entities::block_solid;
-use crate::game::ConnId;
-use crate::game::Game;
-use crate::living::{Goal, GoalCtx, GoalFlags, GoalSelector, MobKind, FIRE_IGNITE_TICKS};
-use crate::spawning::{monsters_burn, sky_darken};
+use crate::living::{
+    brightness, ChaseHitGoal, GlanceGoal, GoalCtx, GoalSelector, IdleStrollGoal, MobKind,
+    NearestPlayerTargetGoal, WatchPlayerGoal, FIRE_IGNITE_TICKS,
+};
+use crate::spawning::monsters_burn;
 
 /// Follow range (the attribute at default).
 const FOLLOW_RANGE: f64 = 35.0;
@@ -19,12 +19,8 @@ const HALF_WIDTH: f64 = 0.3;
 const HEIGHT: f64 = 1.95;
 /// Eye height.
 const EYE: f64 = 1.74;
-/// Player eye height.
-const PLAYER_EYE: f64 = 1.62;
 /// Melee reach: both half widths plus the 0.83 inflation.
 const REACH: f64 = HALF_WIDTH + 0.3 + 0.83;
-/// Attack cooldown, in ticks (the 20-tick interval halved).
-const ATTACK_COOLDOWN: i32 = 10;
 /// Ticks between target scans, in full-cadence passes.
 const TARGET_SCAN_EVERY: i32 = 5;
 /// Unseen-tick budget before a target drops.
@@ -39,339 +35,6 @@ const LOOK_CHANCE: u64 = 50;
 const LOOK_RANGE: f64 = 8.0;
 /// Stroll give-up, in ticks.
 const STROLL_GIVE_UP: i32 = 200;
-
-/// Whether the sight line between two eye points is clear.
-fn visible(world: &Game, from: (f64, f64, f64), to: (f64, f64, f64)) -> bool {
-    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
-    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-    let steps = (dist * 2.0).ceil() as i32;
-    for s in 1..steps {
-        let t = s as f64 / steps as f64;
-        let (x, y, z) = (from.0 + dx * t, from.1 + dy * t, from.2 + dz * t);
-        if block_solid(world, x.floor() as i32, y.floor() as i32, z.floor() as i32) {
-            return false;
-        }
-    }
-    true
-}
-
-/// The mob eye position.
-fn eye_of(body: &crate::living::MobBody) -> (f64, f64, f64) {
-    (body.x, body.y + EYE, body.z)
-}
-
-/// The player eye position above the feet.
-fn eye_at(pos: (f64, f64, f64)) -> (f64, f64, f64) {
-    (pos.0, pos.1 + PLAYER_EYE, pos.2)
-}
-
-/// The look angles from the mob's eyes toward a point.
-fn look_angles(from: (f64, f64, f64), to: (f64, f64, f64)) -> (f32, f32) {
-    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
-    let horiz = (dx * dx + dz * dz).sqrt();
-    (
-        (-dx).atan2(dz).to_degrees() as f32,
-        -dy.atan2(horiz).to_degrees() as f32,
-    )
-}
-
-// ---------------------------------------------------------------------
-// Goals
-// ---------------------------------------------------------------------
-
-/// The melee attack: chase the target, look at it, hit inside the
-/// reach once the attack cooldown spends.
-struct MeleeAttackGoal {
-    check_in: i32,
-    cooldown: i32,
-    target: Option<ConnId>,
-    last_path: (f64, f64),
-}
-
-impl MeleeAttackGoal {
-    fn new() -> MeleeAttackGoal {
-        MeleeAttackGoal {
-            check_in: 0,
-            cooldown: 0,
-            target: None,
-            last_path: (0.0, 0.0),
-        }
-    }
-}
-
-impl Goal for MeleeAttackGoal {
-    fn flags(&self) -> GoalFlags {
-        GoalFlags::MOVE.union(GoalFlags::LOOK)
-    }
-
-    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        // The scan gate: one evaluation per 20 game ticks.
-        if self.check_in > 0 {
-            self.check_in -= 1;
-            return false;
-        }
-        self.check_in = ATTACK_COOLDOWN;
-        let Some(conn) = ctx.body.target else {
-            return false;
-        };
-        self.target = ctx.player_pos(conn).map(|_| conn);
-        self.target.is_some()
-    }
-
-    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        let Some(conn) = self.target else {
-            return false;
-        };
-        if ctx.body.target != Some(conn) {
-            return false;
-        }
-        match ctx.player_pos(conn) {
-            Some((x, y, z)) => {
-                let (dx, dy, dz) = (x - ctx.body.x, y - ctx.body.y, z - ctx.body.z);
-                dx * dx + dy * dy + dz * dz <= FOLLOW_RANGE * FOLLOW_RANGE
-            }
-            None => false,
-        }
-    }
-
-    fn start(&mut self, ctx: &mut GoalCtx) {
-        self.cooldown = ATTACK_COOLDOWN;
-        ctx.body.melee_active = true;
-        if let Some((x, _, z)) = ctx.body.target.and_then(|conn| ctx.player_pos(conn)) {
-            self.last_path = (x, z);
-            ctx.body.nav.move_to(x, z, 1.0);
-        }
-    }
-
-    fn stop(&mut self, ctx: &mut GoalCtx) {
-        ctx.body.melee_active = false;
-        ctx.body.look = None;
-        ctx.body.nav.stop();
-        self.target = None;
-    }
-
-    fn tick(&mut self, ctx: &mut GoalCtx) {
-        self.cooldown -= 1;
-        let Some(conn) = self.target.or(ctx.body.target) else {
-            return;
-        };
-        let Some((px, py, pz)) = ctx.player_pos(conn) else {
-            return;
-        };
-        // Look at the target's eyes.
-        ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at((px, py, pz))));
-        // Re-path when the target moved a block or on the 5% roll.
-        let moved = (px - self.last_path.0) * (px - self.last_path.0)
-            + (pz - self.last_path.1) * (pz - self.last_path.1);
-        if moved >= 1.0 || ctx.below(20) == 0 {
-            self.last_path = (px, pz);
-            ctx.body.nav.retarget(px, pz, 1.0);
-        }
-        // The hit: cooldown spent, inside reach, sight line clear.
-        if self.cooldown > 0 {
-            return;
-        }
-        let (dy, horiz) = (
-            py + PLAYER_EYE - ctx.body.y - EYE,
-            ((px - ctx.body.x) * (px - ctx.body.x) + (pz - ctx.body.z) * (pz - ctx.body.z)).sqrt(),
-        );
-        if horiz >= REACH || dy.abs() > 2.5 {
-            return;
-        }
-        if !visible(ctx.world, eye_of(ctx.body), eye_at((px, py, pz))) {
-            return;
-        }
-        ctx.body.pending_hit = Some(conn);
-        self.cooldown = ATTACK_COOLDOWN;
-    }
-
-    fn requires_every_tick(&self) -> bool {
-        true
-    }
-}
-
-/// The idle stroll: a random nearby column on a 1/60 roll.
-struct RandomStrollGoal;
-
-impl Goal for RandomStrollGoal {
-    fn flags(&self) -> GoalFlags {
-        GoalFlags::MOVE
-    }
-
-    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        if ctx.body.no_action_time >= 100 {
-            return false;
-        }
-        if ctx.below(STROLL_CHANCE) != 0 {
-            return false;
-        }
-        let span = (STROLL_RANGE * 2 + 1) as u64;
-        let x = ctx.body.x + (ctx.below(span) as f64 - STROLL_RANGE as f64);
-        let z = ctx.body.z + (ctx.below(span) as f64 - STROLL_RANGE as f64);
-        ctx.body.nav.move_to(x, z, 1.0);
-        true
-    }
-
-    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        ctx.body.nav.in_progress() && ctx.body.nav.tick_age(STROLL_GIVE_UP)
-    }
-}
-
-/// Look at the nearest player inside 8 blocks.
-struct LookAtPlayerGoal {
-    remaining: i32,
-    duration: i32,
-    conn: Option<ConnId>,
-}
-
-impl Goal for LookAtPlayerGoal {
-    fn flags(&self) -> GoalFlags {
-        GoalFlags::LOOK
-    }
-
-    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        if ctx.below(LOOK_CHANCE) != 0 {
-            return false;
-        }
-        let Some((conn, pos)) = ctx.nearest_player(LOOK_RANGE) else {
-            return false;
-        };
-        if !visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
-            return false;
-        }
-        self.conn = Some(conn);
-        self.duration = 20 + ctx.below(20) as i32;
-        true
-    }
-
-    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        self.remaining > 0
-            && self.conn.is_some_and(|c| {
-                ctx.player_pos(c).is_some_and(|p| {
-                    let (dx, dy, dz) = (p.0 - ctx.body.x, p.1 - ctx.body.y, p.2 - ctx.body.z);
-                    dx * dx + dy * dy + dz * dz < (LOOK_RANGE + 1.0) * (LOOK_RANGE + 1.0)
-                })
-            })
-    }
-
-    fn start(&mut self, _ctx: &mut GoalCtx) {
-        self.remaining = self.duration;
-    }
-
-    fn stop(&mut self, ctx: &mut GoalCtx) {
-        ctx.body.look = None;
-    }
-
-    fn tick(&mut self, ctx: &mut GoalCtx) {
-        self.remaining -= 1;
-        if let Some(conn) = self.conn {
-            if let Some(pos) = ctx.player_pos(conn) {
-                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at(pos)));
-            }
-        }
-    }
-}
-
-/// A random horizontal glance.
-struct RandomLookGoal {
-    remaining: i32,
-    duration: i32,
-    want: (f32, f32),
-}
-
-impl Goal for RandomLookGoal {
-    fn flags(&self) -> GoalFlags {
-        GoalFlags::MOVE.union(GoalFlags::LOOK)
-    }
-
-    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        if ctx.below(LOOK_CHANCE) != 0 {
-            return false;
-        }
-        self.want = (ctx.below(360) as f32, 0.0);
-        self.duration = 20 + ctx.below(20) as i32;
-        true
-    }
-
-    fn can_continue_to_use(&mut self, _ctx: &mut GoalCtx) -> bool {
-        self.remaining > 0
-    }
-
-    fn start(&mut self, _ctx: &mut GoalCtx) {
-        self.remaining = self.duration;
-    }
-
-    fn stop(&mut self, ctx: &mut GoalCtx) {
-        ctx.body.look = None;
-    }
-
-    fn tick(&mut self, ctx: &mut GoalCtx) {
-        self.remaining -= 1;
-        ctx.body.look = Some(self.want);
-    }
-}
-
-/// Target the nearest player inside the follow range with a clear
-/// sight line; drop it when unseen or out of range.
-struct NearestPlayerTargetGoal {
-    scan_in: i32,
-    unseen: i32,
-}
-
-impl NearestPlayerTargetGoal {
-    fn new() -> NearestPlayerTargetGoal {
-        NearestPlayerTargetGoal {
-            scan_in: 0,
-            unseen: 0,
-        }
-    }
-}
-
-impl Goal for NearestPlayerTargetGoal {
-    fn flags(&self) -> GoalFlags {
-        GoalFlags::TARGET
-    }
-
-    fn can_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        if self.scan_in > 0 {
-            self.scan_in -= 1;
-            return false;
-        }
-        self.scan_in = TARGET_SCAN_EVERY;
-        let Some((conn, pos)) = ctx.nearest_player(FOLLOW_RANGE) else {
-            return false;
-        };
-        if !visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
-            return false;
-        }
-        self.unseen = 0;
-        ctx.body.target = Some(conn);
-        true
-    }
-
-    fn can_continue_to_use(&mut self, ctx: &mut GoalCtx) -> bool {
-        let Some(conn) = ctx.body.target else {
-            return false;
-        };
-        let Some(pos) = ctx.player_pos(conn) else {
-            return false;
-        };
-        let (dx, dy, dz) = (pos.0 - ctx.body.x, pos.1 - ctx.body.y, pos.2 - ctx.body.z);
-        if dx * dx + dy * dy + dz * dz > FOLLOW_RANGE * FOLLOW_RANGE {
-            return false;
-        }
-        if visible(ctx.world, eye_of(ctx.body), eye_at(pos)) {
-            self.unseen = 0;
-        } else {
-            self.unseen += 1;
-        }
-        self.unseen <= UNSEEN_LIMIT
-    }
-
-    fn stop(&mut self, ctx: &mut GoalCtx) {
-        ctx.body.target = None;
-    }
-}
 
 // ---------------------------------------------------------------------
 // The kind
@@ -405,6 +68,10 @@ impl MobKind for Zombie {
         HEIGHT
     }
 
+    fn eye(&self) -> f64 {
+        EYE
+    }
+
     fn base_speed(&self) -> f64 {
         SPEED
     }
@@ -418,32 +85,34 @@ impl MobKind for Zombie {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(3, Box::new(MeleeAttackGoal::new()));
-        goals.add(7, Box::new(RandomStrollGoal));
+        goals.add(3, Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, true)));
         goals.add(
-            8,
-            Box::new(LookAtPlayerGoal {
-                remaining: 0,
-                duration: 0,
-                conn: None,
-            }),
+            7,
+            Box::new(IdleStrollGoal::new(
+                STROLL_RANGE,
+                STROLL_CHANCE,
+                STROLL_GIVE_UP,
+                1.0,
+            )),
         );
-        goals.add(
-            8,
-            Box::new(RandomLookGoal {
-                remaining: 0,
-                duration: 0,
-                want: (0.0, 0.0),
-            }),
+        goals.add(8, Box::new(WatchPlayerGoal::new(LOOK_RANGE, LOOK_CHANCE)));
+        goals.add(8, Box::new(GlanceGoal::new(LOOK_CHANCE)));
+        targets.add(
+            2,
+            Box::new(NearestPlayerTargetGoal::new(
+                TARGET_SCAN_EVERY,
+                UNSEEN_LIMIT,
+                FOLLOW_RANGE,
+                None,
+            )),
         );
-        targets.add(2, Box::new(NearestPlayerTargetGoal::new()));
     }
 
     fn kind_tick(&mut self, ctx: &mut GoalCtx) {
         let day = ctx.world.spawning.day_time;
         // Bright locations hasten the despawn clock.
         let bright = if ctx.body.exposed {
-            (15 - sky_darken(day)).max(0) as f64 / 15.0
+            brightness(ctx.world, ctx.body)
         } else {
             0.0
         };
@@ -469,7 +138,7 @@ impl MobKind for Zombie {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::entities::PACKET_SET_ENTITY_DATA;
+    use crate::game::entities::{block_solid, PACKET_SET_ENTITY_DATA};
     use crate::game::{Inbound, Outbound};
     use crate::living::PACKET_DAMAGE_EVENT;
     use doppel_world::WireChunk;
@@ -612,6 +281,78 @@ mod tests {
         }
         let end = dist(&g);
         assert!(end < start - 1.0, "chase moved closer: {start} -> {end}");
+    }
+
+    #[test]
+    fn navigation_routes_around_a_wall() {
+        let (mut g, _rx) = harness();
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 1.5,
+        });
+        // A 2-tall wall at x=6 across z=0..=3; the gap opens north.
+        for z in 0..=3i32 {
+            for y in 100..=101i32 {
+                g.handle(Inbound::Setblock {
+                    conn: 0,
+                    x: 6,
+                    y,
+                    z,
+                    name: "minecraft:stone".to_string(),
+                });
+            }
+        }
+        g.spawn_mob(12.5, 100.0, 1.5, Box::new(Zombie::new()));
+        let mut nav = crate::pathing::Nav::new();
+        nav.move_to(0.5, 1.5, 1.0);
+        nav.nav_tick(12.5, 100.0, 1.5, true, &|x, y, z| block_solid(&g, x, y, z));
+        let route = nav.route();
+        assert!(
+            !route.iter().any(|wp| wp.x == 6 && wp.z <= 3),
+            "the waypoints avoid the wall: {route:?}"
+        );
+        assert_eq!(route.last().map(|wp| (wp.x, wp.z)), Some((0, 1)));
+    }
+
+    #[test]
+    fn chase_closes_through_a_gap() {
+        let (mut g, _rx) = harness();
+        // A 2-tall wall at x=6 across z=0..=5; the sight line and the
+        // route pass through the z=6 gap.
+        for z in 0..=5i32 {
+            for y in 100..=101i32 {
+                g.handle(Inbound::Setblock {
+                    conn: 0,
+                    x: 6,
+                    y,
+                    z,
+                    name: "minecraft:stone".to_string(),
+                });
+            }
+        }
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 0.5,
+            y: 100.0,
+            z: 6.5,
+        });
+        g.spawn_mob(12.5, 100.0, 6.5, Box::new(Zombie::new()));
+        let dist = |g: &crate::game::Game| {
+            let m = &g.mobs.mobs[0];
+            let (dx, dz) = (m.body.x - 0.5, m.body.z - 6.5);
+            (dx * dx + dz * dz).sqrt()
+        };
+        let start = dist(&g);
+        for _ in 0..200 {
+            g.tick_once_for_test();
+        }
+        let end = dist(&g);
+        assert!(
+            end < start - 8.0,
+            "the chase crossed the gap: {start} -> {end}"
+        );
     }
 
     #[test]
