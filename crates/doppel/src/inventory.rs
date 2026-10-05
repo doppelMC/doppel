@@ -39,6 +39,115 @@ pub const PACKET_SET_CURSOR_ITEM: i32 = 0x62;
 pub const PACKET_SET_HELD_SLOT: i32 = 0x6b;
 /// `set_player_inventory`. 26.3 registration order - wire-verify.
 pub const PACKET_SET_PLAYER_INVENTORY: i32 = 0x6e;
+/// `game_event`: the join capture sends the level-chunks-load-start
+/// event (0x0d, 0.0) two frames after set_time.
+pub const PACKET_GAME_EVENT: i32 = 0x27;
+/// `player_abilities`: the join capture sends the survival form
+/// (flags 0, 0.05, 0.1) right after login and change_difficulty.
+pub const PACKET_PLAYER_ABILITIES: i32 = 0x41;
+/// `player_info_update`: a mode switch broadcasts the UPDATE_GAME_MODE
+/// action to every player between the two abilities packets.
+pub const PACKET_PLAYER_INFO_UPDATE: i32 = 0x47;
+
+/// The four game modes, registry-id order (the `game_event` param).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl GameMode {
+    pub fn id(self) -> i32 {
+        match self {
+            GameMode::Survival => 0,
+            GameMode::Creative => 1,
+            GameMode::Adventure => 2,
+            GameMode::Spectator => 3,
+        }
+    }
+
+    /// The creative flag the inventory, placement, and dig paths gate on.
+    pub fn is_creative(self) -> bool {
+        self == GameMode::Creative
+    }
+
+    /// The capitalized name the gamemode command feedback carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            GameMode::Survival => "Survival",
+            GameMode::Creative => "Creative",
+            GameMode::Adventure => "Adventure",
+            GameMode::Spectator => "Spectator",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<GameMode> {
+        Some(match name {
+            "survival" => GameMode::Survival,
+            "creative" => GameMode::Creative,
+            "adventure" => GameMode::Adventure,
+            "spectator" => GameMode::Spectator,
+            _ => return None,
+        })
+    }
+
+    /// The `player_abilities` flag set the mode grants; `flying` adds the
+    /// FLYING bit for the modes that allow it (survival and adventure
+    /// force it off).
+    pub fn ability_flags(self, flying: bool) -> u8 {
+        let granted = match self {
+            GameMode::Creative => ability::INVULNERABLE | ability::MAYFLY | ability::INSTABUILD,
+            GameMode::Spectator => ability::INVULNERABLE | ability::MAYFLY | ability::FLYING,
+            GameMode::Survival | GameMode::Adventure => return 0,
+        };
+        if flying {
+            granted | ability::FLYING
+        } else {
+            granted
+        }
+    }
+}
+
+/// The `player_abilities` flag bits, in wire order.
+pub mod ability {
+    pub const INVULNERABLE: u8 = 0x01;
+    pub const FLYING: u8 = 0x02;
+    pub const MAYFLY: u8 = 0x04;
+    pub const INSTABUILD: u8 = 0x08;
+}
+
+/// `game_event` body: u8 event id, f32 param.
+pub fn encode_game_event(event: u8, param: f32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(5);
+    b.push(event);
+    b.extend_from_slice(&param.to_be_bytes());
+    b
+}
+
+/// `player_abilities` body: flags byte, f32 flying speed, f32 walk speed.
+pub fn encode_player_abilities(flags: u8, flying_speed: f32, walk_speed: f32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(9);
+    b.push(flags);
+    b.extend_from_slice(&flying_speed.to_be_bytes());
+    b.extend_from_slice(&walk_speed.to_be_bytes());
+    b
+}
+
+/// `player_info_update` body for one UPDATE_GAME_MODE entry: the action
+/// bitset (bit 2), the entry count, the player's UUID, the mode id.
+pub fn encode_player_info_update_game_mode(uuid: &[u8; 16], mode_id: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(19);
+    b.push(0x04);
+    b.push(0x01);
+    b.extend_from_slice(uuid);
+    doppel_protocol::write_varint(&mut b, mode_id);
+    b
+}
+
+/// The gamemode-change `game_event` param: the mode's registry id.
+pub const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
 
 /// Serverbound `container_click`.
 pub const SERVERBOUND_CONTAINER_CLICK: i32 = 0x12;
@@ -50,6 +159,9 @@ pub const SERVERBOUND_SET_CARRIED_ITEM: i32 = 0x36;
 
 /// Serverbound `container_close`, for completeness. 26.3 registration order.
 pub const SERVERBOUND_CONTAINER_CLOSE: i32 = 0x13;
+/// Serverbound `player_abilities` (the client toggling flight). 26.3
+/// registration order; only the flying bit carries meaning upward.
+pub const SERVERBOUND_PLAYER_ABILITIES: i32 = 0x28;
 
 // ---------------------------------------------------------------------
 // Data components
@@ -407,6 +519,11 @@ const ITEM_IDS: &[(&str, i32)] = &[
     ("minecraft:diamond_sword", 1050),
     ("minecraft:diamond_pickaxe", 1052),
     ("minecraft:netherite_sword", 1055),
+    ("minecraft:wooden_pickaxe", 1027),
+    ("minecraft:stone_pickaxe", 1037),
+    ("minecraft:golden_pickaxe", 1042),
+    ("minecraft:iron_pickaxe", 1047),
+    ("minecraft:netherite_pickaxe", 1057),
 ];
 
 /// An item name -> registry id table. The default table loads the full
@@ -745,6 +862,17 @@ pub fn parse_set_carried_item(body: &[u8]) -> Result<i16> {
     Ok(slot)
 }
 
+/// Parses a serverbound player_abilities body: one flags byte; only the
+/// flying bit is meaningful (the client cannot grant itself the rest).
+pub fn parse_player_abilities(body: &[u8]) -> Result<bool> {
+    let mut r = Reader::new(body);
+    let flags = r.read_u8().context("abilities flags")?;
+    if r.remaining() != 0 {
+        bail!("trailing bytes in player_abilities");
+    }
+    Ok(flags & ability::FLYING != 0)
+}
+
 // ---------------------------------------------------------------------
 // Click semantics (vanilla `AbstractContainerMenu.doClick`, inventory menu)
 // ---------------------------------------------------------------------
@@ -771,17 +899,38 @@ impl MenuSession {
 /// Per-player inventory state: the inventory itself, the always-open
 /// inventory menu's session (containerId 0), and the materials flag
 /// gating CLONE / clone-drags.
-#[derive(Default)]
 pub struct PlayerInvState {
     pub inventory: PlayerInventory,
     /// The inventory menu's click session.
     pub session: MenuSession,
-    /// `hasInfiniteMaterials` (creative). No gamemode system yet, so this
-    /// starts false; the harness flips it via `set_creative_for_test`.
+    /// `hasInfiniteMaterials` (creative). Starts false at join (the
+    /// replayed login burst carries survival); `gamemode` flips it.
     pub creative: bool,
+    /// `abilities.flying`: the client's own toggle, accepted only while
+    /// it may fly.
+    pub flying: bool,
+    /// `abilities.mayfly`: granted by creative and spectator.
+    pub mayfly: bool,
+    /// The current mode; a same-mode switch sends nothing but the
+    /// command feedback (the reference's changeGameModeForPlayer).
+    pub mode: GameMode,
     /// Slots changed outside a click (a placement's spent stack, a drop)
     /// awaiting the per-tick menu broadcast.
     pub pending_sync: std::collections::BTreeSet<usize>,
+}
+
+impl Default for PlayerInvState {
+    fn default() -> Self {
+        PlayerInvState {
+            inventory: PlayerInventory::default(),
+            session: MenuSession::default(),
+            creative: false,
+            flying: false,
+            mayfly: false,
+            mode: GameMode::Survival,
+            pending_sync: std::collections::BTreeSet::new(),
+        }
+    }
 }
 
 /// The slot access a menu's click engine runs against: menu slot ids
@@ -1500,23 +1649,44 @@ impl Game {
         }
     }
 
+    /// Serverbound set_creative_mode_slot: creative-only. Slots 1..=45
+    /// write the menu slot (0 is the crafting result, never written); a
+    /// negative slot is the client dropping the picked stack outside the
+    /// menu. No echo: the client predicts the write and the server's
+    /// remote view matches, so the reference's broadcastChanges is quiet.
     pub(crate) fn creative_slot(&mut self, conn: ConnId, set: CreativeSlotSet) {
-        let Some(p) = self.players.get(&conn) else {
+        let valid_data = set
+            .stack
+            .as_ref()
+            .is_none_or(|s| s.count() <= s.max_stack_size());
+        if !valid_data {
+            return;
+        }
+        if set.slot < 0 {
+            let stack = {
+                let Some(p) = self.players.get(&conn) else {
+                    return;
+                };
+                if !p.inv.creative {
+                    return;
+                }
+                set.stack
+            };
+            if let Some(stack) = stack {
+                self.spawn_thrown_drop(conn, stack);
+            }
+            return;
+        }
+        if !(1..=45).contains(&set.slot) {
+            return;
+        }
+        let slot = set.slot as usize;
+        let Some(p) = self.players.get_mut(&conn) else {
             return;
         };
         if !p.inv.creative {
             return;
         }
-        if set.slot < 0 {
-            return;
-        }
-        let slot = set.slot as usize;
-        if slot >= 46 {
-            return;
-        }
-        let Some(p) = self.players.get_mut(&conn) else {
-            return;
-        };
         crate::inventory::menu_slot_set(&mut p.inv.inventory, slot, set.stack);
     }
 
@@ -1937,7 +2107,7 @@ mod tests {
         let (mut g, rx) = harness();
         g.handle(Inbound::GameMode {
             conn: 0,
-            creative: false,
+            mode: crate::game::GameMode::Survival,
         });
         while rx.try_recv().is_ok() {}
         let survival_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
@@ -1954,7 +2124,7 @@ mod tests {
 
         g.handle(Inbound::GameMode {
             conn: 0,
-            creative: true,
+            mode: crate::game::GameMode::Creative,
         });
         let creative_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot {
@@ -1968,6 +2138,215 @@ mod tests {
             .get(0)
             .expect("creative push lands");
         assert_eq!((got.count(), got.item()), (1, 1));
+    }
+
+    /// The gamemode packets, byte for byte and in wire order: abilities,
+    /// player_info_update (UPDATE_GAME_MODE), game_event (mode id),
+    /// abilities again, the command feedback.
+    #[test]
+    fn gamemode_sends_game_event_then_abilities() {
+        let (mut g, rx) = harness();
+        let uuid = g.players.get(&0).expect("player").uuid;
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        let frames = drain_frames(&rx);
+        let order: Vec<i32> = frames.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            order,
+            vec![
+                PACKET_PLAYER_ABILITIES,
+                PACKET_PLAYER_INFO_UPDATE,
+                PACKET_GAME_EVENT,
+                PACKET_PLAYER_ABILITIES,
+                0x7c
+            ],
+            "wire order (the reply trails)"
+        );
+        let creative_abilities = vec![
+            ability::INVULNERABLE | ability::MAYFLY | ability::INSTABUILD,
+            0x3d,
+            0x4c,
+            0xcc,
+            0xcd,
+            0x3d,
+            0xcc,
+            0xcc,
+            0xcd,
+        ];
+        assert_eq!(frames[0].1, creative_abilities, "leading abilities bytes");
+        let mut creative_info = vec![0x04, 0x01];
+        creative_info.extend_from_slice(&uuid);
+        creative_info.push(1);
+        assert_eq!(
+            frames[1].1, creative_info,
+            "UPDATE_GAME_MODE info update bytes"
+        );
+        assert_eq!(
+            frames[2].1,
+            vec![GAME_EVENT_CHANGE_GAME_MODE, 0x3f, 0x80, 0x00, 0x00],
+            "creative game_event bytes"
+        );
+        assert_eq!(frames[3].1, creative_abilities, "trailing abilities bytes");
+
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Survival,
+        });
+        g.flush_connections();
+        let frames = drain_frames(&rx);
+        let order: Vec<i32> = frames.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            order,
+            vec![
+                PACKET_PLAYER_ABILITIES,
+                PACKET_PLAYER_INFO_UPDATE,
+                PACKET_GAME_EVENT,
+                PACKET_PLAYER_ABILITIES,
+                0x7c
+            ],
+            "wire order (the reply trails)"
+        );
+        assert_eq!(
+            frames[2].1,
+            vec![GAME_EVENT_CHANGE_GAME_MODE, 0, 0, 0, 0],
+            "survival game_event bytes"
+        );
+        let mut survival_info = vec![0x04, 0x01];
+        survival_info.extend_from_slice(&uuid);
+        survival_info.push(0);
+        assert_eq!(
+            frames[1].1, survival_info,
+            "survival UPDATE_GAME_MODE bytes"
+        );
+        assert_eq!(
+            frames[0].1,
+            vec![0, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd],
+            "survival abilities bytes"
+        );
+    }
+
+    /// The UPDATE_GAME_MODE broadcast reaches every connected player,
+    /// not just the player whose mode changed.
+    #[test]
+    fn gamemode_info_update_reaches_every_player() {
+        use crate::game::Outbound;
+        use std::sync::mpsc::channel;
+        let (mut g, rx) = harness();
+        let (tx2, rx2) = channel();
+        g.join_viewer_for_test(1, &[(0, 0)], tx2);
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        let mut saw = [false, false];
+        for (rx, slot) in [(&rx, 0), (&rx2, 1)] {
+            while let Ok(f) = rx.try_recv() {
+                if let Outbound::Frame { id, .. } = f {
+                    if id == PACKET_PLAYER_INFO_UPDATE {
+                        saw[slot] = true;
+                    }
+                }
+            }
+        }
+        assert!(saw[0] && saw[1], "both players see the info update");
+    }
+
+    /// Every queued frame as (id, body).
+    fn drain_frames(rx: &std::sync::mpsc::Receiver<Outbound>) -> Vec<(i32, Vec<u8>)> {
+        let mut frames = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let Outbound::Frame { id, body } = f {
+                frames.push((id, body));
+            }
+        }
+        frames
+    }
+
+    /// Flight toggles land only while the mode grants mayfly.
+    #[test]
+    fn flight_toggle_needs_mayfly() {
+        let (mut g, _rx) = harness();
+        g.handle(Inbound::PlayerAbilities {
+            conn: 0,
+            flying: true,
+        });
+        assert!(!g.player_inv_state_for_test(0).expect("player").flying);
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.handle(Inbound::PlayerAbilities {
+            conn: 0,
+            flying: true,
+        });
+        assert!(g.player_inv_state_for_test(0).expect("player").flying);
+        g.handle(Inbound::PlayerAbilities {
+            conn: 0,
+            flying: false,
+        });
+        assert!(!g.player_inv_state_for_test(0).expect("player").flying);
+    }
+
+    /// A same-mode switch sends nothing at all: the reference refuses
+    /// the change before any packet or command feedback.
+    #[test]
+    fn same_mode_switch_sends_no_mode_packets() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        while rx.try_recv().is_ok() {}
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        g.flush_connections();
+        let mut frames = 0;
+        while rx.try_recv().is_ok() {
+            frames += 1;
+        }
+        assert_eq!(frames, 0, "a same-mode switch is wire-silent");
+    }
+
+    /// The parse side of the flight toggle.
+    #[test]
+    fn player_abilities_parse() {
+        assert!(parse_player_abilities(&[0x02]).expect("flying"));
+        assert!(!parse_player_abilities(&[0x00]).expect("grounded"));
+        assert!(!parse_player_abilities(&[0x05]).expect("other bits"));
+        assert!(parse_player_abilities(&[0x0f]).expect("all bits"));
+        assert!(parse_player_abilities(&[0x02, 0x00]).is_err());
+    }
+
+    /// Slot 0 (the crafting result) and oversized counts are rejected;
+    /// a negative slot drops the stack.
+    #[test]
+    fn creative_slot_rejects_bad_writes() {
+        let (mut g, rx) = harness();
+        g.handle(Inbound::GameMode {
+            conn: 0,
+            mode: crate::game::GameMode::Creative,
+        });
+        while rx.try_recv().is_ok() {}
+        let over = parse_set_creative_slot(&[0, 36, 1, 65, 1, 0, 0]).unwrap();
+        g.handle(Inbound::CreativeSlot { conn: 0, set: over });
+        assert!(
+            g.player_inv_state_for_test(0)
+                .expect("player")
+                .inventory
+                .get(0)
+                .is_none(),
+            "over-count push rejected"
+        );
+        let zero = parse_set_creative_slot(&[0, 0, 1, 1, 1, 0, 0]).unwrap();
+        g.handle(Inbound::CreativeSlot { conn: 0, set: zero });
+        // Slot 0 never writes; nothing observable to check beyond no panic.
     }
 
     #[test]

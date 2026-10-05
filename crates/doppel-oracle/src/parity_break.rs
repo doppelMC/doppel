@@ -513,109 +513,800 @@ fn run_sessions(
     Ok((digger, witness))
 }
 
-/// The cross-type same-tick order vote shared by both streams. Returns
-/// the count of positively compared pairs; pushes a failure per judged
-/// opposite vote and one when nothing was compared.
-fn order_vote_check(
-    v_digger: &[crate::bot::CapturedPacket],
-    d_digger: &[crate::bot::CapturedPacket],
-    v_witness: &[crate::bot::CapturedPacket],
-    d_witness: &[crate::bot::CapturedPacket],
-    failures: &mut Vec<String>,
-) -> usize {
-    // Cross-type same-tick order: a pair the reference orders unanimously
-    // in at least two bursts is a settled invariant; doppel fails only
-    // when its votes MAJORITY-oppose it with at least two bursts of its
-    // own. Single-burst evidence stays unjudged on BOTH sides: the same
-    // lone doppel opposite vote (1+0) fired three times in one day on
-    // unrelated branches (each clearing on rerun), all traceable to a
-    // burst boundary splitting one entity's data packet from another
-    // entity's spawn - a measurement artifact, not an ordering change.
-    // A genuine reorder draws lopsided opposite votes across many
-    // bursts, never a single one. The positive-pair count keeps an
-    // empty capture from passing.
-    let mut compared_pairs = 0usize;
-    let marker_of = |pk: &[crate::bot::CapturedPacket]| pk.iter().rposition(|p| p.id == 0x7c);
-    for (stream, vpk, dpk) in [
-        ("digger", &v_digger, &d_digger),
-        ("witness", &v_witness, &d_witness),
-    ] {
-        let vstart = match marker_of(vpk) {
-            Some(m) => m + 1,
-            None => 0,
-        };
-        let dstart = match marker_of(dpk) {
-            Some(m) => m + 1,
-            None => 0,
-        };
-        let vvotes = order_votes(vpk, vstart);
-        let dvotes = order_votes(dpk, dstart);
-        for ((lo, hi), [lo_first, hi_first]) in &vvotes {
-            let van_votes = lo_first + hi_first;
-            let van_unanimous = van_votes >= 2 && (*lo_first == 0) != (*hi_first == 0);
-            if !van_unanimous {
-                continue;
+/// A one-server facts probe: boots vanilla, runs the piston circuit and
+/// the gamemode flips, and prints the raw bytes of the packet families
+/// the play-parity work needs (block_event, game_event, abilities, and
+/// the world writes around the piston).
+pub fn probe_play_facts() -> Result<bool> {
+    const PROBE_PORT: u16 = 25570;
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let protocol = pin.protocol.unwrap_or(0);
+    let mut server = Some(vanilla::boot(&pin, &jar, PROBE_PORT)?);
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Session A: the piston circuit (the same layout the local piston
+    // tests drive).
+    let piston_cmds: Vec<String> = [
+        "setblock 22 99 10 minecraft:stone".to_string(),
+        "setblock 23 99 10 minecraft:stone".to_string(),
+        "setblock 24 99 10 minecraft:stone".to_string(),
+        "setblock 25 99 10 minecraft:stone".to_string(),
+        "setblock 26 99 10 minecraft:stone".to_string(),
+        "setblock 27 99 10 minecraft:stone".to_string(),
+        "setblock 28 99 10 minecraft:stone".to_string(),
+        "setblock 24 100 10 minecraft:stone".to_string(),
+        "setblock 25 100 10 minecraft:stone".to_string(),
+        "setblock 23 100 10 minecraft:piston[extended=false,facing=east]".to_string(),
+        "setblock 22 100 10 minecraft:lever[face=floor,facing=north,powered=false]".to_string(),
+        "setblock 22 99 14 minecraft:stone".to_string(),
+        "setblock 23 99 14 minecraft:stone".to_string(),
+        "setblock 24 99 14 minecraft:stone".to_string(),
+        "setblock 25 99 14 minecraft:stone".to_string(),
+        "setblock 26 99 14 minecraft:stone".to_string(),
+        "setblock 24 100 14 minecraft:stone".to_string(),
+        "setblock 25 100 14 minecraft:stone".to_string(),
+        "setblock 23 100 14 minecraft:sticky_piston[extended=false,facing=east]".to_string(),
+        "setblock 22 100 14 minecraft:lever[face=floor,facing=north,powered=false]".to_string(),
+        "tp @s 22 102 10".to_string(),
+        "tick freeze".to_string(),
+        "tick step 2".to_string(),
+        "setblock 22 100 10 minecraft:lever[face=floor,facing=north,powered=true]".to_string(),
+        "tick step 4".to_string(),
+        "setblock 22 100 10 minecraft:lever[face=floor,facing=north,powered=false]".to_string(),
+        "tick step 4".to_string(),
+        "setblock 22 100 14 minecraft:lever[face=floor,facing=north,powered=true]".to_string(),
+        "tick step 4".to_string(),
+        "setblock 22 100 14 minecraft:lever[face=floor,facing=north,powered=false]".to_string(),
+        "tick step 4".to_string(),
+        "tick unfreeze".to_string(),
+    ]
+    .to_vec();
+    let probe_raw: Vec<(i32, Vec<u8>)> = vec![(0x42, bot::build_use_item_on_top(22, 100, 10, 200))];
+    let login = capture::login_start_c("Doppel");
+    let worker = std::thread::spawn(move || {
+        play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &probe_raw, None)
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let a = if worker.is_finished() {
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("piston session thread panicked"))?
+            .context("capturing piston session")?
+    } else {
+        // Break the hung capture from outside: closing the server kills
+        // its socket, which ends the read loop with whatever it captured.
+        server.take();
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("piston session thread panicked"))?
+            .context("capturing piston session after close")?
+    };
+    println!("[probe] piston session: {} frames", a.len());
+    let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
+    for p in a.iter().filter(|p| p.id >= 0) {
+        *hist.entry(p.id).or_default() += 1;
+    }
+    println!(
+        "[probe] piston ids: {}",
+        hist.iter()
+            .map(|(id, n)| format!("{id:#04x}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    for p in a.iter().filter(|p| p.id >= 0) {
+        match p.id {
+            0x07 => println!("[probe] block_event: {}", p.head_hex),
+            0x08 | 0x56 => println!("[probe] write 0x{:02x}: {}", p.id, p.head_hex),
+            0x04 => println!("[probe] block_changed_ack: {}", p.head_hex),
+            _ => {}
+        }
+    }
+    let tail: Vec<String> = a
+        .iter()
+        .rev()
+        .filter_map(|p| p.note.clone())
+        .take(12)
+        .collect();
+    println!("[probe] session tail notes: {:?}", tail);
+    if let Some(end) = a.iter().rev().find(|p| p.id < 0) {
+        println!("[probe] end note: {:?}", end.note);
+    }
+
+    // Session B: gamemode flips plus the tool-family item ids (the give
+    // syncs carry the item registry network ids).
+    let mode_cmds: Vec<String> = [
+        "kill @e[type=!player]".to_string(),
+        "gamemode creative".to_string(),
+        "gamemode survival".to_string(),
+        "give @s minecraft:wooden_pickaxe".to_string(),
+        "give @s minecraft:stone_pickaxe".to_string(),
+        "give @s minecraft:iron_pickaxe".to_string(),
+        "give @s minecraft:golden_pickaxe".to_string(),
+        "give @s minecraft:diamond_pickaxe".to_string(),
+        "give @s minecraft:netherite_pickaxe".to_string(),
+    ]
+    .to_vec();
+    if server.is_none() {
+        server = Some(vanilla::boot(&pin, &jar, PROBE_PORT)?);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let login = capture::login_start_c("Doppelist");
+    let worker = std::thread::spawn(move || {
+        play_capture(PROBE_PORT, protocol, &login, &mode_cmds, &[], None)
+    });
+    // Session B is informational: keep its tail short.
+    let deadline = std::time::Instant::now() + Duration::from_secs(75);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    server.take();
+    let b = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("gamemode session thread panicked"))?
+        .context("capturing gamemode session")?;
+    println!("[probe] gamemode session: {} frames", b.len());
+    for p in b.iter().filter(|p| p.id >= 0) {
+        match p.id {
+            0x27 => println!("[probe] game_event: {}", p.head_hex),
+            0x41 => println!("[probe] abilities: {}", p.head_hex),
+            // container_set_content: containerId varint, stateId varint,
+            // count varint, stacks (count, itemId, patch), carried.
+            0x12 => println!("[probe] set_content: {}", p.head_hex),
+            // container_set_slot: containerId, stateId, slot i16, stack.
+            0x14 => println!("[probe] set_slot: {}", p.head_hex),
+            0x7c => {}
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+/// Connects, drives the handshake and login into the configuration
+/// state, and answers every choreography packet up to the PLAY state.
+fn handshake_into_play(
+    port: u16,
+    protocol: i32,
+    login_body: &[u8],
+) -> Result<doppel_protocol::Conn<std::net::TcpStream>> {
+    use doppel_protocol::write_string;
+    use doppel_protocol::Conn;
+    const WINDOW: Duration = Duration::from_secs(5);
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connecting to play session on {port}"))?;
+    stream.set_read_timeout(Some(WINDOW))?;
+    stream.set_write_timeout(Some(WINDOW))?;
+    stream.set_nodelay(true).ok();
+    let mut conn = Conn::new(stream);
+    let mut hs = Vec::new();
+    doppel_protocol::write_varint(&mut hs, protocol);
+    write_string(&mut hs, "127.0.0.1");
+    hs.extend_from_slice(&port.to_be_bytes());
+    doppel_protocol::write_varint(&mut hs, 2);
+    conn.write_packet(0x00, &hs)?;
+    conn.write_packet(0x00, login_body)?;
+    let mut compression_on = false;
+    let mut config_started = false;
+    let mut packs_answered = false;
+    loop {
+        let (id, body) = conn.read_packet()?;
+        if !compression_on && id == 0x03 {
+            let threshold = doppel_protocol::Reader::new(&body)
+                .read_varint()
+                .context("set compression threshold")?;
+            conn.set_compression(threshold);
+            compression_on = true;
+            continue;
+        }
+        if !config_started && id == 0x02 {
+            conn.write_packet(0x03, &[])?; // login_acknowledged
+            conn.write_packet(0x00, &bot::client_information_body())?;
+            config_started = true;
+            continue;
+        }
+        if !packs_answered && config_started && id == 0x0f {
+            conn.write_packet(0x07, &[0x00])?;
+            packs_answered = true;
+            continue;
+        }
+        if packs_answered && id == 0x03 && body.is_empty() {
+            conn.write_packet(0x03, &[])?;
+            return Ok(conn);
+        }
+    }
+}
+
+fn play_capture(
+    port: u16,
+    protocol: i32,
+    login_body: &[u8],
+    commands: &[String],
+    raw_packets: &[(i32, Vec<u8>)],
+    wait_chunk: Option<(i32, i32)>,
+) -> Result<Vec<bot::CapturedPacket>> {
+    use doppel_protocol::{write_string, Reader};
+    const REPLY_WINDOW: Duration = Duration::from_secs(5);
+    const AFTER_RAW: Duration = Duration::from_millis(2500);
+    let mut conn = handshake_into_play(port, protocol, login_body)?;
+    let mut packets: Vec<bot::CapturedPacket> = Vec::new();
+    let started = std::time::Instant::now();
+    let mut raw_sent_at: Option<std::time::Instant> = None;
+    let mut next_cmd = 0usize;
+    let mut chunk_seen = wait_chunk.is_none();
+    let mut batch_feedback_due = false;
+    let note = |packets: &mut Vec<bot::CapturedPacket>, text: String, t: u128| {
+        packets.push(bot::CapturedPacket {
+            id: -1,
+            t_ms: t,
+            body_len: 0,
+            head_hex: String::new(),
+            file: None,
+            note: Some(text),
+        });
+    };
+
+    while raw_sent_at.is_none_or(|at| std::time::Instant::now() < at + AFTER_RAW) {
+        let (id, body) = match conn.read_packet() {
+            Ok(p) => p,
+            Err(e) => {
+                note(
+                    &mut packets,
+                    format!("transcript ended: {e:#}"),
+                    started.elapsed().as_millis(),
+                );
+                break;
             }
-            let want_first = if *lo_first > 0 { *lo } else { *hi };
-            let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
-            let d_want = if *lo_first > 0 { dlo } else { dhi };
-            let d_other = if *lo_first > 0 { dhi } else { dlo };
-            if dlo + dhi >= 2 && d_other > d_want {
-                failures.push(format!(
-                "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
-            ));
-                // Name the offending bursts: which packets, what order,
-                // what times - a flush-merge artifact and a real reorder
-                // read differently here (different entity ids across a
-                // seam vs the same id inside one flush).
-                let mut shown = 0;
-                let mut burst: Vec<(char, i32, u128)> = Vec::new();
-                let mut last_ms: Option<u128> = None;
-                for p in dpk.iter().skip(dstart) {
-                    if p.id < 0 {
-                        continue;
+        };
+        let head = hex::encode(&body[..body.len().min(4096)]);
+        packets.push(bot::CapturedPacket {
+            id,
+            t_ms: started.elapsed().as_millis(),
+            body_len: body.len(),
+            head_hex: head,
+            file: None,
+            note: None,
+        });
+        if let (Some(want), false) = (wait_chunk, chunk_seen) {
+            if id == 0x2e && body.len() >= 8 {
+                let xb: [u8; 4] = body[0..4].try_into().context("chunk x bytes")?;
+                let zb: [u8; 4] = body[4..8].try_into().context("chunk z bytes")?;
+                let cx = i32::from_be_bytes(xb);
+                let cz = i32::from_be_bytes(zb);
+                if (cx, cz) == want {
+                    // The server only sends a chunk to a player tracking
+                    // it, so its arrival proves the tracking the section
+                    // broadcasts depend on.
+                    chunk_seen = true;
+                    if next_cmd == 1 {
+                        let mut b = Vec::new();
+                        write_string(&mut b, commands[next_cmd].as_str());
+                        conn.write_packet(0x07, &b)?;
+                        next_cmd += 1;
+                        conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
                     }
-                    let Some(l) = order_label(p.id) else {
-                        continue;
-                    };
-                    if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
-                        let firsts: std::collections::BTreeMap<char, u128> =
-                            burst.iter().map(|(l, _, t)| (*l, *t)).collect();
-                        if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
-                            if at < bt {
-                                println!(
-                                    "  {stream} opposite burst: {}",
-                                    burst
-                                        .iter()
-                                        .map(|(l, id, t)| format!("{l}=0x{id:02x}@{t}ms"))
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                );
-                                shown += 1;
-                            }
-                        }
-                        if shown >= 3 {
-                            break;
-                        }
-                        burst.clear();
-                    }
-                    burst.push((l, p.id, p.t_ms));
-                    last_ms = Some(p.t_ms);
                 }
             }
-            if d_want > 0 {
-                compared_pairs += 1;
+        }
+        match id {
+            0x2d => conn.write_packet(0x1c, &body)?, // keep-alive echo
+            0x0b if !body.is_empty() => {
+                // One throughput report per chunk batch keeps the stream
+                // flowing, and the first batch arms the command volley.
+                let mut feedback = Vec::with_capacity(4);
+                feedback.extend_from_slice(&64.0f32.to_be_bytes());
+                conn.write_packet(0x0b, &feedback)?;
+                if next_cmd == 0 {
+                    batch_feedback_due = true;
+                }
+            }
+            0x49 if body.len() >= 4 => {
+                // The join teleport: echo id and position.
+                let mut r = Reader::new(&body);
+                let teleport_id = r.read_varint().context("teleport id")?;
+                let x = r.read_f64().context("teleport x")?;
+                let y = r.read_f64().context("teleport y")?;
+                let z = r.read_f64().context("teleport z")?;
+                r.read_f64().ok();
+                r.read_f64().ok();
+                r.read_f64().ok();
+                let yaw = r.read_f32().unwrap_or(0.0);
+                let pitch = r.read_f32().unwrap_or(0.0);
+                let mut ack = Vec::with_capacity(40);
+                doppel_protocol::write_varint(&mut ack, teleport_id);
+                ack.extend_from_slice(&x.to_be_bytes());
+                ack.extend_from_slice(&y.to_be_bytes());
+                ack.extend_from_slice(&z.to_be_bytes());
+                ack.extend_from_slice(&yaw.to_be_bytes());
+                ack.extend_from_slice(&pitch.to_be_bytes());
+                conn.write_packet(0x00, &ack)?;
+            }
+            0x7c if next_cmd > 0 => {
+                if next_cmd == 1 && !chunk_seen {
+                    // The teleport's reply arrived before the waited
+                    // chunk; hold the volley until the chunk lands.
+                    continue;
+                }
+                if next_cmd < commands.len() {
+                    let mut b = Vec::new();
+                    write_string(&mut b, commands[next_cmd].as_str());
+                    conn.write_packet(0x07, &b)?;
+                    next_cmd += 1;
+                    conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
+                } else if raw_sent_at.is_none() && !raw_packets.is_empty() {
+                    for (rid, rbody) in raw_packets {
+                        conn.write_packet(*rid, rbody)?;
+                    }
+                    raw_sent_at = Some(std::time::Instant::now());
+                }
+            }
+            _ => {}
+        }
+        // The volley starts after the first chunk batch closes; every
+        // command paces on its reply.
+        if batch_feedback_due && next_cmd == 0 && !commands.is_empty() {
+            batch_feedback_due = false;
+            let mut b = Vec::new();
+            write_string(&mut b, commands[0].as_str());
+            conn.write_packet(0x07, &b)?;
+            next_cmd = 1;
+            // With a chunk to wait for, the settle window replaces the
+            // reply pacing until the chunk lands (commands[0] is the
+            // teleport that triggers the stream).
+            let window = if wait_chunk.is_some() {
+                Duration::from_secs(20)
+            } else {
+                REPLY_WINDOW
+            };
+            conn.get_ref().set_read_timeout(Some(window))?;
+        }
+        if let Some(armed) = raw_sent_at {
+            // Saturating: the deadline can pass between the loop check
+            // and here, and a zero timeout is an error, not a wait.
+            let left = (armed + AFTER_RAW).saturating_duration_since(std::time::Instant::now());
+            if !left.is_zero() {
+                conn.get_ref().set_read_timeout(Some(left))?;
             }
         }
     }
-    if compared_pairs == 0 {
-        failures.push("no cross-type same-tick order pairs compared".into());
+    if raw_sent_at.is_some() {
+        note(
+            &mut packets,
+            "transcript ended: raw interaction budget spent".into(),
+            started.elapsed().as_millis(),
+        );
     }
-    compared_pairs
+    Ok(packets)
 }
 
-/// Prints per-side frame histograms and observed writes for both bots.
-fn print_break_summary(sides: &[(&str, &[bot::CapturedPacket], &[bot::CapturedPacket], &Side)]) {
+/// The last state written per position across a capture.
+fn final_writes(pkts: &[bot::CapturedPacket]) -> std::collections::BTreeMap<(i32, i32, i32), u32> {
+    let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
+    decode_update_writes(&refs)
+        .into_iter()
+        .map(|(p, s, _)| (p, s))
+        .collect()
+}
+
+/// The raw block_event bodies fired at one position, in stream order.
+fn block_events_at(pkts: &[bot::CapturedPacket], at: (i32, i32, i32)) -> Vec<Vec<u8>> {
+    pkts.iter()
+        .filter(|p| p.id == 0x07)
+        .filter_map(|p| {
+            let raw = hex::decode(&p.head_hex).unwrap_or_default();
+            if raw.len() < 10 {
+                return None;
+            }
+            let bytes: [u8; 8] = raw[0..8].try_into().ok()?;
+            let packed = i64::from_be_bytes(bytes);
+            let x = ((packed >> 38) & 0x3ff_ffff) << 38 >> 38;
+            let z = ((packed >> 12) & 0x3ff_ffff) << 38 >> 38;
+            let y = (((packed & 0xfff) as i32) << 20) >> 20;
+            ((x as i32, y, z as i32) == at).then_some(raw)
+        })
+        .collect()
+}
+
+/// The game_event and abilities frames, in stream order.
+fn mode_frames(pkts: &[bot::CapturedPacket]) -> Vec<(i32, Vec<u8>)> {
+    pkts.iter()
+        .filter(|p| matches!(p.id, 0x27 | 0x41) || (p.id == 0x47 && p.head_hex.starts_with("04")))
+        .map(|p| (p.id, hex::decode(&p.head_hex).unwrap_or_default()))
+        .collect()
+}
+
+/// One session's world-write packets, in order, for failure context.
+fn dump_write_packets(pkts: &[bot::CapturedPacket], phase: &str, who: &str) {
+    let writes: Vec<String> = pkts
+        .iter()
+        .filter(|p| matches!(p.id, 0x08 | 0x56))
+        .map(|p| {
+            format!(
+                "0x{:02x}@{}ms:{}",
+                p.id,
+                p.t_ms,
+                &p.head_hex[..p.head_hex.len().min(96)]
+            )
+        })
+        .collect();
+    println!(
+        "[oracle] play {phase} {who} write packets: [{}]",
+        writes.join(" ")
+    );
+}
+
+/// The play-parity scenarios: the organic interactions the first real
+/// client found missing. One driver, two servers:
+/// - a lever flipped by a bot-sent use_item_on lights wire across an
+///   up-and-down staircase and darkens it again on the second flip,
+/// - a lever-driven piston extends and retracts with exactly one block
+///   per moved cell and a block_event packet whose bytes match,
+/// - `gamemode creative` / `gamemode survival` emit the game_event and
+///   abilities pairs byte for byte.
+///
+/// The two flip phases run as separate sessions on the same world: the
+/// raw interaction burst fires after a session's command volley, so one
+/// session cannot space two flips of the same lever.
+pub fn parity_play() -> Result<bool> {
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs-break");
+    let pristine_world = root
+        .join("target")
+        .join("vanilla")
+        .join("pristine-world-break");
+    anyhow::ensure!(
+        blobs_dir.is_dir() && pristine_world.is_dir(),
+        "play parity needs the break phase's blobs and pristine world"
+    );
+    let protocol = pin.protocol.unwrap_or(0);
+
+    // Vanilla legs.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    std::thread::sleep(Duration::from_secs(2));
+    let worker = std::thread::spawn(move || run_play_sessions(VANILLA_PORT, protocol));
+    let deadline = std::time::Instant::now() + Duration::from_secs(150);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(server);
+    let (v_on, v_off) = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("vanilla play session thread panicked"))?
+        .context("capturing vanilla play sessions")?;
+
+    // Doppel legs.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(8));
+    let worker = std::thread::spawn(move || run_play_sessions(DOPPEL_PORT, protocol));
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let (d_on, d_off) = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("doppel play session thread panicked"))?
+        .context("capturing doppel play sessions")?;
+
+    // The wire circuit: lever, two wires, a step up, a step down.
+    let wire_cells = [
+        (30, 100, 10),
+        (31, 100, 10),
+        (32, 100, 10),
+        (33, 101, 10),
+        (34, 100, 10),
+    ];
+    // The piston line: base, arm, the two pushed stones' destinations.
+    let piston_cells = [(27, 100, 12), (28, 100, 12), (29, 100, 12), (30, 100, 12)];
+    let lever = (30, 100, 10);
+    let piston = (27, 100, 12);
+
+    let writes_of = final_writes;
+    let events_at = block_events_at;
+
+    let mut failures = Vec::new();
+    for (phase, v, d) in [("on", &v_on, &d_on), ("off", &v_off, &d_off)] {
+        let vw = writes_of(v);
+        let dw = writes_of(d);
+        println!("[oracle] play {phase}: vanilla wire writes {vw:?} doppel {dw:?}");
+        for (who, pk) in [("vanilla", v), ("doppel", d)] {
+            let end = pk.iter().rev().find(|p| p.id < 0);
+            println!(
+                "[oracle] play {phase} {who}: {} frames, end {:?}",
+                pk.len(),
+                end.and_then(|p| p.note.clone())
+            );
+            dump_write_packets(pk, phase, who);
+        }
+        for cell in wire_cells.iter().chain(piston_cells.iter()) {
+            let vv = vw.get(cell).copied();
+            let dd = dw.get(cell).copied();
+            if vv != dd {
+                failures.push(format!(
+                    "{phase} final state at {cell:?}: vanilla {vv:?} vs doppel {dd:?}"
+                ));
+            }
+        }
+        // The lever cell itself: the flip's write must agree.
+        let vv = vw.get(&lever).copied();
+        let dd = dw.get(&lever).copied();
+        if vv != dd {
+            failures.push(format!(
+                "{phase} lever state: vanilla {vv:?} vs doppel {dd:?}"
+            ));
+        }
+        let ve = events_at(v, piston);
+        let de = events_at(d, piston);
+        if ve != de {
+            failures.push(format!(
+                "{phase} piston block_events: vanilla {ve:02x?} vs doppel {de:02x?}"
+            ));
+        }
+        if ve.is_empty() {
+            failures.push(format!("{phase}: vanilla fired no piston block_event"));
+        }
+    }
+
+    // gamemode: the exact game_event and abilities bytes, in order.
+    let mode_frames = mode_frames;
+    let vm = mode_frames(&v_off);
+    let dm = mode_frames(&d_off);
+    if vm != dm {
+        failures.push(format!(
+            "gamemode frames: vanilla {vm:02x?} vs doppel {dm:02x?}"
+        ));
+    }
+    // The oracle-pinned forms, so a both-sides regression cannot pass.
+    let survival = || vec![0x00, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd];
+    let creative = || vec![0x0d, 0x3d, 0x4c, 0xcc, 0xcd, 0x3d, 0xcc, 0xcc, 0xcd];
+    let info = |mode: u8| {
+        let mut b = vec![0x04, 0x01];
+        b.extend_from_slice(&[
+            0xc8, 0x2d, 0x9a, 0x9e, 0xf1, 0xaa, 0x33, 0xeb, 0x93, 0x28, 0x3c, 0xc5, 0xd6, 0x79,
+            0x78, 0x42,
+        ]);
+        b.push(mode);
+        b
+    };
+    let expect = vec![
+        // The join burst's own pair (replayed blobs on both servers).
+        (0x41i32, survival()),
+        (0x27, vec![0x0d, 0x00, 0x00, 0x00, 0x00]),
+        // gamemode creative: abilities, info update, game_event,
+        // abilities.
+        (0x41, creative()),
+        (0x47, info(1)),
+        (0x27, vec![0x03, 0x3f, 0x80, 0x00, 0x00]),
+        (0x41, creative()),
+        // gamemode survival.
+        (0x41, survival()),
+        (0x47, info(0)),
+        (0x27, vec![0x03, 0x00, 0x00, 0x00, 0x00]),
+        (0x41, survival()),
+    ];
+    if vm != expect {
+        failures.push(format!(
+            "vanilla gamemode frames differ from the pinned forms: {vm:02x?}"
+        ));
+    }
+    // The raw same-mode flip after the volley must stay wire-silent.
+    let post_marker_modes = |pk: &[bot::CapturedPacket]| -> usize {
+        let marker = pk.iter().rposition(|p| p.id == 0x7c).map_or(0, |m| m + 1);
+        pk.iter()
+            .skip(marker)
+            .filter(|p| {
+                matches!(p.id, 0x27 | 0x41) || (p.id == 0x47 && p.head_hex.starts_with("04"))
+            })
+            .count()
+    };
+    let v_post = post_marker_modes(&v_off);
+    let d_post = post_marker_modes(&d_off);
+    if v_post != 0 {
+        failures.push(format!(
+            "vanilla emitted {v_post} mode frame(s) after the raw same-mode flip"
+        ));
+    }
+    if d_post != v_post {
+        failures.push(format!(
+            "same-mode flip silence: doppel {d_post} mode frame(s) vs vanilla {v_post}"
+        ));
+    }
+
+    if failures.is_empty() {
+        println!("PASS: play parity");
+        Ok(true)
+    } else {
+        println!("FAIL: {} play-parity difference(s):", failures.len());
+        for f in failures.iter().take(20) {
+            println!("  {f}");
+        }
+        Ok(false)
+    }
+}
+
+/// The two play-parity sessions against one server: the build-and-on
+/// phase, then (after the world has settled) the off phase with the
+/// gamemode flips. Both sessions end at a wall-clock bound the caller
+/// enforces by closing the server.
+fn run_play_sessions(
+    port: u16,
+    protocol: i32,
+) -> Result<(Vec<bot::CapturedPacket>, Vec<bot::CapturedPacket>)> {
+    let build: Vec<String> = [
+        // Stand near the circuits FIRST and let the chunk tracking settle
+        // under a running clock: the teleport's tracking update rides the
+        // tick loop, and a paused clock leaves the far section
+        // untracked, silently dropping its broadcasts. The filler
+        // commands pace the settle without touching the tick clock
+        // (`tick step` would leave it paused when the flips land).
+        "tp @s 28 102 11",
+        "time set day",
+        "time set night",
+        "time set day",
+        "time set night",
+        // Wire circuit support and step.
+        "setblock 30 99 10 minecraft:stone",
+        "setblock 31 99 10 minecraft:stone",
+        "setblock 32 99 10 minecraft:stone",
+        "setblock 33 99 10 minecraft:stone",
+        "setblock 34 99 10 minecraft:stone",
+        "setblock 33 100 10 minecraft:stone",
+        // Piston circuit support.
+        "setblock 26 99 12 minecraft:stone",
+        "setblock 27 99 12 minecraft:stone",
+        "setblock 28 99 12 minecraft:stone",
+        "setblock 29 99 12 minecraft:stone",
+        "time set day",
+        // The circuits.
+        "setblock 30 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+        "setblock 31 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 32 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 33 101 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 34 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 27 100 12 minecraft:piston[extended=false,facing=east]",
+        "setblock 28 100 12 minecraft:stone",
+        "setblock 29 100 12 minecraft:stone",
+        "setblock 26 100 12 minecraft:lever[face=floor,facing=north,powered=false]",
+        "time set day",
+        "time set night",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let on_raw: Vec<(i32, Vec<u8>)> = vec![
+        (0x2c, Vec::new()), // player_loaded
+        (0x42, bot::build_use_item_on_top(30, 100, 10, 100)),
+        (0x42, bot::build_use_item_on_top(26, 100, 12, 101)),
+    ];
+    let login = capture::login_start_c("Doppel");
+    let on = play_capture(port, protocol, &login, &build, &on_raw, Some((2, 0)))
+        .context("play session 1 (flips on)")?;
+    // Let the world settle: the piston lands and the wire stills before
+    // the second session's flips arrive.
+    std::thread::sleep(Duration::from_secs(4));
+
+    let off_commands: Vec<String> = [
+        "tp @s 28 102 11".to_string(),
+        // The teleport's chunk stream needs a settle beat before the
+        // flips: section broadcasts only reach tracked chunks.
+        "time set day".to_string(),
+        "time set night".to_string(),
+        "time set day".to_string(),
+        "time set night".to_string(),
+        "time set day".to_string(),
+        "time set night".to_string(),
+        "gamemode creative".to_string(),
+        "gamemode survival".to_string(),
+        "time set day".to_string(),
+        "time set night".to_string(),
+    ]
+    .to_vec();
+    let mut same_mode = Vec::new();
+    doppel_protocol::write_string(&mut same_mode, "gamemode survival");
+    let off_raw: Vec<(i32, Vec<u8>)> = vec![
+        (0x2c, Vec::new()),
+        (0x42, bot::build_use_item_on_top(30, 100, 10, 102)),
+        (0x42, bot::build_use_item_on_top(26, 100, 12, 103)),
+        // The player already switched back to survival: the reference
+        // refuses a same-mode switch before any packet, feedback
+        // included.
+        (0x07, same_mode),
+    ];
+    let login = capture::login_start_c("Doppelist");
+    let off = play_capture(
+        port,
+        protocol,
+        &login,
+        &off_commands,
+        &off_raw,
+        Some((2, 0)),
+    )
+    .context("play session 2 (flips off)")?;
+
+    Ok((on, off))
+}
+
+pub fn parity_break() -> Result<bool> {
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs-break");
+    let pristine_world = root
+        .join("target")
+        .join("vanilla")
+        .join("pristine-world-break");
+    for dir in [&blobs_dir, &pristine_world] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+    }
+    let protocol = pin.protocol.unwrap_or(0);
+
+    // 1. Clean blobs + pristine world.
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+
+    // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
+    // idle timers, so the phase carries its own wall-clock bound: closing
+    // the server ends any still-blocked capture from outside.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
+    let vdeadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(server);
+    let (v_digger, v_witness) = vworker
+        .join()
+        .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
+
+    // 3. Doppel sessions. The warm-up sleep puts doppel's tick counter
+    // past the delayed-destroy threshold, matching a booted server.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(10));
+    // Both servers keep an idle-based capture alive with steady traffic
+    // (time pushes, entity tracking at spawn), so this phase carries the
+    // same wall-clock bound as the vanilla one.
+    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let (d_digger, d_witness) = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
+
+    let v = analyze(&v_digger, &v_witness);
+    let d = analyze(&d_digger, &d_witness);
     let histogram = |pkts: &[bot::CapturedPacket]| {
         let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
         for p in pkts.iter().filter(|p| p.id >= 0) {
@@ -635,7 +1326,10 @@ fn print_break_summary(sides: &[(&str, &[bot::CapturedPacket], &[bot::CapturedPa
             .join(" ")
     };
     let marker_of = |digger: &[bot::CapturedPacket]| digger.iter().rposition(|p| p.id == 0x7c);
-    for (who, digger, witness, side) in sides {
+    for (who, digger, witness, side) in [
+        ("vanilla", &v_digger, &v_witness, &v),
+        ("doppel", &d_digger, &d_witness, &d),
+    ] {
         println!(
             "[oracle] {who}: digger {} frames, witness {} frames",
             digger.len(),
@@ -670,12 +1364,7 @@ fn print_break_summary(sides: &[(&str, &[bot::CapturedPacket], &[bot::CapturedPa
                 .collect::<Vec<_>>()
         );
     }
-}
 
-/// Compares the analyzed sides: final block states, dig overlays, the
-/// chest interaction, and inventory syncs. Appends one failure per
-/// mismatch.
-fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
     let final_at = |side: &Side, target: (i32, i32, i32)| {
         side.updates
             .iter()
@@ -690,6 +1379,8 @@ fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
             .map(|(_, s)| *s)
             .collect::<Vec<_>>()
     };
+
+    let mut failures = Vec::new();
 
     // Final block states: nothing breaks this session (the released
     // obsidian dig freezes below every threshold), so the four scenario
@@ -718,11 +1409,11 @@ fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
     // boot, so only the two servers' agreement is pinned there).
     let above_chest = (CHEST.0, CHEST.1 + 1, CHEST.2);
     for target in [ANCHOR, PLACED, OBSI, CHEST, above_chest] {
-        if final_at(v, target) != final_at(d, target) {
+        if final_at(&v, target) != final_at(&d, target) {
             failures.push(format!(
                 "final states differ at {target:?}: vanilla {:?} vs doppel {:?}",
-                final_at(v, target),
-                final_at(d, target)
+                final_at(&v, target),
+                final_at(&d, target)
             ));
         }
     }
@@ -805,84 +1496,93 @@ fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
             v.slots, d.slots
         ));
     }
-}
 
-/// The differential breaking test.
-pub fn parity_break() -> Result<bool> {
-    let pin = load_pin()?;
-    let jar = vanilla::ensure_jar(&pin)?;
-    let root = doppel_protocol::find_repo_root()?;
-    let blobs_dir = root.join("target").join("vanilla").join("blobs-break");
-    let pristine_world = root
-        .join("target")
-        .join("vanilla")
-        .join("pristine-world-break");
-    for dir in [&blobs_dir, &pristine_world] {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
+    // Cross-type same-tick order: a pair the reference orders unanimously
+    // in at least two bursts is a settled invariant; doppel fails only
+    // when its votes MAJORITY-oppose it. Single-burst evidence stays
+    // unjudged, and split doppel votes abstain: wire captures show both
+    // servers emit entity spawn before entity data (verified frame by
+    // frame), so the lone opposite vote traces to a burst boundary
+    // splitting one entity's data packet from another entity's spawn -
+    // a measurement artifact, not an ordering change. A genuine reorder
+    // draws lopsided opposite votes, never a tie. The positive-pair
+    // count keeps an empty capture from passing.
+    let mut compared_pairs = 0usize;
+    for (stream, vpk, dpk) in [
+        ("digger", &v_digger, &d_digger),
+        ("witness", &v_witness, &d_witness),
+    ] {
+        let vstart = match marker_of(vpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let dstart = match marker_of(dpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let vvotes = order_votes(vpk, vstart);
+        let dvotes = order_votes(dpk, dstart);
+        for ((lo, hi), [lo_first, hi_first]) in &vvotes {
+            let van_votes = lo_first + hi_first;
+            let van_unanimous = van_votes >= 2 && (*lo_first == 0) != (*hi_first == 0);
+            if !van_unanimous {
+                continue;
+            }
+            let want_first = if *lo_first > 0 { *lo } else { *hi };
+            let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
+            let d_want = if *lo_first > 0 { dlo } else { dhi };
+            let d_other = if *lo_first > 0 { dhi } else { dlo };
+            if d_other > d_want {
+                failures.push(format!(
+                    "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
+                ));
+                // Name the offending bursts: which packets, what order,
+                // what times - a flush-merge artifact and a real reorder
+                // read differently here (different entity ids across a
+                // seam vs the same id inside one flush).
+                let mut shown = 0;
+                let mut burst: Vec<(char, i32, u128)> = Vec::new();
+                let mut last_ms: Option<u128> = None;
+                for p in dpk.iter().skip(dstart) {
+                    if p.id < 0 {
+                        continue;
+                    }
+                    let Some(l) = order_label(p.id) else {
+                        continue;
+                    };
+                    if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
+                        let firsts: std::collections::BTreeMap<char, u128> =
+                            burst.iter().map(|(l, _, t)| (*l, *t)).collect();
+                        if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
+                            if at < bt {
+                                println!(
+                                    "  {stream} opposite burst: {}",
+                                    burst
+                                        .iter()
+                                        .map(|(l, id, t)| format!("{l}=0x{id:02x}@{t}ms"))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                );
+                                shown += 1;
+                            }
+                        }
+                        if shown >= 3 {
+                            break;
+                        }
+                        burst.clear();
+                    }
+                    burst.push((l, p.id, p.t_ms));
+                    last_ms = Some(p.t_ms);
+                }
+            }
+            if d_want > 0 {
+                compared_pairs += 1;
+            }
         }
     }
-    let protocol = pin.protocol.unwrap_or(0);
-
-    // 1. Clean blobs + pristine world.
-    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
-
-    // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
-    // idle timers, so the phase carries its own wall-clock bound: closing
-    // the server ends any still-blocked capture from outside.
-    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
-    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
-    let vdeadline = std::time::Instant::now() + Duration::from_secs(90);
-    while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
-        std::thread::sleep(Duration::from_millis(500));
+    if compared_pairs == 0 {
+        failures.push("no cross-type same-tick order pairs compared".into());
     }
-    drop(server);
-    let (v_digger, v_witness) = vworker
-        .join()
-        .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
-
-    // 3. Doppel sessions. The warm-up sleep puts doppel's tick counter
-    // past the delayed-destroy threshold, matching a booted server.
-    let bin = default_doppel_bin()?;
-    let pin_path = doppel_protocol::pin_path()?;
-    let mut child = Command::new(&bin)
-        .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
-        .env("DOPPEL_PIN", &pin_path)
-        .env("DOPPEL_BLOBS", &blobs_dir)
-        .env("DOPPEL_WORLD", &pristine_world)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
-    std::thread::sleep(Duration::from_secs(10));
-    // Both servers keep an idle-based capture alive with steady traffic
-    // (time pushes, entity tracking at spawn), so this phase carries the
-    // same wall-clock bound as the vanilla one.
-    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !worker.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let (d_digger, d_witness) = worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
-
-    let v = analyze(&v_digger, &v_witness);
-    let d = analyze(&d_digger, &d_witness);
-    print_break_summary(&[
-        ("vanilla", &v_digger, &v_witness, &v),
-        ("doppel", &d_digger, &d_witness, &d),
-    ]);
-
-    let mut failures = Vec::new();
-    compare_break_sides(&v, &d, &mut failures);
-
-    let compared_pairs =
-        order_vote_check(&v_digger, &d_digger, &v_witness, &d_witness, &mut failures);
     println!("[oracle] cross-type same-tick order: {compared_pairs} positively compared pair(s)");
 
     if failures.is_empty() {

@@ -517,7 +517,7 @@ mod tests {
         });
         g.handle(Inbound::GameMode {
             conn: 7,
-            creative: true,
+            mode: crate::game::GameMode::Creative,
         });
         // Menu slot 36 (hotbar 0) gets 1x stone with max_stack_size 16.
         let set = crate::inventory::parse_set_creative_slot(&[

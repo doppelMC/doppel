@@ -429,6 +429,138 @@ fn handle_login(
 /// 26.x serverbound ids are stable across the 26.2→26.3 clientbound
 /// shifts. Unknown packets are ignored, matching vanilla's tolerance for
 /// forward-compat channels.
+/// The chat-command arm of `play_event`: the harness drivers Doppel
+/// exactly like vanilla, so every command it observes must translate.
+fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound> {
+    // chat_command (unsigned, no leading slash). Minimal /tp so the
+    // walk-parity bot can drive Doppel exactly like vanilla.
+    let cmd = r.read_string(1024).ok()?;
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.len() == 5 && parts[0] == "tp" {
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            parts[2].parse::<f64>(),
+            parts[3].parse::<f64>(),
+            parts[4].parse::<f64>(),
+        ) {
+            if parts[1] == "@s" {
+                return Some(game::Inbound::Tp { conn, x, y, z });
+            }
+            return Some(game::Inbound::TpNamed {
+                conn,
+                name: parts[1].to_string(),
+                x,
+                y,
+                z,
+            });
+        }
+    }
+    if parts.len() == 5 && parts[0] == "setblock" {
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            parts[1].parse::<i32>(),
+            parts[2].parse::<i32>(),
+            parts[3].parse::<i32>(),
+        ) {
+            return Some(game::Inbound::Setblock {
+                conn,
+                x,
+                y,
+                z,
+                name: parts[4].to_string(),
+            });
+        }
+    }
+    // `tick step N` is the differential harness's sequencing
+    // barrier: later commands must land on later ticks.
+    if parts.len() == 3 && parts[0] == "tick" && parts[1] == "step" {
+        if let Ok(steps) = parts[2].parse::<u32>() {
+            return Some(game::Inbound::TickStep { conn, steps });
+        }
+    }
+    // `tick freeze` / `tick unfreeze` gate the wall-clock loop;
+    // stepped ticks still advance a frozen clock.
+    if parts.len() == 2 && parts[0] == "tick" {
+        match parts[1] {
+            "freeze" => {
+                return Some(game::Inbound::TickFreeze { conn, frozen: true });
+            }
+            "unfreeze" => {
+                return Some(game::Inbound::TickFreeze {
+                    conn,
+                    frozen: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    // `time set <ticks>`: the game thread stores the day time
+    // and answers with a set_time broadcast plus the pacing
+    // reply.
+    if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
+        if let Ok(value) = parts[2].parse::<i64>() {
+            return Some(game::Inbound::TimeSet { conn, value });
+        }
+    }
+    // `gamemode <mode>` for the commanding player switches the
+    // mode the inventory, placement, and dig paths read.
+    if parts.len() == 2 && parts[0] == "gamemode" {
+        if let Some(mode) = game::GameMode::parse(parts[1]) {
+            return Some(game::Inbound::GameMode { conn, mode });
+        }
+    }
+    // `give @s <item> [count]`: the inventory test driver. The
+    // item name resolves (or fails) game-side against the learned
+    // id table, like setblock.
+    if (parts.len() == 3 || parts.len() == 4) && parts[0] == "give" && parts[1] == "@s" {
+        let count = if parts.len() == 4 {
+            parts[3].parse::<i32>().ok()?
+        } else {
+            1
+        };
+        return Some(game::Inbound::Give {
+            conn,
+            item: parts[2].to_string(),
+            count,
+        });
+    }
+    // --- survival hooks (entities.rs) ---
+    // `gamerule random_tick_speed N`: the random tick rate the
+    // survival gate amplifies its decay window with (the rule is
+    // snake_case on the wire).
+    if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "random_tick_speed" {
+        if let Ok(speed) = parts[2].parse::<usize>() {
+            return Some(game::Inbound::GameRule {
+                conn,
+                tick_speed: speed,
+            });
+        }
+    }
+    // --- mob hooks (living.rs / spawning.rs) ---
+    if let Some(inbound) = mob_command(conn, &parts) {
+        return Some(inbound);
+    }
+    // The other spawner gamerules silence monster families this
+    // build does not spawn; the reply must still come.
+    if parts.len() == 3
+        && parts[0] == "gamerule"
+        && parts[1].starts_with("spawn_")
+        && parts[2].parse::<bool>().is_ok()
+    {
+        return Some(game::Inbound::GameRuleNoop { conn });
+    }
+    // --- containers hooks (containers.rs) ---
+    // `opencontainer x y z`: the container test driver.
+    if parts.len() == 5 && parts[0] == "opencontainer" {
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            parts[1].parse::<i32>(),
+            parts[2].parse::<i32>(),
+            parts[3].parse::<i32>(),
+        ) {
+            return Some(game::Inbound::OpenContainer { conn, x, y, z });
+        }
+    }
+    None
+}
+
 fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound> {
     let mut r = Reader::new(body);
     match id {
@@ -473,147 +605,8 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
             let pitch = r.read_f32().ok()?;
             Some(game::Inbound::Rotated { conn, yaw, pitch })
         }
-        0x07 => {
-            // chat_command (unsigned, no leading slash). Minimal /tp so the
-            // walk-parity bot can drive Doppel exactly like vanilla.
-            let cmd = r.read_string(1024).ok()?;
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            if parts.len() == 5 && parts[0] == "tp" {
-                if let (Ok(x), Ok(y), Ok(z)) = (
-                    parts[2].parse::<f64>(),
-                    parts[3].parse::<f64>(),
-                    parts[4].parse::<f64>(),
-                ) {
-                    if parts[1] == "@s" {
-                        return Some(game::Inbound::Tp { conn, x, y, z });
-                    }
-                    return Some(game::Inbound::TpNamed {
-                        conn,
-                        name: parts[1].to_string(),
-                        x,
-                        y,
-                        z,
-                    });
-                }
-            }
-            if parts.len() == 5 && parts[0] == "setblock" {
-                if let (Ok(x), Ok(y), Ok(z)) = (
-                    parts[1].parse::<i32>(),
-                    parts[2].parse::<i32>(),
-                    parts[3].parse::<i32>(),
-                ) {
-                    return Some(game::Inbound::Setblock {
-                        conn,
-                        x,
-                        y,
-                        z,
-                        name: parts[4].to_string(),
-                    });
-                }
-            }
-            // `tick step N` is the differential harness's sequencing
-            // barrier: later commands must land on later ticks.
-            if parts.len() == 3 && parts[0] == "tick" && parts[1] == "step" {
-                if let Ok(steps) = parts[2].parse::<u32>() {
-                    return Some(game::Inbound::TickStep { conn, steps });
-                }
-            }
-            // `tick freeze` / `tick unfreeze` gate the wall-clock loop;
-            // stepped ticks still advance a frozen clock.
-            if parts.len() == 2 && parts[0] == "tick" {
-                match parts[1] {
-                    "freeze" => {
-                        return Some(game::Inbound::TickFreeze { conn, frozen: true });
-                    }
-                    "unfreeze" => {
-                        return Some(game::Inbound::TickFreeze {
-                            conn,
-                            frozen: false,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            // `time set <ticks>`: the game thread stores the day time
-            // and answers with a set_time broadcast plus the pacing
-            // reply.
-            if parts.len() == 3 && parts[0] == "time" && parts[1] == "set" {
-                if let Ok(value) = parts[2].parse::<i64>() {
-                    return Some(game::Inbound::TimeSet { conn, value });
-                }
-            }
-            // `gamemode <mode>` for the commanding player flips the
-            // creative flag the inventory and placement paths read.
-            if parts.len() == 2 && parts[0] == "gamemode" {
-                match parts[1] {
-                    "creative" => {
-                        return Some(game::Inbound::GameMode {
-                            conn,
-                            creative: true,
-                        });
-                    }
-                    "survival" | "adventure" | "spectator" => {
-                        return Some(game::Inbound::GameMode {
-                            conn,
-                            creative: false,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-            // `give @s <item> [count]`: the inventory test driver. The
-            // item name resolves (or fails) game-side against the learned
-            // id table, like setblock.
-            if (parts.len() == 3 || parts.len() == 4) && parts[0] == "give" && parts[1] == "@s" {
-                let count = if parts.len() == 4 {
-                    parts[3].parse::<i32>().ok()?
-                } else {
-                    1
-                };
-                return Some(game::Inbound::Give {
-                    conn,
-                    item: parts[2].to_string(),
-                    count,
-                });
-            }
-            // --- survival hooks (entities.rs) ---
-            // `gamerule random_tick_speed N`: the random tick rate the
-            // survival gate amplifies its decay window with (the rule is
-            // snake_case on the wire).
-            if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "random_tick_speed" {
-                if let Ok(speed) = parts[2].parse::<usize>() {
-                    return Some(game::Inbound::GameRule {
-                        conn,
-                        tick_speed: speed,
-                    });
-                }
-            }
-            // --- mob hooks (living.rs / spawning.rs) ---
-            if let Some(inbound) = mob_command(conn, &parts) {
-                return Some(inbound);
-            }
-            // The other spawner gamerules silence monster families this
-            // build does not spawn; the reply must still come.
-            if parts.len() == 3
-                && parts[0] == "gamerule"
-                && parts[1].starts_with("spawn_")
-                && parts[2].parse::<bool>().is_ok()
-            {
-                return Some(game::Inbound::GameRuleNoop { conn });
-            }
-            // --- containers hooks (containers.rs) ---
-            // `opencontainer x y z`: the container test driver.
-            if parts.len() == 5 && parts[0] == "opencontainer" {
-                if let (Ok(x), Ok(y), Ok(z)) = (
-                    parts[1].parse::<i32>(),
-                    parts[2].parse::<i32>(),
-                    parts[3].parse::<i32>(),
-                ) {
-                    return Some(game::Inbound::OpenContainer { conn, x, y, z });
-                }
-            }
-            None
-        }
+        // chat_command (unsigned, no leading slash).
+        0x07 => chat_command_event(conn, r),
         // --- inventory hooks (inventory.rs) ---
         // set_carried_item: hotbar select, one i16 slot. The id is the
         // 26.3 registration order (26.2's 0x35 + the inserted-punch shift)
@@ -627,6 +620,11 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
         0x39 => {
             let set = inventory::parse_set_creative_slot(body).ok()?;
             Some(game::Inbound::CreativeSlot { conn, set })
+        }
+        // player_abilities: the client toggling flight.
+        0x28 => {
+            let flying = inventory::parse_player_abilities(body).ok()?;
+            Some(game::Inbound::PlayerAbilities { conn, flying })
         }
         // container_click: clicks against an open menu (HashedStack
         // predictions decoded but not applied — see inventory.rs).

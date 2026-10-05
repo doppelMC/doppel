@@ -138,6 +138,11 @@ pub fn at(g: &Game, x: i32, y: i32, z: i32) -> String {
     g.block_label_for_test(x, y, z)
 }
 
+/// Packs a block position the wire way.
+fn pack_pos(x: i32, y: i32, z: i32) -> i64 {
+    (((x as i64) & 0x3ff_ffff) << 38) | (((z as i64) & 0x3ff_ffff) << 12) | ((y as i64) & 0xfff)
+}
+
 /// Straight push: extend, carriers, landing, retract — the full lifecycle
 /// with vanilla's per-tick broadcast offsets.
 #[test]
@@ -226,6 +231,188 @@ fn piston_extend_and_retract() {
     // Stones stay pushed (plain piston does not pull).
     assert_eq!(at(&g, 25, 100, 10), "minecraft:stone[]");
     assert_eq!(at(&g, 26, 100, 10), "minecraft:stone[]");
+}
+
+/// The block_event packet for extend and retract, byte for byte (the
+/// oracle-captured vanilla form: packed pos, trigger id, direction, and
+/// the piston block registry id 149). Only players within the reference's
+/// 64-block broadcast radius receive it.
+#[test]
+fn piston_broadcasts_block_event() {
+    let (mut g, rx) = harness();
+    // The harness viewer stands at the origin, far outside the radius.
+    g.handle(Inbound::Tp {
+        conn: 0,
+        x: 24.0,
+        y: 102.0,
+        z: 10.0,
+    });
+    for c in [
+        "setblock 25 100 10 minecraft:stone",
+        "setblock 24 100 10 minecraft:stone",
+        "setblock 23 100 10 minecraft:piston[extended=false,facing=east]",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=true]",
+    ] {
+        cmd(&mut g, c);
+    }
+    let mut events = Vec::new();
+    for _ in 0..6 {
+        g.tick_once_for_test();
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, body } = frame else {
+                continue;
+            };
+            if id == 0x07 {
+                events.push(body.clone());
+            }
+        }
+    }
+    // Extend: trigger 0, direction 5 (east), block id 149.
+    let packed = pack_pos(23, 100, 10);
+    let mut extend = Vec::new();
+    extend.extend_from_slice(&packed.to_be_bytes());
+    extend.push(0);
+    extend.push(5);
+    doppel_protocol::write_varint(&mut extend, crate::game::BLOCK_PISTON);
+    assert_eq!(events.first(), Some(&extend), "extend block_event bytes");
+    cmd(
+        &mut g,
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=false]",
+    );
+    for _ in 0..6 {
+        g.tick_once_for_test();
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, body } = frame else {
+                continue;
+            };
+            if id == 0x07 {
+                events.push(body.clone());
+            }
+        }
+    }
+    // Retract: trigger 1 (the carrier landed before the power dropped).
+    let mut retract = Vec::new();
+    retract.extend_from_slice(&packed.to_be_bytes());
+    retract.push(1);
+    retract.push(5);
+    doppel_protocol::write_varint(&mut retract, crate::game::BLOCK_PISTON);
+    assert_eq!(events.get(1), Some(&retract), "retract block_event bytes");
+    assert_eq!(events.len(), 2, "exactly one event per edge: {events:?}");
+
+    // A viewer outside the 64-block radius gets nothing.
+    let (mut g, rx) = harness();
+    for c in [
+        "setblock 25 100 10 minecraft:stone",
+        "setblock 24 100 10 minecraft:stone",
+        "setblock 23 100 10 minecraft:piston[extended=false,facing=east]",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=true]",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=false]",
+    ] {
+        cmd(&mut g, c);
+    }
+    let mut far = 0;
+    for _ in 0..6 {
+        g.tick_once_for_test();
+        while let Ok(frame) = rx.try_recv() {
+            let Outbound::Frame { id, .. } = frame else {
+                continue;
+            };
+            if id == 0x07 {
+                far += 1;
+            }
+        }
+    }
+    assert_eq!(far, 0, "no block_event past the radius");
+}
+
+/// A three-block push moves each block exactly once: after the landing
+/// every source cell except the arm is air and every destination holds
+/// one block.
+#[test]
+fn piston_three_block_push_leaves_one_block_each() {
+    let (mut g, rx) = harness();
+    for c in [
+        "setblock 24 100 10 minecraft:stone",
+        "setblock 25 100 10 minecraft:stone",
+        "setblock 26 100 10 minecraft:stone",
+        "setblock 23 100 10 minecraft:piston[extended=false,facing=east]",
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=true]",
+    ] {
+        cmd(&mut g, c);
+    }
+    for _ in 0..5 {
+        tick(&mut g, &rx);
+    }
+    let is_stone = |g: &Game, x: i32| at(g, x, 100, 10) == "minecraft:stone[]";
+    // Sources 24 and 25 become the head and the nearest carrier cell; 26
+    // vacates to air. Destinations 25, 26, 27 each hold exactly one stone.
+    assert!(is_stone(&g, 25), "25: {}", at(&g, 25, 100, 10));
+    assert!(is_stone(&g, 26), "26: {}", at(&g, 26, 100, 10));
+    assert!(is_stone(&g, 27), "27: {}", at(&g, 27, 100, 10));
+    assert_eq!(at(&g, 26, 100, 10), "minecraft:stone[]");
+    assert_eq!(
+        at(&g, 24, 100, 10),
+        "minecraft:piston_head[facing=east,short=false,type=normal]",
+        "the arm lands at the nearest source cell"
+    );
+    // No stone remains outside the three destinations and the piston.
+    for x in 28..32 {
+        assert_eq!(at(&g, x, 100, 10), "minecraft:air[]", "beyond the push");
+    }
+    // Retract: the plain piston leaves the stones pushed.
+    cmd(
+        &mut g,
+        "setblock 22 100 10 minecraft:lever[face=floor,powered=false]",
+    );
+    for _ in 0..5 {
+        tick(&mut g, &rx);
+    }
+    assert!(is_stone(&g, 25) && is_stone(&g, 26) && is_stone(&g, 27));
+    assert_eq!(
+        at(&g, 23, 100, 10),
+        "minecraft:piston[extended=false,facing=east]"
+    );
+    assert_eq!(at(&g, 24, 100, 10), "minecraft:air[]", "head removed");
+}
+
+/// Breaking the middle wire of a staircase clears the surviving wires'
+/// stale diagonal connections (the removed state's indirect shape fan).
+#[test]
+fn wire_removal_clears_diagonal_connections() {
+    let (mut g, rx) = harness();
+    for c in [
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+        "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 12 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        "setblock 13 100 10 minecraft:stone",
+        "setblock 13 101 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+    ] {
+        cmd(&mut g, c);
+        g.tick_once_for_test();
+    }
+    cmd(
+        &mut g,
+        "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=true]",
+    );
+    for _ in 0..4 {
+        tick(&mut g, &rx);
+    }
+    // The step's up-connection forms while the wire exists.
+    assert!(
+        at(&g, 12, 100, 10).contains("east=up"),
+        "staircase up forms: {}",
+        at(&g, 12, 100, 10)
+    );
+    // Break the step wire: the surviving wire below loses its up side.
+    cmd(&mut g, "setblock 13 101 10 minecraft:air");
+    for _ in 0..4 {
+        tick(&mut g, &rx);
+    }
+    assert!(
+        !at(&g, 12, 100, 10).contains("east=up"),
+        "stale up side cleared after removal: {}",
+        at(&g, 12, 100, 10)
+    );
 }
 
 /// Sticky pull: the block two ahead comes back with the head.

@@ -745,11 +745,11 @@ impl Game {
     /// Spawns a dropped item from a broken block: the centered pop - the
     /// level random draws the in-cell position (x, y, z), the entity
     /// random draws the bob phase, the facing, and the pop velocity - on
-    /// the 10-tick pickup delay. Bare-hand breaks of tool-required blocks
-    /// drop nothing.
-    pub(crate) fn spawn_break_drop(&mut self, pos: (i32, i32, i32), name: &str) {
+    /// the 10-tick pickup delay. Tool-gated blocks drop only when the
+    /// held item is the correct tool.
+    pub(crate) fn spawn_break_drop(&mut self, pos: (i32, i32, i32), name: &str, held: Option<i32>) {
         let (_, requires_tool) = crate::dig::hardness(name);
-        if requires_tool {
+        if requires_tool && !crate::dig::correct_tool_for_drops(name, held) {
             return;
         }
         let Some(item) = block_drop_item(name) else {

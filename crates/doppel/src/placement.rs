@@ -468,12 +468,11 @@ impl Game {
         let known = self.registry.as_ref()?.state_id(&name, "").is_some();
         known.then_some((name, Form::Plain))
     }
-}
 
-impl Game {
-    /// Serverbound use_item_on: resolve the held block item against the
-    /// clicked face, place it, and spend one item (survival). The parse
-    /// and the per-family geometry live in placement.rs.
+    /// Serverbound use_item_on: the clicked block's own use runs first
+    /// (the reference's block-before-item rule), then the held block item
+    /// resolves against the clicked face. The parse and the per-family
+    /// geometry live in placement.rs.
     pub(crate) fn place_from_hand(
         &mut self,
         conn: ConnId,
@@ -483,16 +482,31 @@ impl Game {
         face: u8,
         hand: u8,
     ) {
-        // The clicked block's use runs first (the reference's
-        // block-before-item rule): a container right-click opens the menu
-        // and consumes the click whether or not the menu actually opens
-        // (a blocked chest answers success without opening). The held
-        // item neither places nor spends.
+        // The reference's use_item_on tail: after every in-range click it
+        // echoes the clicked cell and the face's target back to the actor,
+        // consumed or not.
+        let (edx, edy, edz) = crate::placement::face_step(face);
+        let echo = |g: &mut Game| {
+            g.send_block_update(conn, x, y, z);
+            g.send_block_update(conn, x + edx, y + edy, z + edz);
+        };
+        // A container right-click opens the menu and consumes the click
+        // whether or not the menu actually opens (a blocked chest answers
+        // success without opening). The held item neither places nor
+        // spends.
         if matches!(
             self.get_block(x, y, z),
             Some((ref n, _)) if matches!(n.as_str(), "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:hopper")
         ) {
             self.open_container(conn, x, y, z);
+            echo(self);
+            return;
+        }
+        // A lever right-click flips it and consumes the click the same
+        // way (`LeverBlock.useWithoutItem` -> SUCCESS).
+        if matches!(self.get_block(x, y, z), Some((ref n, _)) if n == "minecraft:lever") {
+            self.lever_used(x, y, z);
+            echo(self);
             return;
         }
         // NOTE(breaking): the other menu-providing blocks (barrel,
@@ -529,15 +543,17 @@ impl Game {
                 eprintln!(
                     "[game] use_item_on at ({x},{y},{z}) face {face}: no block item in slot {slot}"
                 );
+                echo(self);
                 return;
             };
             (slot, block, form, p.yaw, p.pitch, p.inv.creative)
         };
+        let (dx, dy, dz) = (edx, edy, edz);
         let Some(spec) = form.spec(&block, face, yaw, pitch) else {
             eprintln!("[game] use_item_on: no form for {block} face {face}");
+            echo(self);
             return;
         };
-        let (dx, dy, dz) = crate::placement::face_step(face);
         let (tx, ty, tz) = (x + dx, y + dy, z + dz);
         // Only air accepts a placement; replaceable blocks (water, grass
         // paths) arrive with the block-data pin.
@@ -546,16 +562,19 @@ impl Game {
                 "[game] use_item_on: target ({tx},{ty},{tz}) is not air: {:?}",
                 self.get_block(tx, ty, tz)
             );
+            echo(self);
             return;
         }
         let Some(state) = self.resolve_state(&spec) else {
             eprintln!("[game] placement: unknown state {spec}");
+            echo(self);
             return;
         };
         // NOTE(placement): chest-family placements would create their
         // block entity here; that lands with containers.rs, which owns
         // block entities. Placement only sets the state.
         self.set_block(tx, ty, tz, state, true);
+        echo(self);
         if creative {
             return;
         }
@@ -573,6 +592,38 @@ impl Game {
             .filter(|s| !s.is_empty());
         p.inv.inventory.set(slot, remaining);
         p.inv.pending_sync.insert(slot);
+    }
+
+    /// The lever's use: flip `powered`, write it with neighbor updates,
+    /// and push the same updates through the block it attaches to (the
+    /// reference's `LeverBlock.pull` + `updateNeighbours`).
+    fn lever_used(&mut self, x: i32, y: i32, z: i32) {
+        let Some((name, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        if name != "minecraft:lever" {
+            return;
+        }
+        let powered = props.contains("powered=true");
+        let new_props = doppel_world::registry::BlockRegistry::with_prop(
+            &props,
+            "powered",
+            if powered { "false" } else { "true" },
+        );
+        let spec = format!("{name}[{new_props}]");
+        let Some(state) = self.resolve_state(&spec) else {
+            return;
+        };
+        self.set_block(x, y, z, state, true);
+        // The attachment side (FLOOR -> below, CEILING -> above, WALL ->
+        // behind the facing): its neighbors re-check as well.
+        let attached = match crate::game::prop_value(&props, "face") {
+            "floor" => crate::game::DIR_DOWN,
+            "ceiling" => crate::game::DIR_UP,
+            _ => crate::game::dir_opposite(crate::game::dir_id(crate::game::prop_dir(&props))),
+        };
+        let (ax, ay, az) = crate::game::offset((x, y, z), crate::game::dir_step(attached), 1);
+        self.schedule_neighbor_update(ax, ay, az);
     }
 }
 
@@ -869,6 +920,130 @@ mod tests {
         let _ = rx;
     }
 
+    /// Right-clicking a lever flips `powered` with an empty hand and with
+    /// a block in hand (the block-before-item rule: nothing places).
+    #[test]
+    fn lever_right_click_toggles() {
+        let (mut g, rx) = harness();
+        for c in [
+            "setblock 10 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
+            "setblock 11 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+        ] {
+            g.handle(Inbound::Setblock {
+                conn: 0,
+                name: c.split_whitespace().last().unwrap().to_string(),
+                x: c.split_whitespace().nth(1).unwrap().parse().unwrap(),
+                y: c.split_whitespace().nth(2).unwrap().parse().unwrap(),
+                z: c.split_whitespace().nth(3).unwrap().parse().unwrap(),
+            });
+            g.tick_once_for_test();
+        }
+        use_on(&mut g, 10, 100, 10, DIR_UP, 0);
+        g.tick_once_for_test();
+        assert!(
+            at(&g, 10, 100, 10).contains("powered=true"),
+            "lever ON: {}",
+            at(&g, 10, 100, 10)
+        );
+        // A held block does not place onto the lever's cell: the use wins
+        // and the second click flips the lever back off.
+        give(&mut g, "minecraft:stone", 64);
+        use_on(&mut g, 10, 100, 10, DIR_UP, 0);
+        g.tick_once_for_test();
+        assert!(
+            at(&g, 10, 101, 10).contains("air"),
+            "no placement on top of the lever: {}",
+            at(&g, 10, 101, 10)
+        );
+        assert!(
+            at(&g, 10, 100, 10).contains("powered=false"),
+            "lever OFF: {}",
+            at(&g, 10, 100, 10)
+        );
+        let _ = rx;
+    }
+
+    /// The lever's flip lights the wire beside it, climbs a staircase of
+    /// one block, and darkens again on the second click.
+    #[test]
+    fn lever_flip_lights_wire_and_staircase() {
+        let (mut g, rx) = harness();
+        // Floor row: lever at 10, wire 11..12 at y=100, then a stone step
+        // at 13 with wire on top at y=101 (the staircase up).
+        for (x, y, z, spec) in [
+            (
+                10,
+                100,
+                10,
+                "minecraft:lever[face=floor,facing=north,powered=false]",
+            ),
+            (
+                11,
+                100,
+                10,
+                "minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+            ),
+            (
+                12,
+                100,
+                10,
+                "minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+            ),
+            (13, 100, 10, "minecraft:stone"),
+            (
+                13,
+                101,
+                10,
+                "minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
+            ),
+        ] {
+            g.handle(Inbound::Setblock {
+                conn: 0,
+                x,
+                y,
+                z,
+                name: spec.to_string(),
+            });
+            g.tick_once_for_test();
+        }
+        use_on(&mut g, 10, 100, 10, DIR_UP, 0);
+        for _ in 0..4 {
+            g.tick_once_for_test();
+        }
+        let wire = |g: &Game, x: i32, y: i32| at(g, x, y, 10);
+        assert!(wire(&g, 10, 100).contains("powered=true"), "lever on");
+        assert!(
+            wire(&g, 11, 100).contains("power=15"),
+            "near wire lit: {}",
+            wire(&g, 11, 100)
+        );
+        assert!(
+            wire(&g, 12, 100).contains("power=14"),
+            "second wire attenuated: {}",
+            wire(&g, 12, 100)
+        );
+        assert!(
+            wire(&g, 13, 101).contains("power=13"),
+            "staircase climbed: {}",
+            wire(&g, 13, 101)
+        );
+        use_on(&mut g, 10, 100, 10, DIR_UP, 0);
+        for _ in 0..4 {
+            g.tick_once_for_test();
+        }
+        assert!(
+            wire(&g, 11, 100).contains("power=0"),
+            "wire dark again: {}",
+            wire(&g, 11, 100)
+        );
+        assert!(
+            wire(&g, 13, 101).contains("power=0"),
+            "staircase dark again: {}",
+            wire(&g, 13, 101)
+        );
+        let _ = rx;
+    }
+
     #[test]
     fn places_on_every_face() {
         let (mut g, rx) = harness();
@@ -888,13 +1063,22 @@ mod tests {
         // Bottom face points into the occupied floor cell: refused.
         use_on(&mut g, 5, 100, 5, DIR_DOWN, 0);
         assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
-        // Five placements consumed five items; the refused click did not.
-        // The tick's world flush broadcasts the five placements first; the
-        // spent stack syncs on the menu broadcast behind the flush point.
+        // Every click echoes its clicked and target cells back to the
+        // actor; the placements ride the world flush behind the echoes.
+        // Five placements consumed five items; the refused click did not
+        // place. The spent stack syncs behind the flush point.
         g.tick_once_for_test();
         let queued = drain(&rx);
         let frames = decode_block_frames(&g, &queued);
-        assert_eq!(frames.len(), 5, "{frames:?}");
+        assert_eq!(frames.len(), 17, "{frames:?}");
+        assert_eq!(
+            frames[0], "553=minecraft:stone[]",
+            "echo of the clicked cell"
+        );
+        assert_eq!(
+            frames[1], "554=minecraft:stone[]",
+            "echo of the target cell"
+        );
         let sync = queued
             .iter()
             .position(|(id, _)| *id == PACKET_CONTAINER_SET_SLOT)
@@ -1055,22 +1239,31 @@ mod tests {
             at(&g, 5, 100, 5),
             "minecraft:lever[face=floor,facing=south,powered=false]"
         );
-        use_on(&mut g, 5, 100, 5, DIR_EAST, 0);
+        // A wall mount needs the side of a plain block: right-clicking the
+        // lever itself would flip it (the block-before-item rule).
+        g.handle(Inbound::Setblock {
+            conn: 0,
+            x: 6,
+            y: 100,
+            z: 5,
+            name: "minecraft:stone".to_string(),
+        });
+        use_on(&mut g, 6, 100, 5, DIR_EAST, 0);
         assert_eq!(
-            at(&g, 6, 100, 5),
+            at(&g, 7, 100, 5),
             "minecraft:lever[face=wall,facing=east,powered=false]"
         );
         // Ceiling mount: click the bottom of a floating scaffold block.
         g.handle(Inbound::Setblock {
             conn: 0,
-            x: 7,
+            x: 9,
             y: 101,
             z: 5,
             name: "minecraft:stone".to_string(),
         });
-        use_on(&mut g, 7, 101, 5, DIR_DOWN, 0);
+        use_on(&mut g, 9, 101, 5, DIR_DOWN, 0);
         assert_eq!(
-            at(&g, 7, 100, 5),
+            at(&g, 9, 100, 5),
             "minecraft:lever[face=ceiling,facing=south,powered=false]"
         );
     }
@@ -1124,8 +1317,16 @@ mod tests {
         g.tick_once_for_test();
         let queued = drain(&rx);
         let frames = decode_block_frames(&g, &queued);
-        // The pop overrides the placement in the same per-tick dedup.
-        assert_eq!(frames, vec!["655=minecraft:air[]"]);
+        // The interaction echo precedes the world flush; the pop overrides
+        // the placement in the same per-tick dedup.
+        assert_eq!(
+            frames,
+            vec![
+                "665=minecraft:stone[]",
+                "655=minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=none]",
+                "655=minecraft:air[]",
+            ]
+        );
         assert_eq!(at(&g, 6, 101, 5), "minecraft:air[]");
         let sync = queued
             .iter()
