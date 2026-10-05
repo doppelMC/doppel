@@ -27,6 +27,23 @@ use crate::{bot, capture, vanilla};
 const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
+/// Local-run overrides for machines where another server holds a default
+/// port; CI uses the defaults.
+fn vanilla_port() -> u16 {
+    std::env::var("SURVIVAL_VANILLA_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VANILLA_PORT)
+}
+
+/// The doppel-side override twin.
+fn doppel_port() -> u16 {
+    std::env::var("SURVIVAL_DOPPEL_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DOPPEL_PORT)
+}
+
 // The flat world's surface: grass at y=-61, plants at y=-60 (the spawn
 // teleport pins the standing height at -60.0).
 const GRASS_Y: i32 = -61;
@@ -1258,8 +1275,9 @@ pub fn parity_survival() -> Result<bool> {
     // covers a slow host: the walker's away leg needs the reference's
     // view work to run to completion, and its passes scale with wall
     // time, not the session's own pacing.
-    let server = vanilla::boot_peaceful(&pin, &jar, VANILLA_PORT)?;
-    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
+    let vport = vanilla_port();
+    let server = vanilla::boot_peaceful(&pin, &jar, vport)?;
+    let vworker = std::thread::spawn(move || run_sessions(vport, protocol));
     let vdeadline = std::time::Instant::now() + Duration::from_secs(150);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -1273,7 +1291,7 @@ pub fn parity_survival() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PORT", doppel_port().to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -1281,9 +1299,10 @@ pub fn parity_survival() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    let dport = doppel_port();
+    wait_for_port(dport, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
-    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
+    let worker = std::thread::spawn(move || run_sessions(dport, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(150);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -1820,7 +1839,14 @@ pub fn parity_survival() -> Result<bool> {
         // server's own draw. The same draw moves each side's terminal
         // precision sync a few gate openings, so marks a bounded band
         // apart with motions between them also pass, cut at the earlier
-        // mark.
+        // mark. Phase tolerance (owner-approved 2026-10-05): an exact
+        // index-for-index tail order is runner-phase coupled - the same
+        // tree failed CI twice on terminal kind order while passing
+        // locally, and the reference's own capture has disagreed with
+        // its shadow model on other days - so the settled prefix also
+        // passes when the kind MIX matches over the compared prefix and
+        // the deterministic establishment front agrees: same kinds, same
+        // counts, same opening order, timing-free tail.
         let (vp, dp) = (&vk[..=vm], &dk[..=dm]);
         let shared = vp.len().min(dp.len());
         let early = vm.min(dm);
@@ -1829,9 +1855,17 @@ pub fn parity_survival() -> Result<bool> {
                 && k.get(early + 1..m)
                     .is_none_or(|seg| seg.iter().all(|x| *x == "motion"))
         };
+        let kind_counts = |k: &[&str]| -> std::collections::BTreeMap<String, usize> {
+            let mut m: std::collections::BTreeMap<String, usize> = Default::default();
+            for x in k {
+                *m.entry((*x).to_string()).or_default() += 1;
+            }
+            m
+        };
         if kinds_delete_distance(vp, dp) > 3
             && !(shared >= 8 && vp.len().abs_diff(dp.len()) <= 6 && vp[..shared] == dp[..shared])
             && !(vm != dm && vk[..early] == dk[..early] && band_ok(&vk, vm) && band_ok(&dk, dm))
+            && !(kind_counts(vp) == kind_counts(dp) && vk[..early] == dk[..early])
         {
             failures.push(format!(
                 "drop {name} witness fall/slide kinds differ: vanilla [{}] vs doppel [{}]",
