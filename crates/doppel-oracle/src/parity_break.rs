@@ -916,11 +916,9 @@ pub fn parity_play() -> Result<bool> {
     let protocol = pin.protocol.unwrap_or(0);
 
     // Vanilla legs.
-    let vport = VANILLA_PORT;
-    let dport = DOPPEL_PORT;
-    let server = vanilla::boot(&pin, &jar, vport)?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     std::thread::sleep(Duration::from_secs(2));
-    let worker = std::thread::spawn(move || run_play_sessions(vport, protocol));
+    let worker = std::thread::spawn(move || run_play_sessions(VANILLA_PORT, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(150);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
