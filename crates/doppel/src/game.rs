@@ -1385,9 +1385,59 @@ impl Game {
             self.scheduled
                 .push((self.tick, (x, y, z), TickAction::NeighborUpdate));
         }
+        // A wire write also pushes the reference's indirect shape fan:
+        // the diagonal wires beside each connected side re-derive their
+        // shape (`updateIndirectNeighbourShapes`).
+        if self
+            .registry
+            .as_ref()
+            .and_then(|r| r.state_of(state))
+            .is_some_and(|(n, _)| n == "minecraft:redstone_wire")
+        {
+            self.wire_indirect_shape_fan(x, y, z);
+        }
         // --- containers hooks (containers.rs) ---
         // A successful write re-syncs the block-entity map with the block.
         self.sync_block_entity(x, y, z);
+    }
+
+    /// The wire's indirect shape fan (`updateIndirectNeighbourShapes`):
+    /// for every connected horizontal side whose same-level neighbor is
+    /// not a wire, the wires one above and one below that neighbor hear a
+    /// directional shape update from the opposite side.
+    fn wire_indirect_shape_fan(&mut self, x: i32, y: i32, z: i32) {
+        let Some((_, props)) = self.get_block(x, y, z) else {
+            return;
+        };
+        let conn = wire::Connections::from_props(&props);
+        let mut targets: Vec<((i32, i32, i32), (i32, i32, i32))> = Vec::new();
+        for d in wire::Dir::HORIZONTAL {
+            if !conn.connected(d) {
+                continue;
+            }
+            let (sx, _sy, sz) = d.step();
+            let level = (x + sx, y, z + sz);
+            if matches!(
+                self.get_block(level.0, level.1, level.2),
+                Some((n, _)) if wire::is_wire(&n)
+            ) {
+                continue;
+            }
+            let back = d.opposite().step();
+            for dy in [-1, 1] {
+                let t = (level.0, level.1 + dy, level.2);
+                if matches!(self.get_block(t.0, t.1, t.2), Some((n, _)) if wire::is_wire(&n)) {
+                    targets.push((t, back));
+                }
+            }
+        }
+        for ((tx, ty, tz), (dx, dy, dz)) in targets {
+            self.scheduled.push((
+                self.tick,
+                (tx, ty, tz),
+                TickAction::ShapeUpdate { dx, dy, dz },
+            ));
+        }
     }
 
     /// The state id for a spec like "name[k=v]".

@@ -49,7 +49,7 @@ impl Dir {
         Dir::South,
     ];
 
-    fn step(self) -> (i32, i32, i32) {
+    pub fn step(self) -> (i32, i32, i32) {
         match self {
             Dir::Down => (0, -1, 0),
             Dir::Up => (0, 1, 0),
@@ -60,7 +60,7 @@ impl Dir {
         }
     }
 
-    fn opposite(self) -> Dir {
+    pub fn opposite(self) -> Dir {
         match self {
             Dir::Down => Dir::Up,
             Dir::Up => Dir::Down,
@@ -87,7 +87,7 @@ impl Dir {
 /// A block position; the internal currency of this module.
 pub type Pos = (i32, i32, i32);
 
-fn at(p: Pos, d: Dir) -> Pos {
+pub fn at(p: Pos, d: Dir) -> Pos {
     let (dx, dy, dz) = d.step();
     (p.0 + dx, p.1 + dy, p.2 + dz)
 }
@@ -145,7 +145,7 @@ fn wire_power_of(props: &str) -> i32 {
 // Block classification
 // ----------------------------------------------------------------------
 
-fn is_wire(name: &str) -> bool {
+pub fn is_wire(name: &str) -> bool {
     name == "minecraft:redstone_wire"
 }
 
@@ -154,7 +154,7 @@ fn is_wire(name: &str) -> bool {
 /// blocks and families; anything unknown (and every partial block —
 /// slabs, stairs, walls, panes, torches, dust, mechanisms) is treated as
 /// a non-conductor.
-fn is_conductor(name: &str) -> bool {
+pub fn is_conductor(name: &str) -> bool {
     const FULL_CUBES: &[&str] = &[
         "minecraft:stone",
         "minecraft:cobblestone",
@@ -386,7 +386,7 @@ impl Connections {
     }
 
     /// Whether the side toward `d` (a horizontal) is connected.
-    fn connected(self, d: Dir) -> bool {
+    pub fn connected(self, d: Dir) -> bool {
         match d {
             Dir::North => self.north.is_connected(),
             Dir::East => self.east.is_connected(),

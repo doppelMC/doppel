@@ -469,6 +469,14 @@ impl Game {
         face: u8,
         hand: u8,
     ) {
+        // The reference's use_item_on tail: after every in-range click it
+        // echoes the clicked cell and the face's target back to the actor,
+        // consumed or not.
+        let (edx, edy, edz) = crate::placement::face_step(face);
+        let echo = |g: &mut Game| {
+            g.send_block_update(conn, x, y, z);
+            g.send_block_update(conn, x + edx, y + edy, z + edz);
+        };
         // A container right-click opens the menu and consumes the click
         // whether or not the menu actually opens (a blocked chest answers
         // success without opening). The held item neither places nor
@@ -478,12 +486,14 @@ impl Game {
             Some((ref n, _)) if matches!(n.as_str(), "minecraft:chest" | "minecraft:trapped_chest" | "minecraft:hopper")
         ) {
             self.open_container(conn, x, y, z);
+            echo(self);
             return;
         }
         // A lever right-click flips it and consumes the click the same
         // way (`LeverBlock.useWithoutItem` -> SUCCESS).
         if matches!(self.get_block(x, y, z), Some((ref n, _)) if n == "minecraft:lever") {
             self.lever_used(x, y, z);
+            echo(self);
             return;
         }
         // NOTE(breaking): the other menu-providing blocks (barrel,
@@ -520,22 +530,15 @@ impl Game {
                 eprintln!(
                     "[game] use_item_on at ({x},{y},{z}) face {face}: no block item in slot {slot}"
                 );
+                echo(self);
                 return;
             };
             (slot, block, form, p.yaw, p.pitch, p.inv.creative)
         };
-        // The attempted-but-refused paths echo the authoritative blocks
-        // back to the actor: the client predicted the placement, and the
-        // reference's `handleUseItemOn` tail corrects it with one
-        // block_update for the clicked cell and one for the target.
-        let (dx, dy, dz) = crate::placement::face_step(face);
-        let refused = |g: &mut Game| {
-            g.send_block_update(conn, x, y, z);
-            g.send_block_update(conn, x + dx, y + dy, z + dz);
-        };
+        let (dx, dy, dz) = (edx, edy, edz);
         let Some(spec) = form.spec(block, face, yaw, pitch) else {
             eprintln!("[game] use_item_on: no form for {block} face {face}");
-            refused(self);
+            echo(self);
             return;
         };
         let (tx, ty, tz) = (x + dx, y + dy, z + dz);
@@ -546,18 +549,19 @@ impl Game {
                 "[game] use_item_on: target ({tx},{ty},{tz}) is not air: {:?}",
                 self.get_block(tx, ty, tz)
             );
-            refused(self);
+            echo(self);
             return;
         }
         let Some(state) = self.resolve_state(&spec) else {
             eprintln!("[game] placement: unknown state {spec}");
-            refused(self);
+            echo(self);
             return;
         };
         // NOTE(placement): chest-family placements would create their
         // block entity here; that lands with containers.rs, which owns
         // block entities. Placement only sets the state.
         self.set_block(tx, ty, tz, state, true);
+        echo(self);
         if creative {
             return;
         }
@@ -1046,20 +1050,20 @@ mod tests {
         // Bottom face points into the occupied floor cell: refused.
         use_on(&mut g, 5, 100, 5, DIR_DOWN, 0);
         assert_eq!(at(&g, 5, 99, 5), "minecraft:stone[]");
+        // Every click echoes its clicked and target cells back to the
+        // actor; the placements ride the world flush behind the echoes.
         // Five placements consumed five items; the refused click did not
-        // place, and its correction echoes the clicked and target cells
-        // back to the actor ahead of the world flush. The spent stack
-        // syncs on the menu broadcast behind the flush point.
+        // place. The spent stack syncs behind the flush point.
         g.tick_once_for_test();
         let queued = drain(&rx);
         let frames = decode_block_frames(&g, &queued);
-        assert_eq!(frames.len(), 7, "{frames:?}");
+        assert_eq!(frames.len(), 17, "{frames:?}");
         assert_eq!(
-            frames[0], "554=minecraft:stone[]",
+            frames[0], "553=minecraft:stone[]",
             "echo of the clicked cell"
         );
         assert_eq!(
-            frames[1], "553=minecraft:stone[]",
+            frames[1], "554=minecraft:stone[]",
             "echo of the target cell"
         );
         let sync = queued
@@ -1300,8 +1304,16 @@ mod tests {
         g.tick_once_for_test();
         let queued = drain(&rx);
         let frames = decode_block_frames(&g, &queued);
-        // The pop overrides the placement in the same per-tick dedup.
-        assert_eq!(frames, vec!["655=minecraft:air[]"]);
+        // The interaction echo precedes the world flush; the pop overrides
+        // the placement in the same per-tick dedup.
+        assert_eq!(
+            frames,
+            vec![
+                "665=minecraft:stone[]",
+                "655=minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=none]",
+                "655=minecraft:air[]",
+            ]
+        );
         assert_eq!(at(&g, 6, 101, 5), "minecraft:air[]");
         let sync = queued
             .iter()

@@ -735,7 +735,7 @@ pub fn parity_break() -> Result<bool> {
 /// The two flip phases run as separate sessions on the same world: the
 /// raw interaction burst fires after a session's command volley, so one
 /// session cannot space two flips of the same lever.
-fn parity_play_impl() -> Result<bool> {
+pub fn parity_play_impl() -> Result<bool> {
     let pin = load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
@@ -835,6 +835,39 @@ fn parity_play_impl() -> Result<bool> {
     for (phase, v, d) in [("on", &v_on, &d_on), ("off", &v_off, &d_off)] {
         let vw = writes_of(v);
         let dw = writes_of(d);
+        println!(
+            "[oracle] play {phase}: vanilla wire writes {vw:?} doppel {dw:?}"
+        );
+        let hist_of = |pkts: &[bot::CapturedPacket], at: (i32, i32, i32)| {
+            let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
+            decode_update_writes(&refs)
+                .into_iter()
+                .filter(|(p, _, _)| *p == at)
+                .map(|(p, st, t)| format!("{p:?}:{st}@{t}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        for cell in [(31, 100, 10), (32, 100, 10)] {
+            println!(
+                "[oracle] play {phase} writes at {cell:?}: vanilla [{}] doppel [{}]",
+                hist_of(v, cell),
+                hist_of(d, cell)
+            );
+        }
+        for (who, pk) in [("vanilla", v), ("doppel", d)] {
+            let end = pk.iter().rev().find(|p| p.id < 0);
+            println!(
+                "[oracle] play {phase} {who}: {} frames, end {:?}",
+                pk.len(),
+                end.and_then(|p| p.note.clone())
+            );
+            let writes: Vec<String> = pk
+                .iter()
+                .filter(|p| matches!(p.id, 0x08 | 0x56))
+                .map(|p| format!("0x{:02x}@{}ms:{}", p.id, p.t_ms, &p.head_hex[..p.head_hex.len().min(96)]))
+                .collect();
+            println!("[oracle] play {phase} {who} write packets: [{}]", writes.join(" "));
+        }
         for cell in wire_cells.iter().chain(piston_cells.iter()) {
             let vv = vw.get(cell).copied();
             let dd = dw.get(cell).copied();
@@ -921,6 +954,17 @@ fn run_play_sessions(
     protocol: i32,
 ) -> Result<(Vec<bot::CapturedPacket>, Vec<bot::CapturedPacket>)> {
     let build: Vec<String> = [
+        // Stand near the circuits FIRST and let the chunk tracking settle
+        // under a running clock: the teleport's tracking update rides the
+        // tick loop, and a paused clock leaves the far section
+        // untracked, silently dropping its broadcasts. The filler
+        // commands pace the settle without touching the tick clock
+        // (`tick step` would leave it paused when the flips land).
+        "tp @s 28 102 11",
+        "time set day",
+        "time set night",
+        "time set day",
+        "time set night",
         // Wire circuit support and step.
         "setblock 30 99 10 minecraft:stone",
         "setblock 31 99 10 minecraft:stone",
@@ -933,7 +977,7 @@ fn run_play_sessions(
         "setblock 27 99 12 minecraft:stone",
         "setblock 28 99 12 minecraft:stone",
         "setblock 29 99 12 minecraft:stone",
-        "tick step 2",
+        "time set day",
         // The circuits.
         "setblock 30 100 10 minecraft:lever[face=floor,facing=north,powered=false]",
         "setblock 31 100 10 minecraft:redstone_wire[east=none,north=none,south=none,west=none]",
@@ -944,9 +988,8 @@ fn run_play_sessions(
         "setblock 28 100 12 minecraft:stone",
         "setblock 29 100 12 minecraft:stone",
         "setblock 26 100 12 minecraft:lever[face=floor,facing=north,powered=false]",
-        "tp @s 28 102 11",
-        "tick step 2",
-        "tick unfreeze",
+        "time set day",
+        "time set night",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -969,7 +1012,7 @@ fn run_play_sessions(
             commands: &build,
             walk_chunks: None,
             raw_packets: &on_raw,
-            stop_after_raw: Some(Duration::from_secs(4)),
+            stop_after_raw: Some(Duration::from_millis(2500)),
         },
     )
     .context("play session 1 (flips on)")?;
@@ -979,10 +1022,10 @@ fn run_play_sessions(
 
     let off_commands: Vec<String> = [
         "tp @s 28 102 11".to_string(),
-        "tick step 1".to_string(),
         "gamemode creative".to_string(),
         "gamemode survival".to_string(),
-        "tick unfreeze".to_string(),
+        "time set day".to_string(),
+        "time set night".to_string(),
     ]
     .to_vec();
     let off_raw: Vec<(i32, Vec<u8>)> = vec![
@@ -1003,10 +1046,45 @@ fn run_play_sessions(
             commands: &off_commands,
             walk_chunks: None,
             raw_packets: &off_raw,
-            stop_after_raw: Some(Duration::from_secs(4)),
+            stop_after_raw: Some(Duration::from_millis(2500)),
         },
     )
     .context("play session 2 (flips off)")?;
+
+    // Session 3: read the circuit's server-side state after the flips.
+    let query: Vec<String> = [
+        "tp @s 28 102 11".to_string(),
+        "time set day".to_string(),
+        "time set night".to_string(),
+        "data get block 30 100 10".to_string(),
+        "data get block 31 100 10".to_string(),
+        "data get block 32 100 10".to_string(),
+        "data get block 33 101 10".to_string(),
+        "data get block 34 100 10".to_string(),
+        "data get block 27 100 12".to_string(),
+    ]
+    .to_vec();
+    let login = capture::login_start_c("Doppelist");
+    let probe = bot::login_capture(
+        "127.0.0.1",
+        port,
+        protocol,
+        &login,
+        &bot::CaptureOpts {
+            idle_timeout: Some(Duration::from_secs(6)),
+            max_packets: Some(24000),
+            dump_dir: None,
+            commands: &query,
+            walk_chunks: None,
+            raw_packets: &[],
+            stop_after_raw: None,
+        },
+    )
+    .context("play session 3 (state query)")?;
+    for p in probe.iter().filter(|p| p.id == 0x7c) {
+        let raw = hex::decode(&p.head_hex).unwrap_or_default();
+        println!("[oracle] play query reply: {}", String::from_utf8_lossy(&raw));
+    }
     Ok((on, off))
 }
 

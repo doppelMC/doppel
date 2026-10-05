@@ -414,6 +414,11 @@ fn login_capture_legs_chase(
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
             Err(e) => {
+                // Quiet inside the raw-burst window is not an end: the
+                // budget itself closes the session.
+                if raw_sent_at.is_some_and(|end_at| std::time::Instant::now() < end_at) {
+                    continue;
+                }
                 // A read timeout while idle with locates pending is a
                 // server that went quiet before proving itself alive
                 // again; firing a locate into that risks the reply
@@ -819,10 +824,7 @@ fn login_capture_legs_chase(
                 break;
             }
             let left = end_at.saturating_duration_since(std::time::Instant::now());
-            if left < idle_timeout {
-                conn.get_ref()
-                    .set_read_timeout(Some(left.max(Duration::from_millis(50))))?;
-            }
+            conn.get_ref().set_read_timeout(Some(left))?;
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.

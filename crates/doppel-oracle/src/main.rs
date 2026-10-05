@@ -86,6 +86,11 @@ fn run() -> Result<()> {
         Some("probe-play") => {
             parity_break::probe_play_facts()?;
         }
+        Some("parity-play") => {
+            if !parity_break::parity_play_impl()? {
+                std::process::exit(1);
+            }
+        }
         Some("parity-survival") => {
             if !parity_survival::parity_survival()? {
                 std::process::exit(1);
