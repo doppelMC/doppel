@@ -285,18 +285,22 @@ fn analyze(pkts: &[bot::CapturedPacket]) -> Obs {
             }
             P_MOVE_ENTITY_POS | P_MOVE_ENTITY_POS_ROT => {
                 if let Some(id) = rd_varint(&raw, &mut o) {
-                    if let (Some(dx), Some(dy), Some(dz)) = (
-                        rd_i16(&raw, &mut o),
-                        rd_i16(&raw, &mut o),
-                        rd_i16(&raw, &mut o),
-                    ) {
-                        obs.deltas.push((
-                            i,
-                            id,
-                            dx as f64 / DELTA_SCALE,
-                            dy as f64 / DELTA_SCALE,
-                            dz as f64 / DELTA_SCALE,
-                        ));
+                    // The properties varint (on-ground bit, step count)
+                    // precedes the delta shorts.
+                    if rd_varint(&raw, &mut o).is_some() {
+                        if let (Some(dx), Some(dy), Some(dz)) = (
+                            rd_i16(&raw, &mut o),
+                            rd_i16(&raw, &mut o),
+                            rd_i16(&raw, &mut o),
+                        ) {
+                            obs.deltas.push((
+                                i,
+                                id,
+                                dx as f64 / DELTA_SCALE,
+                                dy as f64 / DELTA_SCALE,
+                                dz as f64 / DELTA_SCALE,
+                            ));
+                        }
                     }
                 }
             }
