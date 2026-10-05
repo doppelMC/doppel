@@ -90,7 +90,7 @@ fn encode_explode(
     body.extend_from_slice(&y.to_be_bytes());
     body.extend_from_slice(&z.to_be_bytes());
     body.extend_from_slice(&radius.to_be_bytes());
-    write_varint(&mut body, count as i32);
+    body.extend_from_slice(&(count as i32).to_be_bytes());
     match knockback {
         Some((kx, ky, kz)) => {
             body.push(1);

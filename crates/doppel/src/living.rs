@@ -262,7 +262,7 @@ pub fn encode_rotate_head(entity_id: i32, head_yaw: u8) -> Vec<u8> {
 /// `entity_event`: id plus the event byte.
 pub fn encode_entity_event(entity_id: i32, event: u8) -> Vec<u8> {
     let mut body = Vec::with_capacity(6);
-    write_varint(&mut body, entity_id);
+    body.extend_from_slice(&entity_id.to_be_bytes());
     body.push(event);
     body
 }
