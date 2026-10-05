@@ -10,6 +10,7 @@ mod parity_worldgen;
 mod parity_worldgen_biome;
 mod registry;
 mod scenario;
+mod strict_decode;
 mod vanilla;
 mod worldgen_pins;
 
@@ -42,7 +43,16 @@ fn usage() -> ! {
   doppel-oracle capture-vanilla-login [out.jsonl] [blobs-dir]
                                       record vanilla's login transcript; with a
                                       blobs dir, dump byte-exact packet bodies
-                                      plus manifest.json for replay"
+                                      plus manifest.json for replay
+  doppel-oracle strict-decode [--capture-dir <dir>]
+                                      boot vanilla for clean blobs, drive a
+                                      full Doppel session (walk, setblocks,
+                                      container open/click, mob summons,
+                                      dig), and decode every clientbound
+                                      frame strictly; any over-read,
+                                      under-read, or unknown id fails.
+                                      With --capture-dir, run the pass over
+                                      an existing capture instead"
     );
     std::process::exit(2);
 }
@@ -135,6 +145,14 @@ fn run() -> Result<()> {
             )?
         }
         Some("registry") => registry::run()?,
+        Some("strict-decode") => {
+            let capture_dir = if args.get(1).map(String::as_str) == Some("--capture-dir") {
+                args.get(2).cloned()
+            } else {
+                None
+            };
+            strict_decode::run(capture_dir.as_deref())?
+        }
         Some("scenario") => {
             let out = args
                 .get(1)
