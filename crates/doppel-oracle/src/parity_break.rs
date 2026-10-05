@@ -513,6 +513,107 @@ fn run_sessions(
     Ok((digger, witness))
 }
 
+/// The cross-type same-tick order vote shared by both streams. Returns
+/// the count of positively compared pairs; pushes a failure per judged
+/// opposite vote and one when nothing was compared.
+fn order_vote_check(
+    v_digger: &[crate::bot::CapturedPacket],
+    d_digger: &[crate::bot::CapturedPacket],
+    v_witness: &[crate::bot::CapturedPacket],
+    d_witness: &[crate::bot::CapturedPacket],
+    failures: &mut Vec<String>,
+) -> usize {
+    // Cross-type same-tick order: a pair the reference orders unanimously
+    // in at least two bursts is a settled invariant; doppel fails only
+    // when its votes MAJORITY-oppose it with at least two bursts of its
+    // own. Single-burst evidence stays unjudged on BOTH sides: the same
+    // lone doppel opposite vote (1+0) fired three times in one day on
+    // unrelated branches (each clearing on rerun), all traceable to a
+    // burst boundary splitting one entity's data packet from another
+    // entity's spawn - a measurement artifact, not an ordering change.
+    // A genuine reorder draws lopsided opposite votes across many
+    // bursts, never a single one. The positive-pair count keeps an
+    // empty capture from passing.
+    let mut compared_pairs = 0usize;
+    let marker_of = |pk: &[crate::bot::CapturedPacket]| pk.iter().rposition(|p| p.id == 0x7c);
+    for (stream, vpk, dpk) in [
+        ("digger", &v_digger, &d_digger),
+        ("witness", &v_witness, &d_witness),
+    ] {
+        let vstart = match marker_of(vpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let dstart = match marker_of(dpk) {
+            Some(m) => m + 1,
+            None => 0,
+        };
+        let vvotes = order_votes(vpk, vstart);
+        let dvotes = order_votes(dpk, dstart);
+        for ((lo, hi), [lo_first, hi_first]) in &vvotes {
+            let van_votes = lo_first + hi_first;
+            let van_unanimous = van_votes >= 2 && (*lo_first == 0) != (*hi_first == 0);
+            if !van_unanimous {
+                continue;
+            }
+            let want_first = if *lo_first > 0 { *lo } else { *hi };
+            let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
+            let d_want = if *lo_first > 0 { dlo } else { dhi };
+            let d_other = if *lo_first > 0 { dhi } else { dlo };
+            if dlo + dhi >= 2 && d_other > d_want {
+                failures.push(format!(
+                "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
+            ));
+                // Name the offending bursts: which packets, what order,
+                // what times - a flush-merge artifact and a real reorder
+                // read differently here (different entity ids across a
+                // seam vs the same id inside one flush).
+                let mut shown = 0;
+                let mut burst: Vec<(char, i32, u128)> = Vec::new();
+                let mut last_ms: Option<u128> = None;
+                for p in dpk.iter().skip(dstart) {
+                    if p.id < 0 {
+                        continue;
+                    }
+                    let Some(l) = order_label(p.id) else {
+                        continue;
+                    };
+                    if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
+                        let firsts: std::collections::BTreeMap<char, u128> =
+                            burst.iter().map(|(l, _, t)| (*l, *t)).collect();
+                        if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
+                            if at < bt {
+                                println!(
+                                    "  {stream} opposite burst: {}",
+                                    burst
+                                        .iter()
+                                        .map(|(l, id, t)| format!("{l}=0x{id:02x}@{t}ms"))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                );
+                                shown += 1;
+                            }
+                        }
+                        if shown >= 3 {
+                            break;
+                        }
+                        burst.clear();
+                    }
+                    burst.push((l, p.id, p.t_ms));
+                    last_ms = Some(p.t_ms);
+                }
+            }
+            if d_want > 0 {
+                compared_pairs += 1;
+            }
+        }
+    }
+    if compared_pairs == 0 {
+        failures.push("no cross-type same-tick order pairs compared".into());
+    }
+    compared_pairs
+}
+
 /// The differential breaking test.
 pub fn parity_break() -> Result<bool> {
     let pin = load_pin()?;
@@ -769,93 +870,8 @@ pub fn parity_break() -> Result<bool> {
         ));
     }
 
-    // Cross-type same-tick order: a pair the reference orders unanimously
-    // in at least two bursts is a settled invariant; doppel fails only
-    // when its votes MAJORITY-oppose it with at least two bursts of its
-    // own. Single-burst evidence stays unjudged on BOTH sides: the same
-    // lone doppel opposite vote (1+0) fired three times in one day on
-    // unrelated branches (each clearing on rerun), all traceable to a
-    // burst boundary splitting one entity's data packet from another
-    // entity's spawn - a measurement artifact, not an ordering change.
-    // A genuine reorder draws lopsided opposite votes across many
-    // bursts, never a single one. The positive-pair count keeps an
-    // empty capture from passing.
-    let mut compared_pairs = 0usize;
-    for (stream, vpk, dpk) in [
-        ("digger", &v_digger, &d_digger),
-        ("witness", &v_witness, &d_witness),
-    ] {
-        let vstart = match marker_of(vpk) {
-            Some(m) => m + 1,
-            None => 0,
-        };
-        let dstart = match marker_of(dpk) {
-            Some(m) => m + 1,
-            None => 0,
-        };
-        let vvotes = order_votes(vpk, vstart);
-        let dvotes = order_votes(dpk, dstart);
-        for ((lo, hi), [lo_first, hi_first]) in &vvotes {
-            let van_votes = lo_first + hi_first;
-            let van_unanimous = van_votes >= 2 && (*lo_first == 0) != (*hi_first == 0);
-            if !van_unanimous {
-                continue;
-            }
-            let want_first = if *lo_first > 0 { *lo } else { *hi };
-            let [dlo, dhi] = dvotes.get(&(*lo, *hi)).copied().unwrap_or([0, 0]);
-            let d_want = if *lo_first > 0 { dlo } else { dhi };
-            let d_other = if *lo_first > 0 { dhi } else { dlo };
-            if dlo + dhi >= 2 && d_other > d_want {
-                failures.push(format!(
-                    "{stream}: same-tick order {want_first} first voted opposite                      ({lo}?{hi}: vanilla {lo_first}+{hi_first}, doppel {dlo}+{dhi})"
-                ));
-                // Name the offending bursts: which packets, what order,
-                // what times - a flush-merge artifact and a real reorder
-                // read differently here (different entity ids across a
-                // seam vs the same id inside one flush).
-                let mut shown = 0;
-                let mut burst: Vec<(char, i32, u128)> = Vec::new();
-                let mut last_ms: Option<u128> = None;
-                for p in dpk.iter().skip(dstart) {
-                    if p.id < 0 {
-                        continue;
-                    }
-                    let Some(l) = order_label(p.id) else {
-                        continue;
-                    };
-                    if last_ms.is_some_and(|t| p.t_ms.saturating_sub(t) > 15) {
-                        let firsts: std::collections::BTreeMap<char, u128> =
-                            burst.iter().map(|(l, _, t)| (*l, *t)).collect();
-                        if let (Some(at), Some(bt)) = (firsts.get(lo), firsts.get(hi)) {
-                            if at < bt {
-                                println!(
-                                    "  {stream} opposite burst: {}",
-                                    burst
-                                        .iter()
-                                        .map(|(l, id, t)| format!("{l}=0x{id:02x}@{t}ms"))
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                );
-                                shown += 1;
-                            }
-                        }
-                        if shown >= 3 {
-                            break;
-                        }
-                        burst.clear();
-                    }
-                    burst.push((l, p.id, p.t_ms));
-                    last_ms = Some(p.t_ms);
-                }
-            }
-            if d_want > 0 {
-                compared_pairs += 1;
-            }
-        }
-    }
-    if compared_pairs == 0 {
-        failures.push("no cross-type same-tick order pairs compared".into());
-    }
+    let compared_pairs =
+        order_vote_check(&v_digger, &d_digger, &v_witness, &d_witness, &mut failures);
     println!("[oracle] cross-type same-tick order: {compared_pairs} positively compared pair(s)");
 
     if failures.is_empty() {
