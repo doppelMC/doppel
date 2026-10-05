@@ -261,6 +261,7 @@ impl Game {
             self.persistence.dirty.chunks.remove(&at);
         }
         let mut written = 0usize;
+        let mut newly_saved: Vec<(i32, i32)> = Vec::new();
         for ((rx, rz), group) in by_region {
             if written > 0 && deadline.is_some_and(|d| Instant::now() > d) {
                 break;
@@ -271,12 +272,25 @@ impl Game {
                 .collect();
             match RegionWriter::open(&root, rx, rz).write(&group) {
                 Ok(()) => {
-                    for at in updated {
-                        self.persistence.dirty.chunks.remove(&at);
+                    for at in &updated {
+                        self.persistence.dirty.chunks.remove(at);
                     }
                     written += group.len();
+                    newly_saved.extend(updated);
                 }
                 Err(e) => eprintln!("[persistence] region ({rx},{rz}) write failed: {e:#}"),
+            }
+        }
+        if !newly_saved.is_empty() {
+            if let Some(world) = &self.world {
+                let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+                let before = w.saved.len();
+                w.saved.extend(newly_saved);
+                if w.saved.len() != before {
+                    if let Err(e) = crate::write_saved_set(&w.root, &w.saved) {
+                        eprintln!("[persistence] saved-set write failed: {e:#}");
+                    }
+                }
             }
         }
         written
@@ -407,6 +421,7 @@ mod tests {
         let world = WorldState {
             dir: WorldDir::open(root).expect("region dir"),
             boot,
+            saved: crate::load_saved_set(root),
             root: root.to_path_buf(),
             level: Default::default(),
             level_readonly: false,
@@ -479,6 +494,7 @@ mod tests {
         let world = WorldState {
             dir: WorldDir::open(root).expect("region dir"),
             boot: seeded_boot(&registry),
+            saved: crate::load_saved_set(root),
             root: root.to_path_buf(),
             level: Default::default(),
             level_readonly: false,
@@ -585,20 +601,21 @@ mod tests {
             Some(("minecraft:stone".into(), "".into())),
             "generated-chunk edit survives"
         );
-        for &(cx, cz) in &[(1i32, 0i32), (33, 0), (65, 1)] {
+        for &(cx, cz) in &[(1i32, 0i32), (33, 0), (65, 1), (-33, 5)] {
             assert!(g2.ensure_chunk_loaded(cx, cz), "chunk ({cx},{cz}) reloads");
+            assert_eq!(
+                g2.get_block(cx * 16 + 2, -60, cz * 16 + 2),
+                Some(("minecraft:stone".into(), "".into())),
+                "edit in ({cx},{cz}) survives"
+            );
         }
-        // Capture precedence masks edits inside the blob area (the
-        // reference wins over storage on reload); only edits outside it
-        // read back.
-        assert!(
-            g2.ensure_chunk_loaded(-33, 5),
-            "negative-region chunk reloads"
-        );
+        // Complete storage is authoritative over the capture: edits inside
+        // the blob area survive reload too.
+        assert!(g2.ensure_chunk_loaded(0, 0), "captured chunk reloads");
         assert_eq!(
-            g2.get_block(-33 * 16 + 2, -60, 5 * 16 + 2),
+            g2.get_block(3, -60, 5),
             Some(("minecraft:stone".into(), "".into())),
-            "negative-region edit survives"
+            "captured-chunk edit survives"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

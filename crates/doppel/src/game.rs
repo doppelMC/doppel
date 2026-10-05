@@ -2484,11 +2484,11 @@ impl Game {
                 })
             });
             let wire = match reference {
-                Some(reference) => {
+                Some(reference) if !w.saved.contains(&(cx, cz)) => {
                     w.boot.learn(&reference, &anvil);
                     doppel_world::anvil_to_wire::convert(&anvil, &reference, &w.boot)?
                 }
-                None => doppel_world::anvil_to_wire::convert_uncaptured(&anvil, &w.boot)?,
+                _ => doppel_world::anvil_to_wire::convert_uncaptured(&anvil, &w.boot)?,
             };
             drop(w);
             slot.insert(CachedChunk { wire, version: 0 });

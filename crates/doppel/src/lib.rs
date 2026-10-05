@@ -50,13 +50,49 @@ pub struct WorldState {
     /// True when level.dat exists but does not parse; saves leave the
     /// file alone instead of overwriting it with defaults.
     pub level_readonly: bool,
+    /// Chunks this server has written to disk; storage is authoritative
+    /// for these on reload, the wire capture stays authoritative for
+    /// the rest.
+    pub saved: std::collections::BTreeSet<(i32, i32)>,
 }
 
 type SharedWorld = Arc<std::sync::Mutex<WorldState>>;
 
+/// The saved-chunk list beside a world root.
+fn saved_set_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("doppel-saved.txt")
+}
+
+/// Reads the saved-chunk list; a missing file is an empty set.
+pub fn load_saved_set(root: &std::path::Path) -> std::collections::BTreeSet<(i32, i32)> {
+    let Ok(text) = std::fs::read_to_string(saved_set_path(root)) else {
+        return Default::default();
+    };
+    text.lines()
+        .filter_map(|line| line.split_once(','))
+        .filter_map(|(x, z)| Some((x.trim().parse().ok()?, z.trim().parse().ok()?)))
+        .collect()
+}
+
+/// Writes the saved-chunk list atomically.
+pub fn write_saved_set(
+    root: &std::path::Path,
+    saved: &std::collections::BTreeSet<(i32, i32)>,
+) -> Result<()> {
+    let mut text = String::new();
+    for (x, z) in saved {
+        text.push_str(&format!("{x},{z}\n"));
+    }
+    let tmp = saved_set_path(root).with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, saved_set_path(root))?;
+    Ok(())
+}
+
 /// Rebuilds a chunk from Anvil storage when the world has it; the wire
 /// capture bootstraps palette maps and supplies light. Falls back to the
-/// capture itself for chunks missing on disk.
+/// capture itself for chunks missing on disk. Saved chunks convert from
+/// storage alone: their capture snapshot is stale.
 fn build_chunk(world: Option<&SharedWorld>, reference: &WireChunk) -> Result<WireChunk> {
     let Some(world) = world else {
         return Ok(reference.clone());
@@ -64,6 +100,9 @@ fn build_chunk(world: Option<&SharedWorld>, reference: &WireChunk) -> Result<Wir
     let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
     match w.dir.chunk(reference.x, reference.z)? {
         Some(anvil) => {
+            if w.saved.contains(&(reference.x, reference.z)) {
+                return doppel_world::anvil_to_wire::convert_uncaptured(&anvil, &w.boot);
+            }
             w.boot.learn(reference, &anvil);
             doppel_world::anvil_to_wire::convert(&anvil, reference, &w.boot)
         }
@@ -879,6 +918,7 @@ pub fn serve(addr: &str, pin_path: Option<&std::path::Path>) -> Result<()> {
             let state = WorldState {
                 dir: doppel_world::WorldDir::open(&root)?,
                 boot: Default::default(),
+                saved: load_saved_set(&root),
                 root,
                 level,
                 level_readonly,

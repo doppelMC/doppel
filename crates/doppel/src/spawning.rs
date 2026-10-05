@@ -703,6 +703,7 @@ mod tests {
         let mut world = crate::WorldState {
             dir: doppel_world::WorldDir::open(&pristine).expect("world dir"),
             boot: Default::default(),
+            saved: Default::default(),
             root: pristine.clone(),
             level: Default::default(),
             level_readonly: false,
