@@ -1520,7 +1520,7 @@ fn decode_config(id: i32, c: &mut Cursor) -> DResult<()> {
 /// Play-frame dispatch by packet family.
 fn decode_play(id: i32, c: &mut Cursor) -> DResult<()> {
     match id {
-        0x05 | 0x06 | 0x07 | 0x08 | 0x26 | 0x27 | 0x56 | 0x2e => decode_world_frame(id, c),
+        0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x26 | 0x27 | 0x56 | 0x2e => decode_world_frame(id, c),
         0x01 | 0x19 | 0x22 | 0x23 | 0x2b | 0x36 | 0x37 | 0x39 | 0x4e | 0x55 | 0x65 | 0x67
         | 0x68 | 0x7f | 0x86 => decode_entity_frame(id, c),
         0x11 | 0x12 | 0x13 | 0x14 | 0x3c | 0x62 | 0x6b | 0x6e => decode_inventory_frame(id, c),
@@ -1530,6 +1530,10 @@ fn decode_play(id: i32, c: &mut Cursor) -> DResult<()> {
 
 fn decode_world_frame(id: i32, c: &mut Cursor) -> DResult<()> {
     match id {
+        0x04 => {
+            c.varint("sequence")?;
+            Ok(())
+        }
         0x05 => {
             c.varint("breaker entity id")?;
             c.block_pos()?;
