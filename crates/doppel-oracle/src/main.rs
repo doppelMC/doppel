@@ -146,10 +146,16 @@ fn run() -> Result<()> {
         }
         Some("registry") => registry::run()?,
         Some("strict-decode") => {
-            let capture_dir = if args.get(1).map(String::as_str) == Some("--capture-dir") {
-                args.get(2).cloned()
-            } else {
-                None
+            let capture_dir = match args.get(1).map(String::as_str) {
+                Some("--capture-dir") => match args.get(2) {
+                    Some(dir) => Some(dir.clone()),
+                    None => usage(),
+                },
+                Some(other) => {
+                    eprintln!("[oracle] unknown strict-decode argument: {other}");
+                    usage()
+                }
+                None => None,
             };
             strict_decode::run(capture_dir.as_deref())?
         }

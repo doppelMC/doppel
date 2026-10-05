@@ -188,7 +188,7 @@ fn unknown_id_and_gap_fail() {
 }
 
 #[test]
-fn corruption_variants_all_fail_on_synthetic_frames() {
+fn truncation_and_padding_fail_on_synthetic_frames() {
     let mut b = Vec::new();
     b.extend_from_slice(&bot::pack_block_pos(1, 2, 3).to_be_bytes());
     write_varint(&mut b, 9);
