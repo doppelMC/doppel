@@ -278,11 +278,14 @@ pub fn encode_hurt_animation(entity_id: i32, yaw: f32) -> Vec<u8> {
 /// `damage_event`: the hurt entity, the damage-type id, the causing
 /// entity, the direct cause.
 pub fn encode_damage_event(entity_id: i32, damage_type: i32, cause: i32, direct: i32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(10);
+    let mut body = Vec::with_capacity(11);
     write_varint(&mut body, entity_id);
     write_varint(&mut body, damage_type);
-    write_varint(&mut body, cause);
-    write_varint(&mut body, direct);
+    // Optional entity ids travel as id + 1, so -1 (absent) encodes 0.
+    write_varint(&mut body, cause + 1);
+    write_varint(&mut body, direct + 1);
+    // No source position.
+    body.push(0);
     body
 }
 
