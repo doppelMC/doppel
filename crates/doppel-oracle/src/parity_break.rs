@@ -664,6 +664,60 @@ pub fn probe_play_facts() -> Result<bool> {
     }
     Ok(true)
 }
+/// Connects, drives the handshake and login into the configuration
+/// state, and answers every choreography packet up to the PLAY state.
+fn handshake_into_play(
+    port: u16,
+    protocol: i32,
+    login_body: &[u8],
+) -> Result<doppel_protocol::Conn<std::net::TcpStream>> {
+    use doppel_protocol::write_string;
+    use doppel_protocol::Conn;
+    const WINDOW: Duration = Duration::from_secs(5);
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connecting to play session on {port}"))?;
+    stream.set_read_timeout(Some(WINDOW))?;
+    stream.set_write_timeout(Some(WINDOW))?;
+    stream.set_nodelay(true).ok();
+    let mut conn = Conn::new(stream);
+    let mut hs = Vec::new();
+    doppel_protocol::write_varint(&mut hs, protocol);
+    write_string(&mut hs, "127.0.0.1");
+    hs.extend_from_slice(&port.to_be_bytes());
+    doppel_protocol::write_varint(&mut hs, 2);
+    conn.write_packet(0x00, &hs)?;
+    conn.write_packet(0x00, login_body)?;
+    let mut compression_on = false;
+    let mut config_started = false;
+    let mut packs_answered = false;
+    loop {
+        let (id, body) = conn.read_packet()?;
+        if !compression_on && id == 0x03 {
+            let threshold = doppel_protocol::Reader::new(&body)
+                .read_varint()
+                .context("set compression threshold")?;
+            conn.set_compression(threshold);
+            compression_on = true;
+            continue;
+        }
+        if !config_started && id == 0x02 {
+            conn.write_packet(0x03, &[])?; // login_acknowledged
+            conn.write_packet(0x00, &bot::client_information_body())?;
+            config_started = true;
+            continue;
+        }
+        if !packs_answered && config_started && id == 0x0f {
+            conn.write_packet(0x07, &[0x00])?;
+            packs_answered = true;
+            continue;
+        }
+        if packs_answered && id == 0x03 && body.is_empty() {
+            conn.write_packet(0x03, &[])?;
+            return Ok(conn);
+        }
+    }
+}
+
 fn play_capture(
     port: u16,
     protocol: i32,
@@ -672,17 +726,16 @@ fn play_capture(
     raw_packets: &[(i32, Vec<u8>)],
     wait_chunk: Option<(i32, i32)>,
 ) -> Result<Vec<bot::CapturedPacket>> {
-    use doppel_protocol::{write_string, Conn, Reader};
+    use doppel_protocol::{write_string, Reader};
     const REPLY_WINDOW: Duration = Duration::from_secs(5);
     const AFTER_RAW: Duration = Duration::from_millis(2500);
-    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
-        .with_context(|| format!("connecting to play session on {port}"))?;
-    stream.set_read_timeout(Some(REPLY_WINDOW))?;
-    stream.set_write_timeout(Some(REPLY_WINDOW))?;
-    stream.set_nodelay(true).ok();
-    let mut conn = Conn::new(stream);
+    let mut conn = handshake_into_play(port, protocol, login_body)?;
     let mut packets: Vec<bot::CapturedPacket> = Vec::new();
     let started = std::time::Instant::now();
+    let mut raw_sent_at: Option<std::time::Instant> = None;
+    let mut next_cmd = 0usize;
+    let mut chunk_seen = wait_chunk.is_none();
+    let mut batch_feedback_due = false;
     let note = |packets: &mut Vec<bot::CapturedPacket>, text: String, t: u128| {
         packets.push(bot::CapturedPacket {
             id: -1,
@@ -694,22 +747,6 @@ fn play_capture(
         });
     };
 
-    // Handshake + hello, then the confirmed choreography into PLAY.
-    let mut hs = Vec::new();
-    doppel_protocol::write_varint(&mut hs, protocol);
-    write_string(&mut hs, "127.0.0.1");
-    hs.extend_from_slice(&port.to_be_bytes());
-    doppel_protocol::write_varint(&mut hs, 2);
-    conn.write_packet(0x00, &hs)?;
-    conn.write_packet(0x00, login_body)?;
-    let mut compression_on = false;
-    let mut config_started = false;
-    let mut packs_answered = false;
-    let mut play_started = false;
-    let mut raw_sent_at: Option<std::time::Instant> = None;
-    let mut next_cmd = 0usize;
-    let mut chunk_seen = wait_chunk.is_none();
-    let mut batch_feedback_due = false;
     while raw_sent_at.is_none_or(|at| std::time::Instant::now() < at + AFTER_RAW) {
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
@@ -731,39 +768,12 @@ fn play_capture(
             file: None,
             note: None,
         });
-        // Set Compression arrives raw and switches the framing for
-        // everything after it.
-        if !compression_on && id == 0x03 {
-            let threshold = Reader::new(&body)
-                .read_varint()
-                .context("set compression threshold")?;
-            conn.set_compression(threshold);
-            compression_on = true;
-            continue;
-        }
-        if !config_started && id == 0x02 {
-            conn.write_packet(0x03, &[])?; // login_acknowledged
-            conn.write_packet(0x00, &bot::client_information_body())?;
-            config_started = true;
-            continue;
-        }
-        if !packs_answered && config_started && id == 0x0f {
-            conn.write_packet(0x07, &[0x00])?;
-            packs_answered = true;
-            continue;
-        }
-        if packs_answered && !play_started && id == 0x03 && body.is_empty() {
-            conn.write_packet(0x03, &[])?;
-            play_started = true;
-            continue;
-        }
-        if !play_started {
-            continue;
-        }
         if let (Some(want), false) = (wait_chunk, chunk_seen) {
             if id == 0x2e && body.len() >= 8 {
-                let cx = i32::from_be_bytes(body[0..4].try_into().unwrap());
-                let cz = i32::from_be_bytes(body[4..8].try_into().unwrap());
+                let xb: [u8; 4] = body[0..4].try_into().context("chunk x bytes")?;
+                let zb: [u8; 4] = body[4..8].try_into().context("chunk z bytes")?;
+                let cx = i32::from_be_bytes(xb);
+                let cz = i32::from_be_bytes(zb);
                 if (cx, cz) == want {
                     // The server only sends a chunk to a player tracking
                     // it, so its arrival proves the tracking the section
