@@ -1410,7 +1410,8 @@ impl Game {
             return;
         };
         let conn = wire::Connections::from_props(&props);
-        let mut targets: Vec<((i32, i32, i32), (i32, i32, i32))> = Vec::new();
+        type Target = ((i32, i32, i32), (i32, i32, i32));
+        let mut targets: Vec<Target> = Vec::new();
         for d in wire::Dir::HORIZONTAL {
             if !conn.connected(d) {
                 continue;

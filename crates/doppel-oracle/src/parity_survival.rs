@@ -27,6 +27,22 @@ use crate::{bot, capture, vanilla};
 const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
+/// The gate ports: fixed defaults, overridable for local runs beside a
+/// server that already holds one (the constants are the CI values).
+fn vanilla_port() -> u16 {
+    std::env::var("ORACLE_VANILLA_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(VANILLA_PORT)
+}
+
+fn doppel_port() -> u16 {
+    std::env::var("ORACLE_DOPPEL_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DOPPEL_PORT)
+}
+
 // The flat world's surface: grass at y=-61, plants at y=-60 (the spawn
 // teleport pins the standing height at -60.0).
 const GRASS_Y: i32 = -61;
@@ -1261,8 +1277,8 @@ pub fn parity_survival() -> Result<bool> {
     // covers a slow host: the walker's away leg needs the reference's
     // view work to run to completion, and its passes scale with wall
     // time, not the session's own pacing.
-    let server = vanilla::boot_peaceful(&pin, &jar, VANILLA_PORT)?;
-    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
+    let server = vanilla::boot_peaceful(&pin, &jar, vanilla_port())?;
+    let vworker = std::thread::spawn(move || run_sessions(vanilla_port(), protocol));
     let vdeadline = std::time::Instant::now() + Duration::from_secs(150);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -1276,7 +1292,7 @@ pub fn parity_survival() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PORT", doppel_port().to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -1284,9 +1300,9 @@ pub fn parity_survival() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    wait_for_port(doppel_port(), Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
-    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
+    let worker = std::thread::spawn(move || run_sessions(doppel_port(), protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(150);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));

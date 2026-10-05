@@ -154,9 +154,11 @@ fn send_commanded(
     conn.write_packet(0x07, &body)?;
     *next_cmd += 1;
     // While awaiting the response, a short read timeout keeps a missing
-    // reply from ending the session at the idle threshold.
+    // reply from ending the session at the idle threshold. A teleport
+    // that crosses into unloaded chunks can spend seconds loading and
+    // streaming before its reply lands, so the window sits above that.
     conn.get_ref()
-        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))?;
+        .set_read_timeout(Some(std::time::Duration::from_millis(5000)))?;
     Ok(())
 }
 
