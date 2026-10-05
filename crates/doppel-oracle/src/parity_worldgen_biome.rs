@@ -95,7 +95,6 @@ pub fn run() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
         BIOMES,
     )

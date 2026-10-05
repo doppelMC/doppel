@@ -15,22 +15,6 @@ use crate::{bot, vanilla};
 const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
-/// The gate ports: fixed defaults, overridable for local runs beside a
-/// server that already holds one (the constants are the CI values).
-fn vanilla_port() -> u16 {
-    std::env::var("ORACLE_VANILLA_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(VANILLA_PORT)
-}
-
-fn doppel_port() -> u16 {
-    std::env::var("ORACLE_DOPPEL_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DOPPEL_PORT)
-}
-
 /// Fields that are legitimately volatile between runs (the default icon is
 /// regenerated with a random-ish base64 body by some builds).
 fn normalize(v: &mut Value) {
@@ -147,10 +131,10 @@ pub fn parity_status(doppel_bin: Option<PathBuf>) -> Result<bool> {
     let jar = vanilla::ensure_jar(&pin)?;
 
     // 1. Boot the oracle.
-    let vanilla_server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let vanilla_server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v_status = bot::status_ping_retry(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         pin.protocol.unwrap_or(0),
         5,
         Duration::from_secs(2),
@@ -181,18 +165,18 @@ pub fn parity_status(doppel_bin: Option<PathBuf>) -> Result<bool> {
     eprintln!("[oracle] starting doppel ({})...", bin.display());
     let mut doppel_child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
 
     // 4. Observe Doppel exactly as a real client would.
     let hint = pin.protocol.unwrap_or(0);
     let d_status =
-        bot::status_ping_retry("127.0.0.1", doppel_port(), hint, 5, Duration::from_secs(2))
+        bot::status_ping_retry("127.0.0.1", DOPPEL_PORT, hint, 5, Duration::from_secs(2))
             .context("pinging doppel")?;
 
     let _ = doppel_child.kill();
@@ -258,12 +242,12 @@ pub fn parity_login() -> Result<bool> {
     }
 
     // 1. Capture the oracle transcript + blobs.
-    let server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let login_body = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login_body,
         &bot::CaptureOpts {
@@ -273,7 +257,6 @@ pub fn parity_login() -> Result<bool> {
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing vanilla transcript")?;
@@ -344,7 +327,7 @@ pub fn parity_login() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut doppel_child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &world_dir)
@@ -352,12 +335,12 @@ pub fn parity_login() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
 
     // 3. Drive the same dance against Doppel.
     let d = bot::login_capture(
         "127.0.0.1",
-        doppel_port(),
+        DOPPEL_PORT,
         protocol,
         &login_body,
         &bot::CaptureOpts {
@@ -473,12 +456,12 @@ pub fn parity_walk() -> Result<bool> {
 
     // 1. Vanilla walk, dumped straight into the blobs dir so the walk
     // chunks join the reference set Doppel's streaming replays.
-    let server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let login = capture::login_start_c("Doppel");
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -488,7 +471,6 @@ pub fn parity_walk() -> Result<bool> {
             commands: &[],
             walk_chunks: Some(4),
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("walking through vanilla")?;
@@ -503,7 +485,7 @@ pub fn parity_walk() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &world_dir)
@@ -511,10 +493,10 @@ pub fn parity_walk() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     let d = bot::login_capture(
         "127.0.0.1",
-        doppel_port(),
+        DOPPEL_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -524,7 +506,6 @@ pub fn parity_walk() -> Result<bool> {
             commands: &[],
             walk_chunks: Some(4),
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("walking through doppel")?;
@@ -632,7 +613,7 @@ fn capture_clean_blobs(
 ) -> Result<()> {
     use crate::capture;
 
-    let server = vanilla::boot(pin, jar, vanilla_port())?;
+    let server = vanilla::boot(pin, jar, VANILLA_PORT)?;
     // Snapshot the untouched world right after boot: the boot-time
     // spawn-area save settles well within a second, and this phase runs
     // no commands, so the world stays pristine regardless of how the JVM
@@ -650,7 +631,7 @@ fn capture_clean_blobs(
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -660,7 +641,6 @@ fn capture_clean_blobs(
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing clean vanilla join")?;
@@ -775,10 +755,10 @@ pub fn parity_blocks() -> Result<bool> {
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
     // 2. Vanilla reference: same commands, fresh boot (fresh world).
-    let server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -788,7 +768,6 @@ pub fn parity_blocks() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing vanilla setblocks")?;
@@ -799,7 +778,7 @@ pub fn parity_blocks() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -807,10 +786,10 @@ pub fn parity_blocks() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     let d = bot::login_capture(
         "127.0.0.1",
-        doppel_port(),
+        DOPPEL_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -820,7 +799,6 @@ pub fn parity_blocks() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing doppel setblocks")?;
@@ -1029,10 +1007,10 @@ pub fn parity_redstone() -> Result<bool> {
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
     // 2. Vanilla reference: the scripted run on a fresh boot.
-    let server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -1042,7 +1020,6 @@ pub fn parity_redstone() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing vanilla redstone")?;
@@ -1054,7 +1031,7 @@ pub fn parity_redstone() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -1062,10 +1039,10 @@ pub fn parity_redstone() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     let d = bot::login_capture(
         "127.0.0.1",
-        doppel_port(),
+        DOPPEL_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -1075,7 +1052,6 @@ pub fn parity_redstone() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing doppel redstone")?;
@@ -1216,10 +1192,10 @@ pub fn parity_placement() -> Result<bool> {
 
     capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
 
-    let server = vanilla::boot(&pin, &jar, vanilla_port())?;
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -1229,7 +1205,6 @@ pub fn parity_placement() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &raw,
-            stop_after_raw: None,
         },
     )
     .context("capturing vanilla placement")?;
@@ -1239,7 +1214,7 @@ pub fn parity_placement() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", doppel_port().to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -1247,10 +1222,10 @@ pub fn parity_placement() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(doppel_port(), Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     let d = bot::login_capture(
         "127.0.0.1",
-        doppel_port(),
+        DOPPEL_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -1260,7 +1235,6 @@ pub fn parity_placement() -> Result<bool> {
             commands: &commands,
             walk_chunks: None,
             raw_packets: &raw,
-            stop_after_raw: None,
         },
     )
     .context("capturing doppel placement")?;

@@ -79,7 +79,12 @@ fn run() -> Result<()> {
             }
         }
         Some("parity-break") => {
-            if !parity_break::parity_break()? {
+            // The break scenarios and the play scenarios share one gate:
+            // the play legs reuse the blobs and pristine world the break
+            // phase just captured.
+            let ok_break = parity_break::parity_break()?;
+            let ok_play = parity_break::parity_play()?;
+            if !(ok_break && ok_play) {
                 std::process::exit(1);
             }
         }
@@ -87,7 +92,7 @@ fn run() -> Result<()> {
             parity_break::probe_play_facts()?;
         }
         Some("parity-play") => {
-            if !parity_break::parity_play_impl()? {
+            if !parity_break::parity_play()? {
                 std::process::exit(1);
             }
         }

@@ -154,11 +154,9 @@ fn send_commanded(
     conn.write_packet(0x07, &body)?;
     *next_cmd += 1;
     // While awaiting the response, a short read timeout keeps a missing
-    // reply from ending the session at the idle threshold. A teleport
-    // that crosses into unloaded chunks can spend seconds loading and
-    // streaming before its reply lands, so the window sits above that.
+    // reply from ending the session at the idle threshold.
     conn.get_ref()
-        .set_read_timeout(Some(std::time::Duration::from_millis(5000)))?;
+        .set_read_timeout(Some(std::time::Duration::from_millis(1500)))?;
     Ok(())
 }
 
@@ -212,9 +210,6 @@ pub struct CaptureOpts<'a> {
     /// After the join burst, walk this many chunks in +x (one
     /// move_player_pos per 400ms) to exercise chunk streaming.
     pub walk_chunks: Option<usize>,
-    /// End the session this long after the raw interaction burst (steady
-    /// entity traffic keeps a live server from ever going idle-quiet).
-    pub stop_after_raw: Option<Duration>,
 }
 
 impl CaptureOpts<'_> {
@@ -384,7 +379,6 @@ fn login_capture_legs_chase(
     let mut next_cmd = 0usize;
     let raw_packets = opts.raw_packets;
     let mut raw_sent = false;
-    let mut raw_sent_at: Option<std::time::Instant> = None;
     let walk = opts.walk_chunks;
     let mut steps_done = 0usize;
     let mut last_walk_at = std::time::Instant::now();
@@ -416,11 +410,6 @@ fn login_capture_legs_chase(
         let (id, body) = match conn.read_packet() {
             Ok(p) => p,
             Err(e) => {
-                // Quiet inside the raw-burst window is not an end: the
-                // budget itself closes the session.
-                if raw_sent_at.is_some_and(|end_at| std::time::Instant::now() < end_at) {
-                    continue;
-                }
                 // A read timeout while idle with locates pending is a
                 // server that went quiet before proving itself alive
                 // again; firing a locate into that risks the reply
@@ -629,9 +618,6 @@ fn login_capture_legs_chase(
                     for (id, body) in raw_packets {
                         conn.write_packet(*id, body)?;
                     }
-                    if let Some(budget) = opts.stop_after_raw {
-                        raw_sent_at = Some(std::time::Instant::now() + budget);
-                    }
                     note = Some("sent raw interaction packets".to_string());
                 }
             }
@@ -809,24 +795,6 @@ fn login_capture_legs_chase(
                 last_walk_at = std::time::Instant::now();
                 note = Some(format!("tp-walk step {steps_done}: x={x:.1}"));
             }
-        }
-        // A raw-burst budget ends the session once the interactions have
-        // had their settle window: steady entity traffic would otherwise
-        // outlive every idle threshold.
-        if let Some(end_at) = raw_sent_at {
-            if std::time::Instant::now() >= end_at {
-                packets.push(CapturedPacket {
-                    id: -1,
-                    t_ms: started.elapsed().as_millis(),
-                    body_len: 0,
-                    head_hex: String::new(),
-                    file: None,
-                    note: Some("transcript ended: raw interaction budget spent".into()),
-                });
-                break;
-            }
-            let left = end_at.saturating_duration_since(std::time::Instant::now());
-            conn.get_ref().set_read_timeout(Some(left))?;
         }
         // Keep plenty of headroom: decoder-error messages arrive inside
         // disconnect packets.

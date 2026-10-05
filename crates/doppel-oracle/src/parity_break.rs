@@ -24,22 +24,6 @@ use crate::{bot, capture, vanilla};
 const VANILLA_PORT: u16 = 25566;
 const DOPPEL_PORT: u16 = 25565;
 
-/// The gate ports: fixed defaults, overridable for local runs beside a
-/// server that already holds one (the constants are the CI values).
-fn vanilla_port() -> u16 {
-    std::env::var("ORACLE_VANILLA_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(VANILLA_PORT)
-}
-
-fn doppel_port() -> u16 {
-    std::env::var("ORACLE_DOPPEL_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DOPPEL_PORT)
-}
-
 /// The setblock'd stone floor block the held dig targets.
 const ANCHOR: (i32, i32, i32) = (1, -60, 1);
 /// The block right-clicked onto the anchor; only placed, never dug.
@@ -123,7 +107,7 @@ pub(crate) fn capture_clean_blobs(
     blobs_dir: &std::path::Path,
     pristine_world: &std::path::Path,
 ) -> Result<()> {
-    let server = vanilla::boot(pin, jar, vanilla_port())?;
+    let server = vanilla::boot(pin, jar, VANILLA_PORT)?;
     std::thread::sleep(Duration::from_secs(2));
     if pristine_world.exists() {
         std::fs::remove_dir_all(pristine_world)?;
@@ -150,7 +134,7 @@ pub(crate) fn capture_clean_blobs(
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
         "127.0.0.1",
-        vanilla_port(),
+        VANILLA_PORT,
         protocol,
         &login,
         &bot::CaptureOpts {
@@ -160,7 +144,6 @@ pub(crate) fn capture_clean_blobs(
             commands: &[],
             walk_chunks: None,
             raw_packets: &[],
-            stop_after_raw: None,
         },
     )
     .context("capturing clean vanilla join")?;
@@ -501,7 +484,6 @@ fn run_sessions(
                 commands: &[],
                 walk_chunks: None,
                 raw_packets: &[],
-                stop_after_raw: None,
             },
         )
     });
@@ -521,7 +503,6 @@ fn run_sessions(
             commands: &commands,
             walk_chunks: None,
             raw_packets: &raw,
-            stop_after_raw: None,
         },
     )
     .context("capturing digger session")?;
@@ -582,30 +563,8 @@ pub fn probe_play_facts() -> Result<bool> {
     ]
     .to_vec();
     let login = capture::login_start_c("Doppel");
-    let worker = std::thread::spawn(move || {
-        bot::login_capture(
-            "127.0.0.1",
-            PROBE_PORT,
-            protocol,
-            &login,
-            &bot::CaptureOpts {
-                idle_timeout: Some(Duration::from_secs(6)),
-                max_packets: Some(20000),
-                dump_dir: None,
-                commands: &piston_cmds,
-                walk_chunks: None,
-                raw_packets: &[],
-                stop_after_raw: None,
-            },
-        )
-    });
-    // The steady set_time cadence keeps a live session from ever going
-    // idle-quiet; closing the server bounds the capture from outside,
-    // exactly like the break gate's session phases.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while !worker.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    let worker =
+        std::thread::spawn(move || play_capture(PROBE_PORT, protocol, &login, &piston_cmds, &[]));
     let a = if worker.is_finished() {
         worker
             .join()
@@ -658,23 +617,9 @@ pub fn probe_play_facts() -> Result<bool> {
         std::thread::sleep(Duration::from_secs(2));
     }
     let login = capture::login_start_c("Doppelist");
-    let worker = std::thread::spawn(move || {
-        bot::login_capture(
-            "127.0.0.1",
-            PROBE_PORT,
-            protocol,
-            &login,
-            &bot::CaptureOpts {
-                idle_timeout: Some(Duration::from_secs(6)),
-                max_packets: Some(12000),
-                dump_dir: None,
-                commands: &mode_cmds,
-                walk_chunks: None,
-                raw_packets: &[],
-                stop_after_raw: None,
-            },
-        )
-    });
+    let worker =
+        std::thread::spawn(move || play_capture(PROBE_PORT, protocol, &login, &mode_cmds, &[]));
+    // Session B is informational: keep its tail short.
     let deadline = std::time::Instant::now() + Duration::from_secs(75);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -685,17 +630,6 @@ pub fn probe_play_facts() -> Result<bool> {
         .map_err(|_| anyhow::anyhow!("gamemode session thread panicked"))?
         .context("capturing gamemode session")?;
     println!("[probe] gamemode session: {} frames", b.len());
-    let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
-    for p in b.iter().filter(|p| p.id >= 0) {
-        *hist.entry(p.id).or_default() += 1;
-    }
-    println!(
-        "[probe] gamemode ids: {}",
-        hist.iter()
-            .map(|(id, n)| format!("{id:#04x}:{n}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
     for p in b.iter().filter(|p| p.id >= 0) {
         match p.id {
             0x27 => println!("[probe] game_event: {}", p.head_hex),
@@ -711,16 +645,229 @@ pub fn probe_play_facts() -> Result<bool> {
     }
     Ok(true)
 }
+fn play_capture(
+    port: u16,
+    protocol: i32,
+    login_body: &[u8],
+    commands: &[String],
+    raw_packets: &[(i32, Vec<u8>)],
+) -> Result<Vec<bot::CapturedPacket>> {
+    use doppel_protocol::{write_string, Conn, Reader};
+    const REPLY_WINDOW: Duration = Duration::from_secs(5);
+    const AFTER_RAW: Duration = Duration::from_millis(2500);
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connecting to play session on {port}"))?;
+    stream.set_read_timeout(Some(REPLY_WINDOW))?;
+    stream.set_write_timeout(Some(REPLY_WINDOW))?;
+    stream.set_nodelay(true).ok();
+    let mut conn = Conn::new(stream);
+    let mut packets: Vec<bot::CapturedPacket> = Vec::new();
+    let started = std::time::Instant::now();
+    let note = |packets: &mut Vec<bot::CapturedPacket>, text: String, t: u128| {
+        packets.push(bot::CapturedPacket {
+            id: -1,
+            t_ms: t,
+            body_len: 0,
+            head_hex: String::new(),
+            file: None,
+            note: Some(text),
+        });
+    };
 
-/// The differential breaking test.
-pub fn parity_break() -> Result<bool> {
-    let ok_break = parity_break_impl()?;
-    let ok_play = parity_play_impl()?;
-    if ok_break && ok_play {
-        Ok(true)
-    } else {
-        Ok(false)
+    // Handshake + hello, then the confirmed choreography into PLAY.
+    let mut hs = Vec::new();
+    doppel_protocol::write_varint(&mut hs, protocol);
+    write_string(&mut hs, "127.0.0.1");
+    hs.extend_from_slice(&port.to_be_bytes());
+    doppel_protocol::write_varint(&mut hs, 2);
+    conn.write_packet(0x00, &hs)?;
+    conn.write_packet(0x00, login_body)?;
+    let mut compression_on = false;
+    let mut config_started = false;
+    let mut packs_answered = false;
+    let mut play_started = false;
+    let mut raw_sent_at: Option<std::time::Instant> = None;
+    let mut next_cmd = 0usize;
+    let mut batch_feedback_due = false;
+    while raw_sent_at.is_none_or(|at| std::time::Instant::now() < at + AFTER_RAW) {
+        let (id, body) = match conn.read_packet() {
+            Ok(p) => p,
+            Err(e) => {
+                note(
+                    &mut packets,
+                    format!("transcript ended: {e:#}"),
+                    started.elapsed().as_millis(),
+                );
+                break;
+            }
+        };
+        let head = hex::encode(&body[..body.len().min(4096)]);
+        packets.push(bot::CapturedPacket {
+            id,
+            t_ms: started.elapsed().as_millis(),
+            body_len: body.len(),
+            head_hex: head,
+            file: None,
+            note: None,
+        });
+        // Set Compression arrives raw and switches the framing for
+        // everything after it.
+        if !compression_on && id == 0x03 {
+            let threshold = Reader::new(&body)
+                .read_varint()
+                .context("set compression threshold")?;
+            conn.set_compression(threshold);
+            compression_on = true;
+            continue;
+        }
+        if !config_started && id == 0x02 {
+            conn.write_packet(0x03, &[])?; // login_acknowledged
+            conn.write_packet(0x00, &bot::client_information_body())?;
+            config_started = true;
+            continue;
+        }
+        if !packs_answered && config_started && id == 0x0f {
+            conn.write_packet(0x07, &[0x00])?;
+            packs_answered = true;
+            continue;
+        }
+        if packs_answered && !play_started && id == 0x03 && body.is_empty() {
+            conn.write_packet(0x03, &[])?;
+            play_started = true;
+            continue;
+        }
+        if !play_started {
+            continue;
+        }
+        match id {
+            0x2d => conn.write_packet(0x1c, &body)?, // keep-alive echo
+            0x0b if !body.is_empty() => {
+                // One throughput report per chunk batch keeps the stream
+                // flowing, and the first batch arms the command volley.
+                let mut feedback = Vec::with_capacity(4);
+                feedback.extend_from_slice(&64.0f32.to_be_bytes());
+                conn.write_packet(0x0b, &feedback)?;
+                if next_cmd == 0 {
+                    batch_feedback_due = true;
+                }
+            }
+            0x49 if body.len() >= 4 => {
+                // The join teleport: echo id and position.
+                let mut r = Reader::new(&body);
+                let teleport_id = r.read_varint().context("teleport id")?;
+                let x = r.read_f64().context("teleport x")?;
+                let y = r.read_f64().context("teleport y")?;
+                let z = r.read_f64().context("teleport z")?;
+                r.read_f64().ok();
+                r.read_f64().ok();
+                r.read_f64().ok();
+                let yaw = r.read_f32().unwrap_or(0.0);
+                let pitch = r.read_f32().unwrap_or(0.0);
+                let mut ack = Vec::with_capacity(40);
+                doppel_protocol::write_varint(&mut ack, teleport_id);
+                ack.extend_from_slice(&x.to_be_bytes());
+                ack.extend_from_slice(&y.to_be_bytes());
+                ack.extend_from_slice(&z.to_be_bytes());
+                ack.extend_from_slice(&yaw.to_be_bytes());
+                ack.extend_from_slice(&pitch.to_be_bytes());
+                conn.write_packet(0x00, &ack)?;
+            }
+            0x7c if next_cmd > 0 => {
+                if next_cmd < commands.len() {
+                    let mut b = Vec::new();
+                    write_string(&mut b, commands[next_cmd].as_str());
+                    conn.write_packet(0x07, &b)?;
+                    next_cmd += 1;
+                    conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
+                } else if raw_sent_at.is_none() && !raw_packets.is_empty() {
+                    for (rid, rbody) in raw_packets {
+                        conn.write_packet(*rid, rbody)?;
+                    }
+                    raw_sent_at = Some(std::time::Instant::now());
+                }
+            }
+            _ => {}
+        }
+        // The volley starts after the first chunk batch closes; every
+        // command paces on its reply.
+        if batch_feedback_due && next_cmd == 0 && !commands.is_empty() {
+            batch_feedback_due = false;
+            let mut b = Vec::new();
+            write_string(&mut b, commands[0].as_str());
+            conn.write_packet(0x07, &b)?;
+            next_cmd = 1;
+            conn.get_ref().set_read_timeout(Some(REPLY_WINDOW))?;
+        }
+        if raw_sent_at.is_some() {
+            let armed = raw_sent_at.unwrap_or_else(std::time::Instant::now);
+            let left = armed + AFTER_RAW - std::time::Instant::now();
+            conn.get_ref().set_read_timeout(Some(left))?;
+        }
     }
+    if raw_sent_at.is_some() {
+        note(
+            &mut packets,
+            "transcript ended: raw interaction budget spent".into(),
+            started.elapsed().as_millis(),
+        );
+    }
+    Ok(packets)
+}
+
+/// The last state written per position across a capture.
+fn final_writes(pkts: &[bot::CapturedPacket]) -> std::collections::BTreeMap<(i32, i32, i32), u32> {
+    let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
+    decode_update_writes(&refs)
+        .into_iter()
+        .map(|(p, s, _)| (p, s))
+        .collect()
+}
+
+/// The raw block_event bodies fired at one position, in stream order.
+fn block_events_at(pkts: &[bot::CapturedPacket], at: (i32, i32, i32)) -> Vec<Vec<u8>> {
+    pkts.iter()
+        .filter(|p| p.id == 0x07)
+        .filter_map(|p| {
+            let raw = hex::decode(&p.head_hex).unwrap_or_default();
+            if raw.len() < 10 {
+                return None;
+            }
+            let bytes: [u8; 8] = raw[0..8].try_into().ok()?;
+            let packed = i64::from_be_bytes(bytes);
+            let x = ((packed >> 38) & 0x3ff_ffff) << 38 >> 38;
+            let z = ((packed >> 12) & 0x3ff_ffff) << 38 >> 38;
+            let y = (((packed & 0xfff) as i32) << 20) >> 20;
+            ((x as i32, y, z as i32) == at).then_some(raw)
+        })
+        .collect()
+}
+
+/// The game_event and abilities frames, in stream order.
+fn mode_frames(pkts: &[bot::CapturedPacket]) -> Vec<(i32, Vec<u8>)> {
+    pkts.iter()
+        .filter(|p| matches!(p.id, 0x27 | 0x41))
+        .map(|p| (p.id, hex::decode(&p.head_hex).unwrap_or_default()))
+        .collect()
+}
+
+/// One session's world-write packets, in order, for failure context.
+fn dump_write_packets(pkts: &[bot::CapturedPacket], phase: &str, who: &str) {
+    let writes: Vec<String> = pkts
+        .iter()
+        .filter(|p| matches!(p.id, 0x08 | 0x56))
+        .map(|p| {
+            format!(
+                "0x{:02x}@{}ms:{}",
+                p.id,
+                p.t_ms,
+                &p.head_hex[..p.head_hex.len().min(96)]
+            )
+        })
+        .collect();
+    println!(
+        "[oracle] play {phase} {who} write packets: [{}]",
+        writes.join(" ")
+    );
 }
 
 /// The play-parity scenarios: the organic interactions the first real
@@ -735,7 +882,7 @@ pub fn parity_break() -> Result<bool> {
 /// The two flip phases run as separate sessions on the same world: the
 /// raw interaction burst fires after a session's command volley, so one
 /// session cannot space two flips of the same lever.
-pub fn parity_play_impl() -> Result<bool> {
+pub fn parity_play() -> Result<bool> {
     let pin = load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
@@ -751,8 +898,8 @@ pub fn parity_play_impl() -> Result<bool> {
     let protocol = pin.protocol.unwrap_or(0);
 
     // Vanilla legs.
-    let vport = vanilla_port();
-    let dport = doppel_port();
+    let vport = VANILLA_PORT;
+    let dport = DOPPEL_PORT;
     let server = vanilla::boot(&pin, &jar, vport)?;
     std::thread::sleep(Duration::from_secs(2));
     let worker = std::thread::spawn(move || run_play_sessions(vport, protocol));
@@ -806,30 +953,8 @@ pub fn parity_play_impl() -> Result<bool> {
     let lever = (30, 100, 10);
     let piston = (27, 100, 12);
 
-    let writes_of =
-        |pkts: &[bot::CapturedPacket]| -> std::collections::BTreeMap<(i32, i32, i32), u32> {
-            let refs: Vec<_> = pkts.iter().filter(|p| p.id >= 0).collect();
-            decode_update_writes(&refs)
-                .into_iter()
-                .map(|(p, s, _)| (p, s))
-                .collect()
-        };
-    let events_at = |pkts: &[bot::CapturedPacket], at: (i32, i32, i32)| -> Vec<Vec<u8>> {
-        pkts.iter()
-            .filter(|p| p.id == 0x07)
-            .filter_map(|p| {
-                let raw = hex::decode(&p.head_hex).unwrap_or_default();
-                if raw.len() < 10 {
-                    return None;
-                }
-                let packed = i64::from_be_bytes(raw[0..8].try_into().unwrap());
-                let x = ((packed >> 38) & 0x3ff_ffff) << 38 >> 38;
-                let z = ((packed >> 12) & 0x3ff_ffff) << 38 >> 38;
-                let y = (((packed & 0xfff) as i32) << 20) >> 20;
-                ((x as i32, y, z as i32) == at).then_some(raw)
-            })
-            .collect()
-    };
+    let writes_of = final_writes;
+    let events_at = block_events_at;
 
     let mut failures = Vec::new();
     for (phase, v, d) in [("on", &v_on, &d_on), ("off", &v_off, &d_off)] {
@@ -843,22 +968,7 @@ pub fn parity_play_impl() -> Result<bool> {
                 pk.len(),
                 end.and_then(|p| p.note.clone())
             );
-            let writes: Vec<String> = pk
-                .iter()
-                .filter(|p| matches!(p.id, 0x08 | 0x56))
-                .map(|p| {
-                    format!(
-                        "0x{:02x}@{}ms:{}",
-                        p.id,
-                        p.t_ms,
-                        &p.head_hex[..p.head_hex.len().min(96)]
-                    )
-                })
-                .collect();
-            println!(
-                "[oracle] play {phase} {who} write packets: [{}]",
-                writes.join(" ")
-            );
+            dump_write_packets(pk, phase, who);
         }
         for cell in wire_cells.iter().chain(piston_cells.iter()) {
             let vv = vw.get(cell).copied();
@@ -890,12 +1000,7 @@ pub fn parity_play_impl() -> Result<bool> {
     }
 
     // gamemode: the exact game_event and abilities bytes, in order.
-    let mode_frames = |pkts: &[bot::CapturedPacket]| -> Vec<(i32, Vec<u8>)> {
-        pkts.iter()
-            .filter(|p| matches!(p.id, 0x27 | 0x41))
-            .map(|p| (p.id, hex::decode(&p.head_hex).unwrap_or_default()))
-            .collect()
-    };
+    let mode_frames = mode_frames;
     let vm = mode_frames(&v_off);
     let dm = mode_frames(&d_off);
     if vm != dm {
@@ -992,22 +1097,8 @@ fn run_play_sessions(
         (0x42, bot::build_use_item_on_top(26, 100, 12, 101)),
     ];
     let login = capture::login_start_c("Doppel");
-    let on = bot::login_capture(
-        "127.0.0.1",
-        port,
-        protocol,
-        &login,
-        &bot::CaptureOpts {
-            idle_timeout: Some(Duration::from_secs(6)),
-            max_packets: Some(24000),
-            dump_dir: None,
-            commands: &build,
-            walk_chunks: None,
-            raw_packets: &on_raw,
-            stop_after_raw: Some(Duration::from_millis(2500)),
-        },
-    )
-    .context("play session 1 (flips on)")?;
+    let on = play_capture(port, protocol, &login, &build, &on_raw)
+        .context("play session 1 (flips on)")?;
     // Let the world settle: the piston lands and the wire stills before
     // the second session's flips arrive.
     std::thread::sleep(Duration::from_secs(4));
@@ -1034,27 +1125,13 @@ fn run_play_sessions(
         (0x42, bot::build_use_item_on_top(26, 100, 12, 103)),
     ];
     let login = capture::login_start_c("Doppelist");
-    let off = bot::login_capture(
-        "127.0.0.1",
-        port,
-        protocol,
-        &login,
-        &bot::CaptureOpts {
-            idle_timeout: Some(Duration::from_secs(6)),
-            max_packets: Some(24000),
-            dump_dir: None,
-            commands: &off_commands,
-            walk_chunks: None,
-            raw_packets: &off_raw,
-            stop_after_raw: Some(Duration::from_millis(2500)),
-        },
-    )
-    .context("play session 2 (flips off)")?;
+    let off = play_capture(port, protocol, &login, &off_commands, &off_raw)
+        .context("play session 2 (flips off)")?;
 
     Ok((on, off))
 }
 
-fn parity_break_impl() -> Result<bool> {
+pub fn parity_break() -> Result<bool> {
     let pin = load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
@@ -1076,10 +1153,8 @@ fn parity_break_impl() -> Result<bool> {
     // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
     // idle timers, so the phase carries its own wall-clock bound: closing
     // the server ends any still-blocked capture from outside.
-    let vport = vanilla_port();
-    let dport = doppel_port();
-    let server = vanilla::boot(&pin, &jar, vport)?;
-    let vworker = std::thread::spawn(move || run_sessions(vport, protocol));
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
     let vdeadline = std::time::Instant::now() + Duration::from_secs(90);
     while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
         std::thread::sleep(Duration::from_millis(500));
@@ -1095,7 +1170,7 @@ fn parity_break_impl() -> Result<bool> {
     let pin_path = doppel_protocol::pin_path()?;
     let mut child = Command::new(&bin)
         .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", dport.to_string())
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
         .env("DOPPEL_PIN", &pin_path)
         .env("DOPPEL_BLOBS", &blobs_dir)
         .env("DOPPEL_WORLD", &pristine_world)
@@ -1103,12 +1178,12 @@ fn parity_break_impl() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(dport, Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(10));
     // Both servers keep an idle-based capture alive with steady traffic
     // (time pushes, entity tracking at spawn), so this phase carries the
     // same wall-clock bound as the vanilla one.
-    let worker = std::thread::spawn(move || run_sessions(dport, protocol));
+    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));

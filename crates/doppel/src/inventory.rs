@@ -46,6 +46,57 @@ pub const PACKET_GAME_EVENT: i32 = 0x27;
 /// (flags 0, 0.05, 0.1) right after login and change_difficulty.
 pub const PACKET_PLAYER_ABILITIES: i32 = 0x41;
 
+/// The four game modes, registry-id order (the `game_event` param).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl GameMode {
+    pub fn id(self) -> i32 {
+        match self {
+            GameMode::Survival => 0,
+            GameMode::Creative => 1,
+            GameMode::Adventure => 2,
+            GameMode::Spectator => 3,
+        }
+    }
+
+    /// The creative flag the inventory, placement, and dig paths gate on.
+    pub fn is_creative(self) -> bool {
+        self == GameMode::Creative
+    }
+
+    pub fn parse(name: &str) -> Option<GameMode> {
+        Some(match name {
+            "survival" => GameMode::Survival,
+            "creative" => GameMode::Creative,
+            "adventure" => GameMode::Adventure,
+            "spectator" => GameMode::Spectator,
+            _ => return None,
+        })
+    }
+
+    /// The `player_abilities` flag set the mode grants; `flying` adds the
+    /// FLYING bit for the modes that allow it (survival and adventure
+    /// force it off).
+    pub fn ability_flags(self, flying: bool) -> u8 {
+        let granted = match self {
+            GameMode::Creative => ability::INVULNERABLE | ability::MAYFLY | ability::INSTABUILD,
+            GameMode::Spectator => ability::INVULNERABLE | ability::MAYFLY | ability::FLYING,
+            GameMode::Survival | GameMode::Adventure => return 0,
+        };
+        if flying {
+            granted | ability::FLYING
+        } else {
+            granted
+        }
+    }
+}
+
 /// The `player_abilities` flag bits, in wire order.
 pub mod ability {
     pub const INVULNERABLE: u8 = 0x01;
