@@ -50,7 +50,9 @@ jobs:
     name: capture - vanilla login transcript
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The strict-decode step adds a vanilla boot plus three live Doppel
+    # sessions on top of the existing captures.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@v1
@@ -71,7 +73,13 @@ jobs:
         run: cargo run --release -p doppel-oracle -- capture-vanilla-login captures/vanilla-login.jsonl captures/blobs
       - name: Run first tick-stepped scenario
         run: cargo run --release -p doppel-oracle -- scenario captures/scenario.jsonl
+      - name: Strict-decode every clientbound frame
+        run: cargo run --release -p doppel-oracle -- strict-decode
+      - name: Print strict-decode report
+        if: always()
+        run: cat target/oracle/strict-decode/report.txt || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: vanilla-login-transcript
           path: |
@@ -79,6 +87,11 @@ jobs:
             captures/blobs
             captures/scenario.jsonl
             pins/blocks.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strict-decode-report
+          path: target/oracle/strict-decode/
 
   parity-break:
     name: parity - break vs vanilla
