@@ -980,9 +980,9 @@ pub fn parity_play() -> Result<bool> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(dport, Duration::from_secs(30))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(8));
-    let worker = std::thread::spawn(move || run_play_sessions(dport, protocol));
+    let worker = std::thread::spawn(move || run_play_sessions(DOPPEL_PORT, protocol));
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !worker.is_finished() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(500));
