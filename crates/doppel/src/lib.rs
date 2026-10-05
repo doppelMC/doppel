@@ -5,6 +5,7 @@
 pub mod blobs;
 pub mod creeper;
 pub mod dig;
+pub mod events;
 pub mod explosion;
 pub mod game;
 pub mod inventory;

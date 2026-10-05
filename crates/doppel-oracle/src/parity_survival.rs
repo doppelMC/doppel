@@ -1250,8 +1250,16 @@ fn compare_tail(
     }
 }
 
-/// The differential survival test.
-pub fn parity_survival() -> Result<bool> {
+/// Boots the reference, captures its sessions, then does the same
+/// against a fresh doppel over the clean blobs and pristine world.
+fn run_survival_sessions() -> Result<(
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+)> {
     let pin = load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
@@ -1312,18 +1320,31 @@ pub fn parity_survival() -> Result<bool> {
     let (d_digger, d_walker, d_witness) = worker
         .join()
         .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
+    Ok((v_digger, v_walker, v_witness, d_digger, d_walker, d_witness))
+}
 
+/// Prints the per-session frame histograms, drop spawns, and movement
+/// shapes for both servers.
+fn print_survival_summary(
+    v: &Obs,
+    d: &Obs,
+    v_walk: &Obs,
+    d_walk: &Obs,
+    v_wit: &Obs,
+    d_wit: &Obs,
+    v_digger: &[bot::CapturedPacket],
+    d_digger: &[bot::CapturedPacket],
+    v_walker: &[bot::CapturedPacket],
+    d_walker: &[bot::CapturedPacket],
+    v_witness: &[bot::CapturedPacket],
+    d_witness: &[bot::CapturedPacket],
+) {
     // Every stream is observation from its first frame: the entity and
     // inventory decodes key on the drop cells and ids (join traffic never
     // matches), and the grass writes cover the whole stream anyway.
-    let v = analyze(&v_digger, None);
-    let d = analyze(&d_digger, None);
-    let v_walk = analyze(&v_walker, None);
-    let d_walk = analyze(&d_walker, None);
-    let v_all = analyze(&v_digger, None);
-    let d_all = analyze(&d_digger, None);
-    let v_wit = analyze(&v_witness, None);
-    let d_wit = analyze(&d_witness, None);
+    let _ = (&v, &d, &v_walk, &d_walk, &v_wit, &d_wit);
+    let v_all = analyze(v_digger, None);
+    let d_all = analyze(d_digger, None);
 
     let histogram = |pkts: &[bot::CapturedPacket]| {
         let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
@@ -1365,9 +1386,9 @@ pub fn parity_survival() -> Result<bool> {
         for (name, cell) in [("A", TORCH), ("B", TORCH_B)] {
             for (id, typ, x, y, z, movement) in s.adds_in(cell) {
                 println!(
-                    "[oracle] {who} drop {name} add: id={id} type={typ} at ({x:.3},{y:.3},{z:.3}) movement=({:.4},{:.4},{:.4})",
-                    movement[0], movement[1], movement[2]
-                );
+                "[oracle] {who} drop {name} add: id={id} type={typ} at ({x:.3},{y:.3},{z:.3}) movement=({:.4},{:.4},{:.4})",
+                movement[0], movement[1], movement[2]
+            );
             }
             for (id, typ, x, y, z, movement) in wit.adds_in(cell) {
                 let _ = (id, typ, movement);
@@ -1380,9 +1401,9 @@ pub fn parity_survival() -> Result<bool> {
                     walk.adds.iter().filter(|a| a.0 == id && a.1 == 72)
                 {
                     println!(
-                        "[oracle] {who} walker drop {name} add: id={wid} type={typ} at ({x:.3},{y:.3},{z:.3}) movement=({:.4},{:.4},{:.4})",
-                        movement[0], movement[1], movement[2]
-                    );
+                    "[oracle] {who} walker drop {name} add: id={wid} type={typ} at ({x:.3},{y:.3},{z:.3}) movement=({:.4},{:.4},{:.4})",
+                    movement[0], movement[1], movement[2]
+                );
                 }
             }
         }
@@ -1453,9 +1474,18 @@ pub fn parity_survival() -> Result<bool> {
         let (wgrow, _) = grown(wit);
         println!("[oracle] {who} witness grass: decayed {wcap}/16, grown {wgrow}/9 ({wstate:?})");
     }
+}
 
-    let mut failures = Vec::new();
-
+/// Compares the drop spawn pairings and take/discard cycles.
+fn compare_drop_cycles(
+    v: &Obs,
+    d: &Obs,
+    v_walk: &Obs,
+    d_walk: &Obs,
+    v_wit: &Obs,
+    d_wit: &Obs,
+    failures: &mut Vec<String>,
+) {
     // One item entity spawns per torch cell on each side, typed as the
     // item entity (72 in the entity-type registry). The digger and the
     // witness hold each spawn pairing once (their adds carry the spawn
@@ -1594,6 +1624,10 @@ pub fn parity_survival() -> Result<bool> {
     // at the hop's pairing pass (deterministic), the reference when its
     // away-view chunk work completes, a wall-clock-bound batch that a
     // slow host can leave unfinished at the window's end. So this
+}
+
+/// Compares the drop take/discard cycles and take amounts.
+fn compare_take_cycles(v: &Obs, d: &Obs, v_walk: &Obs, d_walk: &Obs, failures: &mut Vec<String>) {
     // server must always run the full cycle; the reference either runs
     // it (checked in full) or stays paired throughout (checked as the
     // degenerate shape: one add, drop A's discard after its take, drop B
@@ -1627,13 +1661,13 @@ pub fn parity_survival() -> Result<bool> {
                         || takes.first().is_none_or(|&t| t > removes[0])
                     {
                         failures.push(format!(
-                            "vanilla: drop {name} stayed paired but its removal frames are {removes:?} against the add {adds:?} and takes {takes:?}"
-                        ));
+                    "vanilla: drop {name} stayed paired but its removal frames are {removes:?} against the add {adds:?} and takes {takes:?}"
+                ));
                     }
                 } else if !removes.is_empty() {
                     failures.push(format!(
-                        "vanilla: drop {name} stayed paired but removal frames {removes:?} appeared"
-                    ));
+                "vanilla: drop {name} stayed paired but removal frames {removes:?} appeared"
+            ));
                 }
                 continue;
             }
@@ -1652,20 +1686,20 @@ pub fn parity_survival() -> Result<bool> {
                     ));
                 } else if !(adds[0] < removes[0] && removes[0] < adds[1] && adds[1] < removes[1]) {
                     failures.push(format!(
-                        "{who}: drop {name} walker re-pair ordering: adds {adds:?} removes {removes:?}"
-                    ));
+                "{who}: drop {name} walker re-pair ordering: adds {adds:?} removes {removes:?}"
+            ));
                 }
                 if removes.len() == 2
                     && (takes.len() != 1 || takes[0] < adds[1] || takes[0] > removes[1])
                 {
                     failures.push(format!(
-                        "{who}: drop {name} take frames at {takes:?}, want one between the re-pair and the discard"
-                    ));
+                "{who}: drop {name} take frames at {takes:?}, want one between the re-pair and the discard"
+            ));
                 }
             } else if removes.len() != 1 || removes[0] < adds[0] || removes[0] > adds[1] {
                 failures.push(format!(
-                    "{who}: drop {name} walker removal frames {removes:?} against adds {adds:?}, want the unpair alone"
-                ));
+            "{who}: drop {name} walker removal frames {removes:?} against adds {adds:?}, want the unpair alone"
+        ));
             }
             for (count, rid) in &walk.removes {
                 if *rid == id && *count != 1 {
@@ -1707,6 +1741,22 @@ pub fn parity_survival() -> Result<bool> {
             failures.push(format!("{who}: digger take amounts {amounts:?}, want [1]"));
         }
     }
+}
+
+/// Compares the drop fall/slide and rest motion shapes, the grass
+/// cycles, and the inventory syncs.
+fn compare_drop_motion(
+    v: &Obs,
+    d: &Obs,
+    v_walk: &Obs,
+    d_walk: &Obs,
+    v_wit: &Obs,
+    d_wit: &Obs,
+    v_all: &Obs,
+    d_all: &Obs,
+    mut failures: &mut Vec<String>,
+) {
+    compare_take_cycles(&v, &d, &v_walk, &d_walk, &mut failures);
 
     // The movement frames: each standing stream's tail after the spawn
     // add must match the shadow replayed from that stream's own observed
@@ -1732,8 +1782,8 @@ pub fn parity_survival() -> Result<bool> {
                     match (tail.pop(), tail.pop()) {
                         (Some(EFrame::Remove(_)), Some(EFrame::Take(e, _, _))) if e == spawn.0 => {}
                         _ => failures.push(format!(
-                            "{who}: drop {name}/{stream} tail does not end with its take and removal"
-                        )),
+                        "{who}: drop {name}/{stream} tail does not end with its take and removal"
+                    )),
                     }
                 }
                 compare_tail(who, &format!("{name}/{stream}"), &tail, &sim, &mut failures);
@@ -1791,6 +1841,31 @@ pub fn parity_survival() -> Result<bool> {
         compare_obs_pair(name, &vt, &dt, &mut failures);
     }
 
+    compare_drop_tails(
+        &v,
+        &d,
+        &v_walk,
+        &d_walk,
+        &v_wit,
+        &d_wit,
+        &v_all,
+        &d_all,
+        &mut failures,
+    );
+}
+/// Compares the drop fall/slide and rest motion tails, the grass
+/// cycles, and the inventory syncs.
+fn compare_drop_tails(
+    v: &Obs,
+    d: &Obs,
+    v_walk: &Obs,
+    d_walk: &Obs,
+    v_wit: &Obs,
+    d_wit: &Obs,
+    v_all: &Obs,
+    d_all: &Obs,
+    mut failures: &mut Vec<String>,
+) {
     // Cross-server on the standing witnesses, split at each tail's own
     // settle mark. The two servers draw their own spawns (0.25 per axis,
     // the pop 0.1), so the slide lengths legitimately differ: one side's
@@ -1900,10 +1975,10 @@ pub fn parity_survival() -> Result<bool> {
         }
         if !r_ok {
             failures.push(format!(
-                "drop {name} witness resting kinds disagree at every rotation: vanilla [{}] vs doppel [{}]",
-                vr.iter().take(12).copied().collect::<Vec<_>>().join(","),
-                dr.iter().take(12).copied().collect::<Vec<_>>().join(",")
-            ));
+    "drop {name} witness resting kinds disagree at every rotation: vanilla [{}] vs doppel [{}]",
+    vr.iter().take(12).copied().collect::<Vec<_>>().join(","),
+    dr.iter().take(12).copied().collect::<Vec<_>>().join(",")
+));
         }
     }
 
@@ -1917,8 +1992,11 @@ pub fn parity_survival() -> Result<bool> {
         ));
     } else if v_slots.is_empty() {
         failures.push("no set_slot frames carry the picked-up stack".into());
-    } else if let Some((_, _, vi)) =
-        stack_of(&v, v.adds_in(TORCH).first().map(|a| a.0).unwrap_or(-1))
+    } else if let Some((_, _, vi)) = v
+        .stacks
+        .iter()
+        .copied()
+        .find(|(eid, _, _)| *eid == v.adds_in(TORCH).first().map(|a| a.0).unwrap_or(-1))
     {
         for (slot, item, count) in &v_slots {
             if *item != vi || *count != 1 {
@@ -1951,15 +2029,27 @@ pub fn parity_survival() -> Result<bool> {
             )),
         }
     }
-    let (_, v_dirt) = decayed(&v_all);
-    let (_, d_dirt) = decayed(&d_all);
+    compare_grass_and_witness(&v_all, &d_all, &v_wit, &d_wit, failures);
+}
+
+/// Compares the grass decay/regrowth states and the standing witness's
+/// broadcast lifecycle.
+fn compare_grass_and_witness(
+    v_all: &Obs,
+    d_all: &Obs,
+    v_wit: &Obs,
+    d_wit: &Obs,
+    failures: &mut Vec<String>,
+) {
+    let (_, v_dirt) = decayed(v_all);
+    let (_, d_dirt) = decayed(d_all);
     if v_dirt.is_some() && v_dirt != d_dirt {
         failures.push(format!(
             "decay states differ: vanilla {v_dirt:?} vs doppel {d_dirt:?}"
         ));
     }
-    let (_, v_grass) = grown(&v_all);
-    let (_, d_grass) = grown(&d_all);
+    let (_, v_grass) = grown(v_all);
+    let (_, d_grass) = grown(d_all);
     if v_grass.is_some() && v_grass != d_grass {
         failures.push(format!(
             "regrown states differ: vanilla {v_grass:?} vs doppel {d_grass:?}"
@@ -1972,7 +2062,7 @@ pub fn parity_survival() -> Result<bool> {
     }
 
     // The standing witness sees the same broadcast lifecycle.
-    for (who, wit) in [("vanilla", &v_wit), ("doppel", &d_wit)] {
+    for (who, wit) in [("vanilla", v_wit), ("doppel", d_wit)] {
         let amounts: Vec<i32> = wit.takes.iter().map(|(_, _, a)| *a).collect();
         if amounts != vec![1] {
             failures.push(format!("{who}: witness take amounts {amounts:?}, want [1]"));
@@ -1986,7 +2076,41 @@ pub fn parity_survival() -> Result<bool> {
             failures.push(format!("{who}: witness saw {n}/9 patch cells regrow"));
         }
     }
+}
 
+/// The differential survival test.
+pub fn parity_survival() -> Result<bool> {
+    let (v_digger, v_walker, v_witness, d_digger, d_walker, d_witness) = run_survival_sessions()?;
+
+    // Every stream is observation from its first frame: the entity and
+    // inventory decodes key on the drop cells and ids (join traffic never
+    // matches), and the grass writes cover the whole stream anyway.
+    let v = analyze(&v_digger, None);
+    let d = analyze(&d_digger, None);
+    let v_walk = analyze(&v_walker, None);
+    let d_walk = analyze(&d_walker, None);
+    let v_all = analyze(&v_digger, None);
+    let d_all = analyze(&d_digger, None);
+    let v_wit = analyze(&v_witness, None);
+    let d_wit = analyze(&d_witness, None);
+
+    print_survival_summary(
+        &v, &d, &v_walk, &d_walk, &v_wit, &d_wit, &v_digger, &d_digger, &v_walker, &d_walker,
+        &v_witness, &d_witness,
+    );
+    let mut failures = Vec::new();
+    compare_drop_cycles(&v, &d, &v_walk, &d_walk, &v_wit, &d_wit, &mut failures);
+    compare_drop_motion(
+        &v,
+        &d,
+        &v_walk,
+        &d_walk,
+        &v_wit,
+        &d_wit,
+        &v_all,
+        &d_all,
+        &mut failures,
+    );
     if failures.is_empty() {
         println!("PASS: survival parity");
         Ok(true)
