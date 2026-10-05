@@ -1250,16 +1250,19 @@ fn compare_tail(
     }
 }
 
+/// The six captured survival streams: digger, walker, witness per server.
+type SurvivalSessions = (
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+    Vec<bot::CapturedPacket>,
+);
+
 /// Boots the reference, captures its sessions, then does the same
 /// against a fresh doppel over the clean blobs and pristine world.
-fn run_survival_sessions() -> Result<(
-    Vec<bot::CapturedPacket>,
-    Vec<bot::CapturedPacket>,
-    Vec<bot::CapturedPacket>,
-    Vec<bot::CapturedPacket>,
-    Vec<bot::CapturedPacket>,
-    Vec<bot::CapturedPacket>,
-)> {
+fn run_survival_sessions() -> Result<SurvivalSessions> {
     let pin = load_pin()?;
     let jar = vanilla::ensure_jar(&pin)?;
     let root = doppel_protocol::find_repo_root()?;
@@ -1323,6 +1326,7 @@ fn run_survival_sessions() -> Result<(
     Ok((v_digger, v_walker, v_witness, d_digger, d_walker, d_witness))
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Prints the per-session frame histograms, drop spawns, and movement
 /// shapes for both servers.
 fn print_survival_summary(
@@ -1336,8 +1340,8 @@ fn print_survival_summary(
     d_digger: &[bot::CapturedPacket],
     v_walker: &[bot::CapturedPacket],
     d_walker: &[bot::CapturedPacket],
-    v_witness: &[bot::CapturedPacket],
-    d_witness: &[bot::CapturedPacket],
+    _v_witness: &[bot::CapturedPacket],
+    _d_witness: &[bot::CapturedPacket],
 ) {
     // Every stream is observation from its first frame: the entity and
     // inventory decodes key on the drop cells and ids (join traffic never
@@ -1480,8 +1484,8 @@ fn print_survival_summary(
 fn compare_drop_cycles(
     v: &Obs,
     d: &Obs,
-    v_walk: &Obs,
-    d_walk: &Obs,
+    _v_walk: &Obs,
+    _d_walk: &Obs,
     v_wit: &Obs,
     d_wit: &Obs,
     failures: &mut Vec<String>,
@@ -1593,11 +1597,11 @@ fn compare_drop_cycles(
         let v_stack = v
             .adds_in(cell)
             .first()
-            .and_then(|(id, ..)| stack_of(&v, *id));
+            .and_then(|(id, ..)| stack_of(v, *id));
         let d_stack = d
             .adds_in(cell)
             .first()
-            .and_then(|(id, ..)| stack_of(&d, *id));
+            .and_then(|(id, ..)| stack_of(d, *id));
         match (v_stack, d_stack) {
             (Some((_, vc, vi)), Some((_, dc, di))) => {
                 if vc != 1 || dc != 1 {
@@ -1727,7 +1731,7 @@ fn compare_take_cycles(v: &Obs, d: &Obs, v_walk: &Obs, d_walk: &Obs, failures: &
         failures.push(format!(
             "walker takes {v_takes:?}, want one full-stack take"
         ));
-    } else if let Some(id) = a_id(&v) {
+    } else if let Some(id) = a_id(v) {
         if v_takes[0].0 != id {
             failures.push(format!(
                 "the taken entity {} is not drop A ({id})",
@@ -1743,6 +1747,7 @@ fn compare_take_cycles(v: &Obs, d: &Obs, v_walk: &Obs, d_walk: &Obs, failures: &
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Compares the drop fall/slide and rest motion shapes, the grass
 /// cycles, and the inventory syncs.
 fn compare_drop_motion(
@@ -1754,9 +1759,9 @@ fn compare_drop_motion(
     d_wit: &Obs,
     v_all: &Obs,
     d_all: &Obs,
-    mut failures: &mut Vec<String>,
+    failures: &mut Vec<String>,
 ) {
-    compare_take_cycles(&v, &d, &v_walk, &d_walk, &mut failures);
+    compare_take_cycles(v, d, v_walk, d_walk, failures);
 
     // The movement frames: each standing stream's tail after the spawn
     // add must match the shadow replayed from that stream's own observed
@@ -1786,7 +1791,7 @@ fn compare_drop_motion(
                     )),
                     }
                 }
-                compare_tail(who, &format!("{name}/{stream}"), &tail, &sim, &mut failures);
+                compare_tail(who, &format!("{name}/{stream}"), &tail, &sim, failures);
                 if !taken && tail.len() < 15 {
                     failures.push(format!(
                         "{who}: drop {name}/{stream} sent {} resting movement frames, want >= 15",
@@ -1838,33 +1843,24 @@ fn compare_drop_motion(
         // servers' tick rates, not with parity.
         vt.truncate(WALKER_TAIL_MAX);
         dt.truncate(WALKER_TAIL_MAX);
-        compare_obs_pair(name, &vt, &dt, &mut failures);
+        compare_obs_pair(name, &vt, &dt, failures);
     }
 
-    compare_drop_tails(
-        &v,
-        &d,
-        &v_walk,
-        &d_walk,
-        &v_wit,
-        &d_wit,
-        &v_all,
-        &d_all,
-        &mut failures,
-    );
+    compare_drop_tails(v, d, v_walk, d_walk, v_wit, d_wit, v_all, d_all, failures);
 }
+#[allow(clippy::too_many_arguments)]
 /// Compares the drop fall/slide and rest motion tails, the grass
 /// cycles, and the inventory syncs.
 fn compare_drop_tails(
     v: &Obs,
-    d: &Obs,
+    _d: &Obs,
     v_walk: &Obs,
     d_walk: &Obs,
     v_wit: &Obs,
     d_wit: &Obs,
     v_all: &Obs,
     d_all: &Obs,
-    mut failures: &mut Vec<String>,
+    failures: &mut Vec<String>,
 ) {
     // Cross-server on the standing witnesses, split at each tail's own
     // settle mark. The two servers draw their own spawns (0.25 per axis,
@@ -1894,7 +1890,7 @@ fn compare_drop_tails(
             }
             t
         };
-        let (vt, dt) = (tail(&v_wit), tail(&d_wit));
+        let (vt, dt) = (tail(v_wit), tail(d_wit));
         let kinds = |t: &[EFrame]| -> Vec<&str> { t.iter().map(|f| f.kind()).collect::<Vec<_>>() };
         let (vk, dk) = (kinds(&vt), kinds(&dt));
         let head = |k: &[&str]| k.iter().take(12).copied().collect::<Vec<_>>().join(",");
@@ -1984,8 +1980,8 @@ fn compare_drop_tails(
 
     // The stack lands in the walker's inventory: identical set_slot
     // traffic carrying the drop's stack.
-    let v_slots = sorted_slots(&v_walk);
-    let d_slots = sorted_slots(&d_walk);
+    let v_slots = sorted_slots(v_walk);
+    let d_slots = sorted_slots(d_walk);
     if v_slots != d_slots {
         failures.push(format!(
             "walker set_slot traffic differs: vanilla {v_slots:?} vs doppel {d_slots:?}"
@@ -2029,7 +2025,7 @@ fn compare_drop_tails(
             )),
         }
     }
-    compare_grass_and_witness(&v_all, &d_all, &v_wit, &d_wit, failures);
+    compare_grass_and_witness(v_all, d_all, v_wit, d_wit, failures);
 }
 
 /// Compares the grass decay/regrowth states and the standing witness's

@@ -1287,11 +1287,11 @@ fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
     // boot, so only the two servers' agreement is pinned there).
     let above_chest = (CHEST.0, CHEST.1 + 1, CHEST.2);
     for target in [ANCHOR, PLACED, OBSI, CHEST, above_chest] {
-        if final_at(&v, target) != final_at(&d, target) {
+        if final_at(v, target) != final_at(d, target) {
             failures.push(format!(
                 "final states differ at {target:?}: vanilla {:?} vs doppel {:?}",
-                final_at(&v, target),
-                final_at(&d, target)
+                final_at(v, target),
+                final_at(d, target)
             ));
         }
     }
