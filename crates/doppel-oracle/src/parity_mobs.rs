@@ -285,14 +285,39 @@ fn analyze(pkts: &[bot::CapturedPacket]) -> Obs {
             }
             P_MOVE_ENTITY_POS | P_MOVE_ENTITY_POS_ROT => {
                 if let Some(id) = rd_varint(&raw, &mut o) {
-                    // The properties varint (on-ground bit, step count)
-                    // precedes the delta shorts.
-                    if rd_varint(&raw, &mut o).is_some() {
-                        if let (Some(dx), Some(dy), Some(dz)) = (
-                            rd_i16(&raw, &mut o),
-                            rd_i16(&raw, &mut o),
-                            rd_i16(&raw, &mut o),
-                        ) {
+                    // The properties varint: on-ground in bit 0, the step
+                    // count in the bits above. A zero step count carries
+                    // one linear delta; a positive count carries that many
+                    // (ticks varint, three shorts) sub-steps, and the
+                    // movement is their sum.
+                    if let Some(props) = rd_varint(&raw, &mut o) {
+                        let steps = (props >> 1) as usize;
+                        let mut dx = 0i32;
+                        let mut dy = 0i32;
+                        let mut dz = 0i32;
+                        let mut ok = true;
+                        for _ in 0..steps.max(1) {
+                            if steps > 0 && rd_varint(&raw, &mut o).is_none() {
+                                ok = false;
+                                break;
+                            }
+                            match (
+                                rd_i16(&raw, &mut o),
+                                rd_i16(&raw, &mut o),
+                                rd_i16(&raw, &mut o),
+                            ) {
+                                (Some(a), Some(b), Some(c)) => {
+                                    dx += a as i32;
+                                    dy += b as i32;
+                                    dz += c as i32;
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
                             obs.deltas.push((
                                 i,
                                 id,
