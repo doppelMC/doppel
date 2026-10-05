@@ -614,72 +614,8 @@ fn order_vote_check(
     compared_pairs
 }
 
-/// The differential breaking test.
-pub fn parity_break() -> Result<bool> {
-    let pin = load_pin()?;
-    let jar = vanilla::ensure_jar(&pin)?;
-    let root = doppel_protocol::find_repo_root()?;
-    let blobs_dir = root.join("target").join("vanilla").join("blobs-break");
-    let pristine_world = root
-        .join("target")
-        .join("vanilla")
-        .join("pristine-world-break");
-    for dir in [&blobs_dir, &pristine_world] {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
-        }
-    }
-    let protocol = pin.protocol.unwrap_or(0);
-
-    // 1. Clean blobs + pristine world.
-    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
-
-    // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
-    // idle timers, so the phase carries its own wall-clock bound: closing
-    // the server ends any still-blocked capture from outside.
-    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
-    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
-    let vdeadline = std::time::Instant::now() + Duration::from_secs(90);
-    while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    drop(server);
-    let (v_digger, v_witness) = vworker
-        .join()
-        .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
-
-    // 3. Doppel sessions. The warm-up sleep puts doppel's tick counter
-    // past the delayed-destroy threshold, matching a booted server.
-    let bin = default_doppel_bin()?;
-    let pin_path = doppel_protocol::pin_path()?;
-    let mut child = Command::new(&bin)
-        .env("DOPPEL_ADDR", "127.0.0.1")
-        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
-        .env("DOPPEL_PIN", &pin_path)
-        .env("DOPPEL_BLOBS", &blobs_dir)
-        .env("DOPPEL_WORLD", &pristine_world)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawning {}", bin.display()))?;
-    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
-    std::thread::sleep(Duration::from_secs(10));
-    // Both servers keep an idle-based capture alive with steady traffic
-    // (time pushes, entity tracking at spawn), so this phase carries the
-    // same wall-clock bound as the vanilla one.
-    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !worker.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let (d_digger, d_witness) = worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
-
-    let v = analyze(&v_digger, &v_witness);
-    let d = analyze(&d_digger, &d_witness);
+/// Prints per-side frame histograms and observed writes for both bots.
+fn print_break_summary(sides: &[(&str, &[bot::CapturedPacket], &[bot::CapturedPacket], &Side)]) {
     let histogram = |pkts: &[bot::CapturedPacket]| {
         let mut hist: std::collections::BTreeMap<i32, usize> = Default::default();
         for p in pkts.iter().filter(|p| p.id >= 0) {
@@ -699,10 +635,7 @@ pub fn parity_break() -> Result<bool> {
             .join(" ")
     };
     let marker_of = |digger: &[bot::CapturedPacket]| digger.iter().rposition(|p| p.id == 0x7c);
-    for (who, digger, witness, side) in [
-        ("vanilla", &v_digger, &v_witness, &v),
-        ("doppel", &d_digger, &d_witness, &d),
-    ] {
+    for (who, digger, witness, side) in sides {
         println!(
             "[oracle] {who}: digger {} frames, witness {} frames",
             digger.len(),
@@ -737,7 +670,12 @@ pub fn parity_break() -> Result<bool> {
                 .collect::<Vec<_>>()
         );
     }
+}
 
+/// Compares the analyzed sides: final block states, dig overlays, the
+/// chest interaction, and inventory syncs. Appends one failure per
+/// mismatch.
+fn compare_break_sides(v: &Side, d: &Side, failures: &mut Vec<String>) {
     let final_at = |side: &Side, target: (i32, i32, i32)| {
         side.updates
             .iter()
@@ -869,6 +807,81 @@ pub fn parity_break() -> Result<bool> {
             v.slots, d.slots
         ));
     }
+}
+
+/// The differential breaking test.
+pub fn parity_break() -> Result<bool> {
+    let pin = load_pin()?;
+    let jar = vanilla::ensure_jar(&pin)?;
+    let root = doppel_protocol::find_repo_root()?;
+    let blobs_dir = root.join("target").join("vanilla").join("blobs-break");
+    let pristine_world = root
+        .join("target")
+        .join("vanilla")
+        .join("pristine-world-break");
+    for dir in [&blobs_dir, &pristine_world] {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+    }
+    let protocol = pin.protocol.unwrap_or(0);
+
+    // 1. Clean blobs + pristine world.
+    capture_clean_blobs(&pin, &jar, &blobs_dir, &pristine_world)?;
+
+    // 2. Vanilla reference sessions. Keep-alive traffic can outlive the
+    // idle timers, so the phase carries its own wall-clock bound: closing
+    // the server ends any still-blocked capture from outside.
+    let server = vanilla::boot(&pin, &jar, VANILLA_PORT)?;
+    let vworker = std::thread::spawn(move || run_sessions(VANILLA_PORT, protocol));
+    let vdeadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !vworker.is_finished() && std::time::Instant::now() < vdeadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    drop(server);
+    let (v_digger, v_witness) = vworker
+        .join()
+        .map_err(|_| anyhow::anyhow!("vanilla session thread panicked"))??;
+
+    // 3. Doppel sessions. The warm-up sleep puts doppel's tick counter
+    // past the delayed-destroy threshold, matching a booted server.
+    let bin = default_doppel_bin()?;
+    let pin_path = doppel_protocol::pin_path()?;
+    let mut child = Command::new(&bin)
+        .env("DOPPEL_ADDR", "127.0.0.1")
+        .env("DOPPEL_PORT", DOPPEL_PORT.to_string())
+        .env("DOPPEL_PIN", &pin_path)
+        .env("DOPPEL_BLOBS", &blobs_dir)
+        .env("DOPPEL_WORLD", &pristine_world)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("spawning {}", bin.display()))?;
+    wait_for_port(DOPPEL_PORT, Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(10));
+    // Both servers keep an idle-based capture alive with steady traffic
+    // (time pushes, entity tracking at spawn), so this phase carries the
+    // same wall-clock bound as the vanilla one.
+    let worker = std::thread::spawn(move || run_sessions(DOPPEL_PORT, protocol));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let (d_digger, d_witness) = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("doppel session thread panicked"))??;
+
+    let v = analyze(&v_digger, &v_witness);
+    let d = analyze(&d_digger, &d_witness);
+    print_break_summary(&[
+        ("vanilla", &v_digger, &v_witness, &v),
+        ("doppel", &d_digger, &d_witness, &d),
+    ]);
+
+    let mut failures = Vec::new();
+    compare_break_sides(&v, &d, &mut failures);
 
     let compared_pairs =
         order_vote_check(&v_digger, &d_digger, &v_witness, &d_witness, &mut failures);
