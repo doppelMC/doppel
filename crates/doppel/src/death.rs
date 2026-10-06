@@ -123,20 +123,24 @@ impl Game {
     /// bar that reaches zero runs the death sequence. A dead player
     /// takes no further damage.
     pub(crate) fn damage_player(&mut self, conn: ConnId, damage: f32, cause: KillCause) {
-        let health = {
+        let outcome = {
             let Some(p) = self.players.get_mut(&conn) else {
                 return;
             };
             if p.health <= 0.0 {
                 return;
             }
-            p.health = (p.health - damage).max(0.0);
-            p.health
+            if p.health - damage <= 0.0 {
+                // Fatal: kill_player owns the bar and the sequence.
+                None
+            } else {
+                p.health -= damage;
+                Some(p.health)
+            }
         };
-        if health <= 0.0 {
-            self.kill_player(conn, cause);
-        } else {
-            self.send_set_health(conn);
+        match outcome {
+            Some(_) => self.send_set_health(conn),
+            None => self.kill_player(conn, cause),
         }
     }
 
