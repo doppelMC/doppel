@@ -559,8 +559,9 @@ class Bot {
       this.send(SB.container_close, containerCloseBody(this.openContainer));
       this.openContainer = null;
     } else {
-      this.log('chest menu never opened');
-      this.residuals.push('chest open_screen not observed');
+      // A chest that does not open is a broken player path, not a
+      // shortfall to note: the phase goes red.
+      this.fail('container phase: use_item_on on the chest produced no open_screen');
     }
 
     // 6. drop the held stack.
