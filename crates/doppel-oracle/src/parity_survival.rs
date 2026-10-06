@@ -1908,7 +1908,22 @@ fn fall_kinds_match(vk: &[&str], dk: &[&str], vm: usize, dm: usize) -> bool {
     if kind_counts(vp) == kind_counts(dp) && vk[..early] == dk[..early] {
         return true;
     }
-    shared >= 6 && vp[..6] == dp[..6] && mix_within(vp, dp, 1)
+    if shared >= 6 && vp[..6] == dp[..6] && mix_within(vp, dp, 1) {
+        return true;
+    }
+    // The settle marks themselves sit a frame or two apart run to run
+    // (the reference's own captures place them asymmetrically), so each
+    // side's own-mark prefix mixes unequal windows. When the marks stay
+    // within that band, the same mix bound over the window both sides
+    // share up to the earlier mark compares like for like; marks far
+    // apart stay a rhythm difference.
+    if vm.abs_diff(dm) <= 2 {
+        let cut = vm.min(dm);
+        if cut >= 6 && vk[..6] == dk[..6] && mix_within(&vk[..=cut], &dk[..=cut], 1) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Compares the drop fall/slide and rest motion tails, the grass
@@ -2200,6 +2215,14 @@ mod tests {
         assert!(
             fall_kinds_match(&vanilla_a, &vanilla_b, vm, dm),
             "the reference vs itself"
+        );
+        // Asymmetric settle marks: the same observed captures with the
+        // marks placed a few frames apart (the reference's own captures
+        // place them asymmetrically run to run).
+        assert!(fall_kinds_match(&vanilla_a, &doppel, 8, 10), "marks apart");
+        assert!(
+            fall_kinds_match(&vanilla_a, &doppel, 9, 8),
+            "marks apart, flipped"
         );
     }
 
