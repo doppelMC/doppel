@@ -708,6 +708,7 @@ impl Game {
             Inbound::Tp { .. }
             | Inbound::TpNamed { .. }
             | Inbound::Setblock { .. }
+            | Inbound::SetblockRel { .. }
             | Inbound::GameMode { .. }
             | Inbound::Give { .. }
             | Inbound::GameRule { .. }
@@ -834,6 +835,23 @@ impl Game {
             } => {
                 self.setblock(conn, x, y, z, name);
                 self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
+            }
+            Inbound::SetblockRel {
+                conn,
+                x,
+                y,
+                z,
+                name,
+            } => {
+                let Some(p) = self.players.get(&conn) else {
+                    return;
+                };
+                let (px, py, pz) = (p.x, p.y, p.z);
+                let rx = if x.0 { px.floor() as i32 + x.1 } else { x.1 };
+                let ry = if y.0 { py.floor() as i32 + y.1 } else { y.1 };
+                let rz = if z.0 { pz.floor() as i32 + z.1 } else { z.1 };
+                self.setblock(conn, rx, ry, rz, name);
+                self.send_command_feedback(conn, &format!("Changed the block at {rx}, {ry}, {rz}"));
             }
             Inbound::GameMode { conn, mode } => {
                 // The reference's wire order, five frames: the mode
@@ -2932,5 +2950,54 @@ impl wire::WireHost for Game {
     }
     fn dispatch_neighbor_changed(&mut self, x: i32, y: i32, z: i32) {
         self.update_block(x, y, z);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_setblock_resolves_against_the_sender() {
+        let (tx, rx) = std::sync::mpsc::channel::<Inbound>();
+        let mut g = Game::new(rx, None, None);
+        drop(tx);
+        assert!(g.registry_for_test());
+        let flat = doppel_world::worldgen::FlatGenerator::classic(&g.registry_snapshot_for_test())
+            .expect("flat generator");
+        g.seed_chunk_for_test(0, 0, flat.generate(0, 0));
+        let (out_tx, _out_rx) = std::sync::mpsc::channel::<Outbound>();
+        g.join_viewer_for_test(0, &[(0, 0)], out_tx);
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: -60.0,
+            z: 7.5,
+        });
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: (true, 0),
+            y: (true, 1),
+            z: (true, -2),
+            name: "minecraft:stone".into(),
+        });
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: (false, 2),
+            y: (true, 1),
+            z: (true, -2),
+            name: "minecraft:dirt".into(),
+        });
+        g.flush_connections();
+        assert_eq!(
+            g.get_block(5, -59, 5),
+            Some(("minecraft:stone".into(), "".into())),
+            "fully relative placement"
+        );
+        assert_eq!(
+            g.get_block(2, -59, 5),
+            Some(("minecraft:dirt".into(), "".into())),
+            "mixed absolute and relative axes"
+        );
     }
 }

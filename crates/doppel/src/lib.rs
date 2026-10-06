@@ -430,6 +430,22 @@ fn handle_login(
 /// 26.x serverbound ids are stable across the 26.2→26.3 clientbound
 /// shifts. Unknown packets are ignored, matching vanilla's tolerance for
 /// forward-compat channels.
+/// One `setblock` axis: `~`, `~N`, or an absolute coordinate, as
+/// (relative, value).
+fn setblock_axis(part: &str) -> Option<(bool, i32)> {
+    match part.strip_prefix('~') {
+        Some(rest) => {
+            let value = if rest.is_empty() {
+                0
+            } else {
+                rest.parse::<i32>().ok()?
+            };
+            Some((true, value))
+        }
+        None => part.parse::<i32>().ok().map(|v| (false, v)),
+    }
+}
+
 /// The chat-command arm of `play_event`: the harness drivers Doppel
 /// exactly like vanilla, so every command it observes must translate.
 fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound> {
@@ -456,16 +472,25 @@ fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound
         }
     }
     if parts.len() == 5 && parts[0] == "setblock" {
-        if let (Ok(x), Ok(y), Ok(z)) = (
-            parts[1].parse::<i32>(),
-            parts[2].parse::<i32>(),
-            parts[3].parse::<i32>(),
+        if let (Some(x), Some(y), Some(z)) = (
+            setblock_axis(parts[1]),
+            setblock_axis(parts[2]),
+            setblock_axis(parts[3]),
         ) {
+            if x.0 || y.0 || z.0 {
+                return Some(game::Inbound::SetblockRel {
+                    conn,
+                    x,
+                    y,
+                    z,
+                    name: parts[4].to_string(),
+                });
+            }
             return Some(game::Inbound::Setblock {
                 conn,
-                x,
-                y,
-                z,
+                x: x.1,
+                y: y.1,
+                z: z.1,
                 name: parts[4].to_string(),
             });
         }
@@ -976,5 +1001,31 @@ mod tests {
             slots[1..].iter().all(Option::is_none),
             "foreign slot layouts drop instead of indexing wild"
         );
+    }
+
+    #[test]
+    fn relative_setblock_parses() {
+        let frame = |cmd: &str| {
+            let mut body = Vec::new();
+            out_varint(&mut body, cmd.len() as i32);
+            body.extend_from_slice(cmd.as_bytes());
+            chat_command_event(0, Reader::new(&body))
+        };
+        match frame("setblock ~ ~10 ~-3 minecraft:stone") {
+            Some(game::Inbound::SetblockRel { x, y, z, name, .. }) => {
+                assert_eq!(x, (true, 0));
+                assert_eq!(y, (true, 10));
+                assert_eq!(z, (true, -3));
+                assert_eq!(name, "minecraft:stone");
+            }
+            _ => panic!("relative form misparsed"),
+        }
+        match frame("setblock 4 -60 2 minecraft:dirt") {
+            Some(game::Inbound::Setblock { x, y, z, .. }) => {
+                assert_eq!((x, y, z), (4, -60, 2));
+            }
+            _ => panic!("absolute form misparsed"),
+        }
+        assert!(frame("setblock ~x 1 1 minecraft:stone").is_none());
     }
 }

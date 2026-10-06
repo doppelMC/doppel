@@ -57,6 +57,16 @@ pub enum Inbound {
         z: i32,
         name: String,
     },
+    /// `setblock` with relative axes: each axis is (relative, value); a
+    /// relative axis resolves against the sender's feet, a bare `~`
+    /// carries value 0.
+    SetblockRel {
+        conn: ConnId,
+        x: (bool, i32),
+        y: (bool, i32),
+        z: (bool, i32),
+        name: String,
+    },
     /// `tick step N`: run N game ticks now, before any later-queued
     /// commands — vanilla's stepped ticks are the sequencing barrier that
     /// separates a circuit's setup from its power flips.
