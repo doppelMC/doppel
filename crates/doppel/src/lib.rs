@@ -187,8 +187,9 @@ fn saved_container_slots(
 }
 
 /// Rebuilds a player_position (0x49) body with a saved pose, preserving
-/// the teleport id, deltas, and flags. None when the body does not parse
-/// as the absolute form.
+/// the teleport id, deltas, and flags. The reference writes the flags as
+/// a fixed int; they are carried through byte for byte. None when the
+/// body does not parse as the absolute form.
 fn rewrite_position(body: &[u8], pos: [f64; 3], yaw: f32, pitch: f32) -> Option<Vec<u8>> {
     let mut r = Reader::new(body);
     let teleport_id = r.read_varint().ok()?;
@@ -202,8 +203,8 @@ fn rewrite_position(body: &[u8], pos: [f64; 3], yaw: f32, pitch: f32) -> Option<
     }
     r.read_f32().ok()?;
     r.read_f32().ok()?;
-    let flags = r.read_varint().ok()?;
-    if flags != 0 {
+    let flags = r.read_bytes(4).ok()?;
+    if flags != [0, 0, 0, 0] {
         return None;
     }
     let mut out = Vec::with_capacity(body.len());
@@ -216,7 +217,7 @@ fn rewrite_position(body: &[u8], pos: [f64; 3], yaw: f32, pitch: f32) -> Option<
     }
     out.extend_from_slice(&yaw.to_be_bytes());
     out.extend_from_slice(&pitch.to_be_bytes());
-    write_varint(&mut out, flags);
+    out.extend_from_slice(&flags);
     Some(out)
 }
 
@@ -1008,7 +1009,7 @@ mod tests {
         }
         body.extend_from_slice(&yaw.to_be_bytes());
         body.extend_from_slice(&pitch.to_be_bytes());
-        out_varint(&mut body, 0);
+        body.extend_from_slice(&0i32.to_be_bytes());
         body
     }
 
@@ -1016,6 +1017,11 @@ mod tests {
     fn rewrite_position_swaps_pose_and_keeps_shape() {
         let body = position_body(3, 1.0, 2.0, 3.0, 10.0, 20.0);
         let rewritten = rewrite_position(&body, [7.5, -60.0, 9.25], -90.0, 12.5).expect("rewrites");
+        assert_eq!(
+            rewritten.len(),
+            body.len(),
+            "the fixed-int flags keep the body length"
+        );
         let mut r = Reader::new(&rewritten);
         assert_eq!(r.read_varint().unwrap(), 3, "teleport id kept");
         assert_eq!(
@@ -1039,9 +1045,14 @@ mod tests {
             (r.read_f32().unwrap(), r.read_f32().unwrap()),
             (-90.0, 12.5)
         );
-        assert_eq!(r.read_varint().unwrap(), 0, "flags kept");
+        assert_eq!(r.read_bytes(4).unwrap(), vec![0, 0, 0, 0], "flags kept");
         // A truncated body stays untouched.
         assert!(rewrite_position(&body[..8], [0.0; 3], 0.0, 0.0).is_none());
+        // A varint-flags body is not the reference form; it passes
+        // through untouched rather than shrinking.
+        let mut foreign = body[..body.len() - 4].to_vec();
+        foreign.push(0);
+        assert!(rewrite_position(&foreign, [0.0; 3], 0.0, 0.0).is_none());
     }
 
     #[test]

@@ -2750,7 +2750,7 @@ fn capture_doppel(
     let result = (|| -> Result<PassReport> {
         wait_for_port(port, Duration::from_secs(30))?;
         let protocol = doppel_protocol::load_pin()?.protocol.unwrap_or(0);
-        for dir in ["wit", "act", "mob"] {
+        for dir in ["wit", "act", "mob", "rej"] {
             let p = capture_root.join(dir);
             if p.exists() {
                 std::fs::remove_dir_all(&p)?;
@@ -2832,10 +2832,34 @@ fn capture_doppel(
         capture::write_manifest(&witness, &capture_root.join("wit"))?;
         capture::write_manifest(&actor, &capture_root.join("act"))?;
         capture::write_manifest(&mobber, &capture_root.join("mob"))?;
+        // The rejoin: the actor's disconnect saved its playerdata, so a
+        // second join of the same name replays the burst rewritten with
+        // the saved pose - the path the rewritten packets live on.
+        let rej_dir = capture_root.join("rej");
+        if rej_dir.exists() {
+            std::fs::remove_dir_all(&rej_dir)?;
+        }
+        let rejoin = bot::login_capture(
+            "127.0.0.1",
+            port,
+            protocol,
+            &capture::login_start_c("Doppel"),
+            &CaptureOpts {
+                idle_timeout: Some(Duration::from_secs(20)),
+                max_packets: Some(400),
+                dump_dir: Some(&rej_dir),
+                commands: &[],
+                walk_chunks: None,
+                raw_packets: &[],
+            },
+        )
+        .context("capturing rejoin session")?;
+        capture::write_manifest(&rejoin, &rej_dir)?;
         let mut report = PassReport::new();
         run_over_packets(&witness, &capture_root.join("wit"), "witness", &mut report)?;
         run_over_packets(&actor, &capture_root.join("act"), "actor", &mut report)?;
         run_over_packets(&mobber, &capture_root.join("mob"), "mob", &mut report)?;
+        run_over_packets(&rejoin, &rej_dir, "rejoin", &mut report)?;
         Ok(report)
     })();
     let _ = child.kill();
