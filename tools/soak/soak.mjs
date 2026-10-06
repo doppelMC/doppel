@@ -16,6 +16,9 @@ const repoRoot = findRepoRoot(here);
 const soakDir = path.join(repoRoot, 'target', 'soak');
 const isWin = process.platform === 'win32';
 const CONTROL = process.argv[2] || process.env.SOAK_CONTROL || 'none';
+// The booted server, for teardown on failure paths that never reach
+// main()'s own cleanup.
+let server = null;
 
 function findRepoRoot(start) {
   let dir = start;
@@ -343,7 +346,6 @@ async function main() {
   fs.mkdirSync(soakDir, { recursive: true });
 
   const pin = readPin();
-  let server;
 
   if (control === 'vanilla') {
     const jar = await ensureVanillaJar(pin);
@@ -397,17 +399,32 @@ async function main() {
     items: readItems(),
   });
 
-  const watchdog = setInterval(() => {
-    if (stats.lastPacketAt && Date.now() - stats.lastPacketAt > 60000) {
-      log('watchdog: 60s without inbound packets');
-    }
-  }, 5000);
+  // The inbound watchdog participates in the race: a live-socket hang
+  // must go red when it happens, not only if it still holds after the
+  // session resolves.
+  let watchdogClear = null;
+  const watchdogPromise = new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (stats.lastPacketAt && Date.now() - stats.lastPacketAt > 60000) {
+        clearInterval(timer);
+        resolve({
+          status: 'red',
+          phase: stats.phase || 'unknown',
+          error: `watchdog: ${Math.round((Date.now() - stats.lastPacketAt) / 1000)}s without inbound packets`,
+          lastPackets: [],
+          phases: [],
+        });
+      }
+    }, 5000);
+    watchdogClear = () => clearInterval(timer);
+  });
 
   let result;
   let globalTimer;
   try {
     result = await Promise.race([
       sessionPromise,
+      watchdogPromise,
       new Promise((resolve) => {
         globalTimer = setTimeout(() => resolve({
           status: 'red',
@@ -419,7 +436,7 @@ async function main() {
       }),
     ]);
   } finally {
-    clearInterval(watchdog);
+    watchdogClear();
     clearTimeout(globalTimer);
     if (killTimer) {
       clearTimeout(killTimer);
@@ -478,6 +495,9 @@ async function cleanup(code) {
     return;
   }
   cleaned = true;
+  if (server) {
+    killTree(server.child);
+  }
   try {
     await running;
   } catch {}
@@ -490,7 +510,11 @@ process.on('unhandledRejection', (err) => {
 });
 running.catch((err) => {
   console.error(`[soak] ${err.message}`);
-  writeReport({
+  if (server) {
+    killTree(server.child);
+  }
+  try {
+    writeReport({
     status: 'red',
     control: CONTROL,
     phase: 'boot',
@@ -506,6 +530,9 @@ running.catch((err) => {
     serverTail: '(failed before the server booted; see the error above)',
     serverExit: null,
     botLog: [],
-  });
+    });
+  } catch (e) {
+    console.error('[soak] report write failed:', e.message);
+  }
   process.exitCode = 1;
 });

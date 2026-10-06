@@ -304,12 +304,14 @@ class Bot {
     }
     if (name === 'player_position' && body.length >= 4) {
       const [teleportId, off] = readVarint(body, 0);
-      if (body.length >= off + 32) {
+      // id, pos x3, delta x3, yaw, pitch: the rotation sits behind the
+      // three delta doubles.
+      if (body.length >= off + 52) {
         const x = body.readDoubleBE(off);
         const y = body.readDoubleBE(off + 8);
         const z = body.readDoubleBE(off + 16);
-        const yaw = body.readFloatBE(off + 24);
-        const pitch = body.readFloatBE(off + 28);
+        const yaw = body.readFloatBE(off + 48);
+        const pitch = body.readFloatBE(off + 52);
         this.pos = { x, y, z };
         this.groundY = y;
         this.yaw = yaw;
@@ -595,8 +597,8 @@ class Bot {
     }
     this.setPhase('death');
     this.log(`hits taken: ${this.stats.hits} health: ${this.stats.health}`);
-    if (!deathSeen && !this.dead && this.stats.hits < DOWNED_HITS) {
-      this.residuals.push(`zombie phase timed out at ${this.stats.hits} hits`);
+    if (!deathSeen) {
+      this.residuals.push(`zombie phase ended without the death signal (${this.stats.hits} hits, dead=${this.dead})`);
     }
 
     this.setPhase('respawn');
