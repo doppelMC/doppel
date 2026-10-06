@@ -4,6 +4,14 @@
 use crate::game::{ConnId, GameMode, Outbound};
 use std::sync::mpsc::Sender;
 
+/// One `setblock` axis: an absolute block coordinate or a `~` offset
+/// against the sender's feet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetblockAxis {
+    Abs(i32),
+    Rel(f64),
+}
+
 /// Events from connection actors to the game thread.
 pub enum Inbound {
     /// A player finished the join burst; `sent` lists chunks already
@@ -55,6 +63,15 @@ pub enum Inbound {
         x: i32,
         y: i32,
         z: i32,
+        name: String,
+    },
+    /// `setblock` with relative axes: a relative axis resolves against
+    /// the sender's feet with a double offset, a bare `~` carries 0.
+    SetblockRel {
+        conn: ConnId,
+        x: SetblockAxis,
+        y: SetblockAxis,
+        z: SetblockAxis,
         name: String,
     },
     /// `tick step N`: run N game ticks now, before any later-queued

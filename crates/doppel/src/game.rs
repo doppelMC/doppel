@@ -708,6 +708,7 @@ impl Game {
             Inbound::Tp { .. }
             | Inbound::TpNamed { .. }
             | Inbound::Setblock { .. }
+            | Inbound::SetblockRel { .. }
             | Inbound::GameMode { .. }
             | Inbound::Give { .. }
             | Inbound::GameRule { .. }
@@ -834,6 +835,29 @@ impl Game {
             } => {
                 self.setblock(conn, x, y, z, name);
                 self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
+            }
+            Inbound::SetblockRel {
+                conn,
+                x,
+                y,
+                z,
+                name,
+            } => {
+                let Some(p) = self.players.get(&conn) else {
+                    return;
+                };
+                let (px, py, pz) = (p.x, p.y, p.z);
+                let resolve = |axis: crate::events::SetblockAxis, pos: f64| match axis {
+                    crate::events::SetblockAxis::Abs(v) => v,
+                    crate::events::SetblockAxis::Rel(off) => {
+                        (pos + off).floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32
+                    }
+                };
+                let rx = resolve(x, px);
+                let ry = resolve(y, py);
+                let rz = resolve(z, pz);
+                self.setblock(conn, rx, ry, rz, name);
+                self.send_command_feedback(conn, &format!("Changed the block at {rx}, {ry}, {rz}"));
             }
             Inbound::GameMode { conn, mode } => {
                 // The reference's wire order, five frames: the mode
@@ -2932,5 +2956,87 @@ impl wire::WireHost for Game {
     }
     fn dispatch_neighbor_changed(&mut self, x: i32, y: i32, z: i32) {
         self.update_block(x, y, z);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_setblock_resolves_against_the_sender() {
+        use crate::events::SetblockAxis;
+        let (tx, rx) = std::sync::mpsc::channel::<Inbound>();
+        let mut g = Game::new(rx, None, None);
+        drop(tx);
+        assert!(g.registry_for_test());
+        let flat = doppel_world::worldgen::FlatGenerator::classic(&g.registry_snapshot_for_test())
+            .expect("flat generator");
+        g.seed_chunk_for_test(0, 0, flat.generate(0, 0));
+        g.seed_chunk_for_test(-1, -1, flat.generate(-1, -1));
+        let (out_tx, _out_rx) = std::sync::mpsc::channel::<Outbound>();
+        g.join_viewer_for_test(0, &[(0, 0)], out_tx);
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: 5.5,
+            y: -60.0,
+            z: 7.5,
+        });
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: SetblockAxis::Rel(0.0),
+            y: SetblockAxis::Rel(1.0),
+            z: SetblockAxis::Rel(-2.0),
+            name: "minecraft:stone".into(),
+        });
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: SetblockAxis::Abs(2),
+            y: SetblockAxis::Rel(1.0),
+            z: SetblockAxis::Rel(-2.0),
+            name: "minecraft:dirt".into(),
+        });
+        // A fractional offset floors after the add, not before.
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: SetblockAxis::Rel(0.5),
+            y: SetblockAxis::Rel(1.0),
+            z: SetblockAxis::Rel(-2.0),
+            name: "minecraft:cobblestone".into(),
+        });
+        g.handle(Inbound::Tp {
+            conn: 0,
+            x: -0.5,
+            y: -60.0,
+            z: -10.3,
+        });
+        g.handle(Inbound::SetblockRel {
+            conn: 0,
+            x: SetblockAxis::Rel(0.0),
+            y: SetblockAxis::Rel(0.0),
+            z: SetblockAxis::Rel(0.0),
+            name: "minecraft:bedrock".into(),
+        });
+        g.flush_connections();
+        assert_eq!(
+            g.get_block(5, -59, 5),
+            Some(("minecraft:stone".into(), "".into())),
+            "fully relative placement"
+        );
+        assert_eq!(
+            g.get_block(2, -59, 5),
+            Some(("minecraft:dirt".into(), "".into())),
+            "mixed absolute and relative axes"
+        );
+        assert_eq!(
+            g.get_block(6, -59, 5),
+            Some(("minecraft:cobblestone".into(), "".into())),
+            "fractional offset floors after the add: floor(5.5 + 0.5) = 6"
+        );
+        assert_eq!(
+            g.get_block(-1, -60, -11),
+            Some(("minecraft:bedrock".into(), "".into())),
+            "negative fractional feet floor: floor(-0.5) = -1, floor(-10.3) = -11"
+        );
     }
 }

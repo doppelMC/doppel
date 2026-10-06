@@ -29,6 +29,7 @@ use anyhow::{bail, Context, Result};
 use blobs::Blobs;
 use doppel_protocol::{frame_packet, read_packet, write_string, write_varint, Conn, Pin, Reader};
 use doppel_world::WireChunk;
+use events::SetblockAxis;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -469,6 +470,26 @@ fn handle_login(
 /// 26.x serverbound ids are stable across the 26.2→26.3 clientbound
 /// shifts. Unknown packets are ignored, matching vanilla's tolerance for
 /// forward-compat channels.
+/// One `setblock` axis: `~`, `~N`, or an absolute coordinate, as
+/// (relative, value).
+fn setblock_axis(part: &str) -> Option<SetblockAxis> {
+    if let Some(rest) = part.strip_prefix('~') {
+        let value = if rest.is_empty() {
+            0.0
+        } else {
+            if rest.starts_with('+') {
+                return None;
+            }
+            rest.parse::<f64>().ok()?
+        };
+        return Some(SetblockAxis::Rel(value));
+    }
+    if part.starts_with('+') {
+        return None;
+    }
+    part.parse::<i32>().ok().map(SetblockAxis::Abs)
+}
+
 /// The chat-command arm of `play_event`: the harness drivers Doppel
 /// exactly like vanilla, so every command it observes must translate.
 fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound> {
@@ -495,11 +516,27 @@ fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound
         }
     }
     if parts.len() == 5 && parts[0] == "setblock" {
-        if let (Ok(x), Ok(y), Ok(z)) = (
-            parts[1].parse::<i32>(),
-            parts[2].parse::<i32>(),
-            parts[3].parse::<i32>(),
+        if let (Some(x), Some(y), Some(z)) = (
+            setblock_axis(parts[1]),
+            setblock_axis(parts[2]),
+            setblock_axis(parts[3]),
         ) {
+            if matches!(x, SetblockAxis::Rel(_))
+                || matches!(y, SetblockAxis::Rel(_))
+                || matches!(z, SetblockAxis::Rel(_))
+            {
+                return Some(game::Inbound::SetblockRel {
+                    conn,
+                    x,
+                    y,
+                    z,
+                    name: parts[4].to_string(),
+                });
+            }
+            let (SetblockAxis::Abs(x), SetblockAxis::Abs(y), SetblockAxis::Abs(z)) = (x, y, z)
+            else {
+                unreachable!("the relative form returned above")
+            };
             return Some(game::Inbound::Setblock {
                 conn,
                 x,
@@ -1016,5 +1053,41 @@ mod tests {
             slots[1..].iter().all(Option::is_none),
             "foreign slot layouts drop instead of indexing wild"
         );
+    }
+
+    #[test]
+    fn relative_setblock_parses() {
+        use crate::events::SetblockAxis;
+        let frame = |cmd: &str| {
+            let mut body = Vec::new();
+            out_varint(&mut body, cmd.len() as i32);
+            body.extend_from_slice(cmd.as_bytes());
+            chat_command_event(0, Reader::new(&body))
+        };
+        match frame("setblock ~ ~10 ~-3 minecraft:stone") {
+            Some(game::Inbound::SetblockRel { x, y, z, name, .. }) => {
+                assert_eq!(x, SetblockAxis::Rel(0.0));
+                assert_eq!(y, SetblockAxis::Rel(10.0));
+                assert_eq!(z, SetblockAxis::Rel(-3.0));
+                assert_eq!(name, "minecraft:stone");
+            }
+            _ => panic!("relative form misparsed"),
+        }
+        // A fractional offset is legal; an absolute axis must be integral.
+        assert_eq!(
+            setblock_axis("~0.5"),
+            Some(SetblockAxis::Rel(0.5)),
+            "fractional offset"
+        );
+        assert_eq!(setblock_axis("4.5"), None, "fractional absolute");
+        match frame("setblock 4 -60 2 minecraft:dirt") {
+            Some(game::Inbound::Setblock { x, y, z, .. }) => {
+                assert_eq!((x, y, z), (4, -60, 2));
+            }
+            _ => panic!("absolute form misparsed"),
+        }
+        assert!(frame("setblock ~x 1 1 minecraft:stone").is_none());
+        assert!(frame("setblock +4 1 1 minecraft:stone").is_none());
+        assert!(frame("setblock ~+1 1 1 minecraft:stone").is_none());
     }
 }
