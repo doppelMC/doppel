@@ -84,7 +84,7 @@ pub struct Game {
     // pub(crate) for the inventory module's Game hooks (inventory.rs).
     pub(crate) players: std::collections::BTreeMap<ConnId, Player>,
     /// Inverse index: chunk column -> connections tracking it.
-    viewers: std::collections::BTreeMap<(i32, i32), Vec<ConnId>>,
+    pub(crate) viewers: std::collections::BTreeMap<(i32, i32), Vec<ConnId>>,
     inbound: Receiver<Inbound>,
     outbounds: HashMap<ConnId, Sender<Outbound>>,
     /// Frames buffered since the last connection flush (once per tick).
@@ -2332,7 +2332,10 @@ impl Game {
             if let Some(p) = self.players.get_mut(&conn) {
                 p.sent.insert((*x, *z));
             }
-            self.viewers.entry((*x, *z)).or_default().push(conn);
+            let viewers = self.viewers.entry((*x, *z)).or_default();
+            if !viewers.contains(&conn) {
+                viewers.push(conn);
+            }
         }
         let mut finished = Vec::new();
         doppel_protocol::write_varint(&mut finished, loaded.len() as i32);

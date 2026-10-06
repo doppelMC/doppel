@@ -221,10 +221,14 @@ impl Game {
             }
         }
         let count = destroyed.len();
-        // 2. Entity damage and knockback.
+        // 2. Entity damage and knockback. A corpse takes no blast (the
+        // reference's hurt path returns early on a dead entity).
         let double_radius = radius * 2.0;
         let mut struck: Vec<Struck> = Vec::new();
         for (&conn, p) in self.players.iter() {
+            if !crate::death::player_alive(p) {
+                continue;
+            }
             let (dist, exposure) = {
                 let (ddx, ddy, ddz) = (p.x - x, p.y + 0.9 - y, p.z - z);
                 let dist = (ddx * ddx + ddy * ddy + ddz * ddz).sqrt() / double_radius;

@@ -1664,29 +1664,37 @@ impl Game {
             let (zx, zy, zz, zid) = (mob.body.x, mob.body.y, mob.body.z, mob.body.id);
             let damage = mob.kind.attack_damage();
             let killer = mob.kind.display_name();
-            if let Some(p) = self.players.get(&conn) {
-                let (px, pz, pid) = (p.x, p.z, p.entity_id);
-                let yaw = facing_yaw(zx - px, zz - pz);
-                // Sent now, not queued: the death sequence a killing
-                // blow triggers must land after these two frames.
-                self.send_within(
-                    zx,
-                    zy,
-                    zz,
-                    MOB_TRACK_RANGE,
-                    PACKET_DAMAGE_EVENT,
-                    &encode_damage_event(pid, DAMAGE_TYPE_MOB_ATTACK, zid, zid),
-                );
-                self.send_within(
-                    zx,
-                    zy,
-                    zz,
-                    MOB_TRACK_RANGE,
-                    PACKET_HURT_ANIMATION,
-                    &encode_hurt_animation(pid, yaw),
-                );
+            // A corpse takes no hit: no frames, no damage (the
+            // reference's hurt path returns early on a dead entity).
+            let alive = self
+                .players
+                .get(&conn)
+                .is_some_and(crate::death::player_alive);
+            if alive {
+                if let Some(p) = self.players.get(&conn) {
+                    let (px, pz, pid) = (p.x, p.z, p.entity_id);
+                    let yaw = facing_yaw(zx - px, zz - pz);
+                    // Sent now, not queued: the death sequence a killing
+                    // blow triggers must land after these two frames.
+                    self.send_within(
+                        zx,
+                        zy,
+                        zz,
+                        MOB_TRACK_RANGE,
+                        PACKET_DAMAGE_EVENT,
+                        &encode_damage_event(pid, DAMAGE_TYPE_MOB_ATTACK, zid, zid),
+                    );
+                    self.send_within(
+                        zx,
+                        zy,
+                        zz,
+                        MOB_TRACK_RANGE,
+                        PACKET_HURT_ANIMATION,
+                        &encode_hurt_animation(pid, yaw),
+                    );
+                }
+                self.damage_player(conn, damage, crate::death::KillCause::Melee(killer));
             }
-            self.damage_player(conn, damage, crate::death::KillCause::Melee(killer));
         }
         // Look control: the wanted head yaw, else the body yaw, clamped
         // within 75 degrees of the body.

@@ -50,13 +50,13 @@ pub enum KillCause {
 }
 
 impl KillCause {
-    /// The literal death message ("was slain by X" / "was killed"),
-    /// vanilla's translatable form reduced to its rendered text.
+    /// The literal death message, vanilla's translatable forms reduced
+    /// to their rendered text.
     fn message(&self, name: &str) -> String {
         match self {
-            KillCause::Melee(killer) | KillCause::Arrow(killer) | KillCause::Explosion(killer) => {
-                format!("{name} was slain by {killer}")
-            }
+            KillCause::Melee(killer) => format!("{name} was slain by {killer}"),
+            KillCause::Arrow(killer) => format!("{name} was shot by {killer}"),
+            KillCause::Explosion(killer) => format!("{name} was blown up by {killer}"),
             KillCause::KillCommand => format!("{name} was killed"),
         }
     }
@@ -176,15 +176,22 @@ impl Game {
             &encode_player_combat_kill(entity_id, &text),
         );
         self.send(conn, PACKET_SYSTEM_CHAT, &encode_system_chat(&text));
-        if !self.keep_inventory {
-            self.drop_and_clear_inventory(conn, x, y, z);
-        }
+        let held = if self.keep_inventory {
+            Vec::new()
+        } else {
+            self.drop_inventory(conn, x, y, z)
+        };
         self.send(
             conn,
             crate::living::PACKET_ENTITY_EVENT,
             &encode_entity_event(entity_id, EVENT_DEATH),
         );
         self.send(conn, PACKET_SET_HEALTH, &encode_set_health(0.0));
+        // The slot clears trail the sequence, where the reference's
+        // recording places them.
+        if !held.is_empty() {
+            self.clear_inventory(conn, &held);
+        }
         for mob in self.mobs.mobs.iter_mut() {
             if mob.body.target == Some(conn) {
                 mob.body.target = None;
@@ -192,15 +199,15 @@ impl Game {
         }
     }
 
-    /// The default inventory consequence: every non-empty slot spawns
-    /// its stack as an item entity at the death position, then the slot
-    /// clears (one container_set_slot per emptied menu slot). The drop
-    /// scatter skips the reference's random velocities: drops land
-    /// still, deterministic on the wire.
-    fn drop_and_clear_inventory(&mut self, conn: ConnId, x: f64, y: f64, z: f64) {
+    /// The default inventory consequence's first half: every non-empty
+    /// slot spawns its stack as an item entity at the death position.
+    /// Returns the held slots for the clear. The drop scatter skips the
+    /// reference's random velocities: drops land still, deterministic
+    /// on the wire.
+    fn drop_inventory(&mut self, conn: ConnId, x: f64, y: f64, z: f64) -> Vec<(usize, ItemStack)> {
         let held: Vec<(usize, ItemStack)> = {
             let Some(p) = self.players.get(&conn) else {
-                return;
+                return Vec::new();
             };
             (0..crate::inventory::TOTAL_SLOTS)
                 .filter_map(|slot| p.inv.inventory.get(slot).map(|stack| (slot, stack.clone())))
@@ -209,14 +216,20 @@ impl Game {
         for (_, stack) in &held {
             self.spawn_item(x, y, z, (0.0, 0.0, 0.0), 0.0, stack.clone(), None);
         }
-        let state_id = self
+        held
+    }
+
+    /// The consequence's second half: the emptied slots clear, one
+    /// container_set_slot per held menu slot.
+    fn clear_inventory(&mut self, conn: ConnId, held: &[(usize, ItemStack)]) {
+        let Some(state_id) = self
             .players
             .get_mut(&conn)
-            .map(|p| p.inv.session.next_state_id());
-        let Some(state_id) = state_id else {
+            .map(|p| p.inv.session.next_state_id())
+        else {
             return;
         };
-        for (slot, _) in &held {
+        for (slot, _) in held {
             let Some(menu) = container_to_menu(*slot) else {
                 continue;
             };
@@ -224,7 +237,7 @@ impl Game {
             self.send(conn, PACKET_CONTAINER_SET_SLOT, &body);
         }
         if let Some(p) = self.players.get_mut(&conn) {
-            for (slot, _) in &held {
+            for (slot, _) in held {
                 p.inv.inventory.set(*slot, None);
             }
             p.inv.pending_sync.clear();
@@ -302,14 +315,22 @@ impl Game {
         self.send(conn, PACKET_SET_HEALTH, &health);
         // The chunk stream restarts from the spawn view: no cached
         // center, no already-sent set, so the center packet, the batch,
-        // and every entering chunk go out. Item entities re-pair after
-        // the stream (their pairing rides the sent set).
+        // and every entering chunk go out. The viewer index drops the
+        // old sent set first (a stale entry would double-register when
+        // the stream re-enters). Item entities re-pair after the
+        // stream (their pairing rides the sent set).
         {
             let Some(p) = self.players.get_mut(&conn) else {
                 return;
             };
+            let stale: Vec<(i32, i32)> = p.sent.iter().copied().collect();
             p.center = None;
             p.sent.clear();
+            for chunk in stale {
+                if let Some(v) = self.viewers.get_mut(&chunk) {
+                    v.retain(|c| *c != conn);
+                }
+            }
         }
         self.stream_if_moved(conn);
         self.track_player_respawned(conn);
@@ -442,11 +463,11 @@ mod tests {
                 PACKET_SYSTEM_CHAT,
                 crate::game::entities::PACKET_ADD_ENTITY,
                 crate::game::entities::PACKET_SET_ENTITY_DATA,
-                PACKET_CONTAINER_SET_SLOT,
                 crate::living::PACKET_ENTITY_EVENT,
                 PACKET_SET_HEALTH,
+                PACKET_CONTAINER_SET_SLOT,
             ],
-            "dying sequence order"
+            "dying sequence order (clears trail the sequence)"
         );
         let (_, kill) = &frames[0];
         assert_eq!(kill[0], 0x01, "player entity id varint");
@@ -455,7 +476,10 @@ mod tests {
             text.contains("was slain by Zombie"),
             "death message: {text}"
         );
-        let (_, health) = frames.last().unwrap();
+        let (_, health) = frames
+            .iter()
+            .find(|(id, _)| *id == PACKET_SET_HEALTH)
+            .expect("set_health in the dying sequence");
         assert_eq!(&health[..4], &0.0f32.to_be_bytes(), "health 0");
         // The inventory dropped and cleared.
         let got = g
@@ -561,6 +585,48 @@ mod tests {
         g.kill_player(0, KillCause::KillCommand);
         let frames = flush_and_drain(&mut g, &rx);
         assert!(frames.is_empty(), "no second dying sequence");
+    }
+
+    /// A corpse standing on its death drops re-collects nothing: the
+    /// drops stay on the ground until an alive player picks them up.
+    #[test]
+    fn dead_player_picks_up_nothing() {
+        let (mut g, rx) = harness();
+        give_stone(&mut g, 16, &rx);
+        g.damage_player(0, 20.0, KillCause::Melee("Zombie"));
+        let _ = flush_and_drain(&mut g, &rx);
+        assert_eq!(g.survival.items.len(), 1, "the drop is on the ground");
+        // The pickup delay passes with the corpse in range.
+        for _ in 0..12 {
+            g.tick_entities();
+        }
+        assert_eq!(g.survival.items.len(), 1, "the corpse vacuums nothing up");
+        let got = g
+            .player_inv_state_for_test(0)
+            .expect("player")
+            .inventory
+            .get(0);
+        assert!(got.is_none(), "the inventory stays cleared");
+    }
+
+    /// The respawn's chunk restart drops the connection's stale viewer
+    /// entries: a stale entry would double-register when the stream
+    /// re-enters the chunk and duplicate every block broadcast.
+    #[test]
+    fn respawn_prunes_stale_viewer_entries() {
+        let (mut g, rx) = harness();
+        // The join burst's registration, as handle_joined performs it.
+        g.viewers.entry((0, 0)).or_default().push(0);
+        g.damage_player(0, 20.0, KillCause::Melee("Zombie"));
+        let _ = flush_and_drain(&mut g, &rx);
+        g.handle(Inbound::ClientCommand { conn: 0, action: 0 });
+        let _ = flush_and_drain(&mut g, &rx);
+        let stale = g
+            .viewers
+            .get(&(0, 0))
+            .map(|v| v.iter().filter(|c| **c == 0).count())
+            .unwrap_or(0);
+        assert_eq!(stale, 0, "the pre-respawn entry is gone");
     }
 
     /// The kill command drives the same death and respawn cycle.

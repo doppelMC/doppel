@@ -321,14 +321,15 @@ impl Game {
     }
 
     /// Damage and animation for a struck player: the damage event, the
-    /// shared hurt animation along the flight direction, and the
-    /// absorbed-damage counter.
+    /// shared hurt animation along the flight direction, then the
+    /// health bar (death.rs). A corpse takes no hit.
     fn arrow_hit_player(&mut self, owner: i32, damage: f32, at: (f64, f64, f64), yaw: f32) {
         let struck: Vec<(ConnId, i32)> = self
             .players
             .iter()
             .filter(|(_, p)| {
-                (at.0 - p.x).abs() < PLAYER_HALF + ARROW_HALF
+                crate::death::player_alive(p)
+                    && (at.0 - p.x).abs() < PLAYER_HALF + ARROW_HALF
                     && (at.2 - p.z).abs() < PLAYER_HALF + ARROW_HALF
                     && at.1 > p.y - ARROW_HALF
                     && at.1 < p.y + PLAYER_HEIGHT + ARROW_HALF

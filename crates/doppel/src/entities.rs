@@ -1078,7 +1078,10 @@ impl Game {
                 .players
                 .iter()
                 .filter(|(_, p)| {
-                    (p.x - x).abs() < PICKUP_INFLATE_XZ
+                    // A dead player picks nothing up: their death drops
+                    // stay on the ground (death.rs).
+                    crate::death::player_alive(p)
+                        && (p.x - x).abs() < PICKUP_INFLATE_XZ
                         && (p.z - z).abs() < PICKUP_INFLATE_XZ
                         && y < p.y + PICKUP_UP
                         && y + HEIGHT > p.y - PICKUP_DOWN
