@@ -90,7 +90,7 @@ pub struct Game {
     /// True inside a stepped-tick batch: per-tick flushes defer to one
     /// flush after the batch (the reference flushes once per server
     /// cycle, and a step batch is one cycle).
-    flush_suspended: bool,
+    pub(crate) flush_suspended: bool,
     pub(crate) world: Option<std::sync::Arc<std::sync::Mutex<crate::WorldState>>>,
     blobs: Option<std::sync::Arc<Blobs>>,
     /// Per-tick dirty sections: (chunkX, chunkZ, sectionY) -> ordered
@@ -101,7 +101,7 @@ pub struct Game {
     /// Dedup guard for dropped-world-write warnings: (cx, cz, reason).
     warned_writes: std::collections::BTreeSet<(i32, i32, String)>,
     /// `/tick freeze`: wall-clock ticks suspend; steps still run.
-    frozen: bool,
+    pub(crate) frozen: bool,
     /// Flat-world generator: the fallback for chunks the Anvil store does
     /// not have, built from the same registry pins.
     flat: Option<doppel_world::worldgen::FlatGenerator>,
@@ -494,7 +494,7 @@ impl Game {
     /// frames here ride the entity phase instead); entity storage
     /// management; and the per-connection flush after the world tick
     /// (keep-alives sit there; run() sends them right after game_tick).
-    fn game_tick(&mut self) {
+    pub(crate) fn game_tick(&mut self) {
         self.tick += 1;
         self.broadcast_time();
         // Scheduled-tick phase: torch transitions, then the rest of the
@@ -561,7 +561,7 @@ impl Game {
 
     /// set_time (0x73) with one clock entry: the overworld clock (network
     /// id 0) at the stored day time.
-    fn send_set_time(&mut self) {
+    pub(crate) fn send_set_time(&mut self) {
         let game = if self.spawning.time_running {
             self.spawning.total_ticks
         } else {
@@ -789,169 +789,6 @@ impl Game {
         }
     }
 
-    /// The chat commands and their replies. Each arm applies its effect
-    /// and answers with a feedback frame; the oracle harness paces its
-    /// scripted volleys on those replies.
-    fn apply_command(&mut self, event: Inbound) {
-        match event {
-            Inbound::Tp { conn, x, y, z } => {
-                self.teleport_conn(conn, x, y, z);
-                let name = self
-                    .players
-                    .get(&conn)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
-            }
-            Inbound::TpNamed {
-                conn,
-                name,
-                x,
-                y,
-                z,
-            } => {
-                let target = self
-                    .players
-                    .iter()
-                    .find(|(_, p)| p.name == name)
-                    .map(|(&c, _)| c);
-                if let Some(target) = target {
-                    self.teleport_conn(target, x, y, z);
-                }
-                let name = self
-                    .players
-                    .iter()
-                    .find(|(_, p)| p.name == name)
-                    .map(|(_, p)| p.name.clone())
-                    .unwrap_or_default();
-                self.send_command_feedback(conn, &format!("Teleported {name} to {x}, {y}, {z}"));
-            }
-            Inbound::Setblock {
-                conn,
-                x,
-                y,
-                z,
-                name,
-            } => {
-                self.setblock(conn, x, y, z, name);
-                self.send_command_feedback(conn, &format!("Changed the block at {x}, {y}, {z}"));
-            }
-            Inbound::SetblockRel {
-                conn,
-                x,
-                y,
-                z,
-                name,
-            } => {
-                let Some(p) = self.players.get(&conn) else {
-                    return;
-                };
-                let (px, py, pz) = (p.x, p.y, p.z);
-                let resolve = |axis: crate::events::SetblockAxis, pos: f64| match axis {
-                    crate::events::SetblockAxis::Abs(v) => v,
-                    crate::events::SetblockAxis::Rel(off) => {
-                        (pos + off).floor().clamp(i32::MIN as f64, i32::MAX as f64) as i32
-                    }
-                };
-                let rx = resolve(x, px);
-                let ry = resolve(y, py);
-                let rz = resolve(z, pz);
-                self.setblock(conn, rx, ry, rz, name);
-                self.send_command_feedback(conn, &format!("Changed the block at {rx}, {ry}, {rz}"));
-            }
-            Inbound::GameMode { conn, mode } => {
-                // The reference's wire order, five frames: the mode
-                // change itself syncs abilities and broadcasts the
-                // UPDATE_GAME_MODE info update to every player
-                // (changeGameModeForPlayer), then setGameMode sends
-                // game_event followed by the abilities again, and the
-                // command answers its feedback last. A same-mode switch
-                // is refused before any of it: nothing reaches the wire,
-                // not even the command feedback.
-                let (flags, uuid) = {
-                    let Some(p) = self.players.get_mut(&conn) else {
-                        return;
-                    };
-                    if p.inv.mode == mode {
-                        return;
-                    }
-                    p.inv.mode = mode;
-                    p.inv.creative = mode.is_creative();
-                    p.inv.mayfly = matches!(mode, GameMode::Creative | GameMode::Spectator);
-                    if !p.inv.mayfly {
-                        p.inv.flying = false;
-                    } else if mode == GameMode::Spectator {
-                        p.inv.flying = true;
-                    }
-                    (mode.ability_flags(p.inv.flying), p.uuid)
-                };
-                let abilities = crate::inventory::encode_player_abilities(flags, 0.05, 0.1);
-                self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
-                let info = crate::inventory::encode_player_info_update_game_mode(&uuid, mode.id());
-                let conns: Vec<ConnId> = self.players.keys().copied().collect();
-                for c in conns {
-                    self.send(c, crate::inventory::PACKET_PLAYER_INFO_UPDATE, &info);
-                }
-                self.send(
-                    conn,
-                    crate::inventory::PACKET_GAME_EVENT,
-                    &crate::inventory::encode_game_event(
-                        crate::inventory::GAME_EVENT_CHANGE_GAME_MODE,
-                        mode.id() as f32,
-                    ),
-                );
-                self.send(conn, crate::inventory::PACKET_PLAYER_ABILITIES, &abilities);
-                self.send_command_feedback(
-                    conn,
-                    &format!("Set own game mode to {} Mode", mode.name()),
-                );
-            }
-            Inbound::Give { conn, item, count } => {
-                self.give_item(conn, &item, count);
-                self.send_command_feedback(conn, &format!("Gave {count} {item}"));
-            }
-            Inbound::GameRule { conn, tick_speed } => {
-                self.set_tick_speed(tick_speed);
-                self.send_command_feedback(
-                    conn,
-                    &format!("Gamerule randomTickSpeed is now set to: {tick_speed}"),
-                );
-            }
-            Inbound::TimeSet { conn, value } => {
-                self.day_time = value;
-                // The spawn cycle's darkness/burn timelines read the
-                // spawning clock, so the command drives both.
-                self.spawning.day_time = value.rem_euclid(24000) as u64;
-                self.spawning.time_running = true;
-                self.send_set_time();
-                self.send_command_feedback(conn, &format!("Set the time to {value}"));
-            }
-            Inbound::GameRuleNoop { conn } => {
-                self.send_command_feedback(conn, "Gamerule updated");
-            }
-            Inbound::TickStep { conn, steps } => {
-                // Run the stepped ticks inline: commands queued behind this
-                // event in the same channel batch land on later ticks,
-                // matching vanilla's `tick step` barrier. The whole step
-                // batch shares ONE connection flush: stepped ticks execute
-                // inside a single server cycle, and the reference flushes
-                // once after it.
-                self.flush_suspended = true;
-                for _ in 0..steps {
-                    self.game_tick();
-                }
-                self.flush_suspended = false;
-                self.send_command_feedback(conn, "");
-            }
-            Inbound::TickFreeze { conn, frozen } => {
-                self.frozen = frozen;
-                let what = if frozen { "frozen" } else { "resumed" };
-                self.send_command_feedback(conn, &format!("Tick {what}"));
-            }
-            _ => {}
-        }
-    }
-
     /// The join event: register the connection, restore saved player
     /// state when the store has it, and pair the newcomer with every
     /// tracked entity.
@@ -1103,7 +940,7 @@ impl Game {
     /// The first world write: mutate the cached chunk's section, bump its
     /// version, and broadcast one section_blocks_update (0x56) to every
     /// viewer - exactly vanilla's batching (one packet per section per tick).
-    fn setblock(&mut self, _conn: ConnId, x: i32, y: i32, z: i32, name: String) {
+    pub(crate) fn setblock(&mut self, _conn: ConnId, x: i32, y: i32, z: i32, name: String) {
         let Some(state) = self.resolve_state(&name).or_else(|| Self::state_id(&name)) else {
             eprintln!("[game] setblock: unknown block {name}");
             return;
@@ -1206,7 +1043,7 @@ impl Game {
     /// travels as anonymous-root NBT (a literal text is a bare TAG_String)
     /// followed by the overlay bool. The reply pacing of the oracle
     /// harness rides on these frames.
-    fn send_command_feedback(&mut self, conn: ConnId, text: &str) {
+    pub(crate) fn send_command_feedback(&mut self, conn: ConnId, text: &str) {
         let mut body = Vec::with_capacity(text.len() + 8);
         body.push(0x08);
         let n = text.len() as u16;
@@ -1222,7 +1059,7 @@ impl Game {
     /// re-checks pairing before it swaps the tracking view, so a teleport
     /// out and back never re-pairs on its own: the drops stay unpaired
     /// until the player's next move.
-    fn teleport_conn(&mut self, conn: ConnId, x: f64, y: f64, z: f64) {
+    pub(crate) fn teleport_conn(&mut self, conn: ConnId, x: f64, y: f64, z: f64) {
         let Some(p) = self.players.get_mut(&conn) else {
             return;
         };

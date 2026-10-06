@@ -3,6 +3,7 @@
 //! captured from the vanilla oracle.
 
 pub mod blobs;
+pub mod commands;
 pub mod creeper;
 pub mod dig;
 pub mod events;
