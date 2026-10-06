@@ -151,12 +151,17 @@ impl Game {
 
     /// The dying sequence in the reference's order: the combat kill and
     /// its death message, the inventory consequence, the death entity
-    /// event, set_health 0, and every mob target dropped.
+    /// event, set_health 0, and every mob target dropped. A player
+    /// already dead stays dead: no second sequence (the reference's
+    /// hurt path returns early on a dead entity).
     pub(crate) fn kill_player(&mut self, conn: ConnId, cause: KillCause) {
         let (name, entity_id, x, y, z) = {
             let Some(p) = self.players.get_mut(&conn) else {
                 return;
             };
+            if p.health <= 0.0 {
+                return;
+            }
             p.health = 0.0;
             (p.name.clone(), p.entity_id, p.x, p.y, p.z)
         };
@@ -548,6 +553,10 @@ mod tests {
         g.damage_player(0, 3.0, KillCause::Melee("Zombie"));
         let frames = flush_and_drain(&mut g, &rx);
         assert!(frames.is_empty(), "no frames after death");
+        // A kill command on the corpse re-runs nothing either.
+        g.kill_player(0, KillCause::KillCommand);
+        let frames = flush_and_drain(&mut g, &rx);
+        assert!(frames.is_empty(), "no second dying sequence");
     }
 
     /// The kill command drives the same death and respawn cycle.
