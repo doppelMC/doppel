@@ -1,0 +1,16 @@
+{
+  "name": "soak",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phased soak bot and runner against a local doppel or vanilla server",
+  "scripts": {
+    "soak": "node soak.mjs",
+    "soak:kill": "node soak.mjs kill",
+    "soak:vanilla": "node soak.mjs vanilla"
+  },
+  "dependencies": {
+    "minecraft-protocol": "^1.68.0",
+    "mineflayer": "^4.39.0"
+  }
+}
