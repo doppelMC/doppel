@@ -151,7 +151,7 @@ pub struct Game {
     /// Live arrows.
     pub(crate) projectiles: crate::projectile::ProjectileState,
     // --- death hooks (death.rs) ---
-    /// `gamerule keepInventory`: true keeps the inventory off the
+    /// `gamerule keep_inventory`: true keeps the inventory off the
     /// ground on death.
     pub(crate) keep_inventory: bool,
 }

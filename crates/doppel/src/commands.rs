@@ -175,7 +175,7 @@ impl Game {
                 self.keep_inventory = enabled;
                 self.send_command_feedback(
                     conn,
-                    &format!("Gamerule keepInventory is now set to: {enabled}"),
+                    &format!("Gamerule keep_inventory is now set to: {enabled}"),
                 );
             }
             _ => {}

@@ -219,7 +219,7 @@ pub enum Inbound {
     Kill {
         conn: ConnId,
     },
-    /// `gamerule keepInventory <bool>`: the death-drop rule.
+    /// `gamerule keep_inventory <bool>`: the death-drop rule.
     KeepInventory {
         conn: ConnId,
         enabled: bool,

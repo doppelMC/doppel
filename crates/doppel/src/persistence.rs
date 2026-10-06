@@ -103,7 +103,7 @@ impl Game {
                         self.spawning.spawn_mobs = enabled;
                     }
                 }
-                "keepInventory" => {
+                "keep_inventory" => {
                     if let Ok(enabled) = value.parse::<bool>() {
                         self.keep_inventory = enabled;
                     }
@@ -330,7 +330,10 @@ impl Game {
             "spawn_mobs".to_string(),
             self.spawning.spawn_mobs.to_string(),
         );
-        rules.insert("keepInventory".to_string(), self.keep_inventory.to_string());
+        rules.insert(
+            "keep_inventory".to_string(),
+            self.keep_inventory.to_string(),
+        );
         let meta = LevelMeta {
             spawn: self.persistence.spawn,
             day_time: self.day_time,

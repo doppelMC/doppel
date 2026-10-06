@@ -626,8 +626,9 @@ fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound
     {
         return Some(game::Inbound::GameRuleNoop { conn });
     }
-    // `gamerule keepInventory <bool>`: the death-path rule (death.rs).
-    if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "keepInventory" {
+    // `gamerule keep_inventory <bool>`: the death-path rule (death.rs),
+    // parsed under its 26.3 registry id.
+    if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "keep_inventory" {
         if let Ok(enabled) = parts[2].parse::<bool>() {
             return Some(game::Inbound::KeepInventory { conn, enabled });
         }

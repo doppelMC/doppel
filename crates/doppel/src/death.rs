@@ -491,7 +491,7 @@ mod tests {
         assert!(!g.survival.items.is_empty(), "ground drop spawned");
     }
 
-    /// keepInventory=true keeps the inventory off the ground.
+    /// keep_inventory=true keeps the inventory off the ground.
     #[test]
     fn keep_inventory_skips_drops() {
         let (mut g, rx) = harness();
