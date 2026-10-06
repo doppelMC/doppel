@@ -1856,9 +1856,64 @@ fn compare_drop_motion(
 
     compare_drop_tails(v, d, v_walk, d_walk, v_wit, d_wit, v_all, d_all, failures);
 }
-#[allow(clippy::too_many_arguments)]
+
+/// The fall/slide prefix verdict. Exact order when the sequences sit
+/// within a small deletion budget; otherwise the band and mix rules:
+/// the terminal slide's length belongs to each server's own spawn
+/// draw, and the mid-fall sync interleaving is runner-phase coupled on
+/// the reference's side - two of its own captures disagree in that
+/// band, while the establishment front is deterministic. Owner-approved
+/// 2026-10-05 (band and settled-prefix mix) and 2026-10-06 (fall mix:
+/// past a shared six-frame establishment front the fall passes when
+/// the kind mix matches within one frame per kind and one frame of
+/// length).
+fn kind_counts<'a>(k: &[&'a str]) -> std::collections::BTreeMap<&'a str, usize> {
+    let mut m: std::collections::BTreeMap<&str, usize> = Default::default();
+    for x in k {
+        *m.entry(*x).or_default() += 1;
+    }
+    m
+}
+
+fn fall_kinds_match(vk: &[&str], dk: &[&str], vm: usize, dm: usize) -> bool {
+    let (vp, dp) = (&vk[..=vm], &dk[..=dm]);
+    let shared = vp.len().min(dp.len());
+    let early = vm.min(dm);
+    let band_ok = |k: &[&str], m: usize| -> bool {
+        m - early <= 7
+            && k.get(early + 1..m)
+                .is_none_or(|seg| seg.iter().all(|x| *x == "motion"))
+    };
+    let mix_within = |a: &[&str], b: &[&str], tol: usize| -> bool {
+        let (ca, cb) = (kind_counts(a), kind_counts(b));
+        a.len().abs_diff(b.len()) <= tol
+            && ca.iter().all(|(k, n)| {
+                let m = cb.get(k).copied().unwrap_or(0);
+                (*n).saturating_sub(tol) <= m && m <= *n + tol
+            })
+            && cb.iter().all(|(k, n)| {
+                let m = ca.get(k).copied().unwrap_or(0);
+                (*n).saturating_sub(tol) <= m && m <= *n + tol
+            })
+    };
+    if kinds_delete_distance(vp, dp) <= 3 {
+        return true;
+    }
+    if shared >= 8 && vp.len().abs_diff(dp.len()) <= 6 && vp[..shared] == dp[..shared] {
+        return true;
+    }
+    if vm != dm && vk[..early] == dk[..early] && band_ok(vk, vm) && band_ok(dk, dm) {
+        return true;
+    }
+    if kind_counts(vp) == kind_counts(dp) && vk[..early] == dk[..early] {
+        return true;
+    }
+    shared >= 6 && vp[..6] == dp[..6] && mix_within(vp, dp, 1)
+}
+
 /// Compares the drop fall/slide and rest motion tails, the grass
 /// cycles, and the inventory syncs.
+#[allow(clippy::too_many_arguments)]
 fn compare_drop_tails(
     v: &Obs,
     _d: &Obs,
@@ -1926,26 +1981,7 @@ fn compare_drop_tails(
         // passes when the kind MIX matches over the compared prefix and
         // the deterministic establishment front agrees: same kinds, same
         // counts, same opening order, timing-free tail.
-        let (vp, dp) = (&vk[..=vm], &dk[..=dm]);
-        let shared = vp.len().min(dp.len());
-        let early = vm.min(dm);
-        let band_ok = |k: &[&str], m: usize| -> bool {
-            m - early <= 7
-                && k.get(early + 1..m)
-                    .is_none_or(|seg| seg.iter().all(|x| *x == "motion"))
-        };
-        let kind_counts = |k: &[&str]| -> std::collections::BTreeMap<String, usize> {
-            let mut m: std::collections::BTreeMap<String, usize> = Default::default();
-            for x in k {
-                *m.entry((*x).to_string()).or_default() += 1;
-            }
-            m
-        };
-        if kinds_delete_distance(vp, dp) > 3
-            && !(shared >= 8 && vp.len().abs_diff(dp.len()) <= 6 && vp[..shared] == dp[..shared])
-            && !(vm != dm && vk[..early] == dk[..early] && band_ok(&vk, vm) && band_ok(&dk, dm))
-            && !(kind_counts(vp) == kind_counts(dp) && vk[..early] == dk[..early])
-        {
+        if !fall_kinds_match(&vk, &dk, vm, dm) {
             failures.push(format!(
                 "drop {name} witness fall/slide kinds differ: vanilla [{}] vs doppel [{}]",
                 head(&vk),
@@ -2124,5 +2160,76 @@ pub fn parity_survival() -> Result<bool> {
             println!("  {f}");
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The observed CI captures of 2026-10-06: the reference's own two
+    /// runs disagree in the mid-fall band, the establishment front is
+    /// deterministic, and doppel sits inside the mix spread.
+    #[test]
+    fn fall_kinds_tolerance_covers_the_observed_spread() {
+        let vanilla_a: Vec<&str> = [
+            "pos", "motion", "sync", "motion", "sync", "motion", "sync", "motion", "motion",
+            "sync", "motion", "motion",
+        ]
+        .to_vec();
+        let vanilla_b: Vec<&str> = [
+            "pos", "motion", "sync", "motion", "sync", "motion", "motion", "sync", "motion",
+            "motion", "motion", "motion",
+        ]
+        .to_vec();
+        let doppel: Vec<&str> = [
+            "pos", "motion", "sync", "motion", "sync", "motion", "motion", "motion", "motion",
+            "sync", "motion", "pos",
+        ]
+        .to_vec();
+        let vm = 11;
+        let dm = 11;
+        assert!(
+            fall_kinds_match(&vanilla_a, &doppel, vm, dm),
+            "run A vs doppel"
+        );
+        assert!(
+            fall_kinds_match(&vanilla_b, &doppel, vm, dm),
+            "run B vs doppel"
+        );
+        assert!(
+            fall_kinds_match(&vanilla_a, &vanilla_b, vm, dm),
+            "the reference vs itself"
+        );
+    }
+
+    #[test]
+    fn fall_kinds_still_catches_real_rhythm_drift() {
+        let vanilla: Vec<&str> = [
+            "pos", "motion", "sync", "motion", "sync", "motion", "sync", "motion", "motion",
+            "sync", "motion", "motion",
+        ]
+        .to_vec();
+        // Two terminal syncs sits one past the observed reference spread
+        // (3 to 4) and the mix bound: rejected.
+        let drifting: Vec<&str> = [
+            "pos", "motion", "sync", "motion", "sync", "motion", "motion", "motion", "motion",
+            "motion", "motion", "motion",
+        ]
+        .to_vec();
+        assert!(!fall_kinds_match(&vanilla, &drifting, 11, 11));
+        // A much longer fall is a different rhythm, not a phase shift;
+        // its settle mark moves with it.
+        let mut long = vanilla.clone();
+        long.extend(["motion"; 8].to_vec());
+        assert!(!fall_kinds_match(&vanilla, &long, 11, 19));
+        // Syncs gone entirely: neither the deletion budget nor the mix
+        // spread covers it.
+        let nosync: Vec<&str> = [
+            "pos", "motion", "motion", "motion", "motion", "motion", "motion", "motion", "motion",
+            "motion", "motion", "motion",
+        ]
+        .to_vec();
+        assert!(!fall_kinds_match(&vanilla, &nosync, 11, 11));
     }
 }
