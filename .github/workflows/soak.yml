@@ -1,0 +1,52 @@
+name: soak
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  soak:
+    name: soak - phased bot session
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Build
+        run: cargo build --release
+      - name: Pin latest vanilla release
+        run: cargo run --release -p doppel-oracle -- pin
+      - name: Extract block registry
+        run: cargo run --release -p doppel-oracle -- registry
+      - name: Record vanilla login transcript
+        run: cargo run --release -p doppel-oracle -- capture-vanilla-login captures/vanilla-login.jsonl captures/blobs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/soak/package-lock.json
+      - name: Install soak tooling
+        run: npm ci
+        working-directory: tools/soak
+      - name: Run the soak
+        run: SOAK_SECONDS=180 node soak.mjs
+        working-directory: tools/soak
+      - name: Print soak report
+        if: always()
+        run: cat target/soak/report.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-report
+          path: |
+            target/soak/report.json
+            target/soak/report.txt
+            target/soak/server.log
