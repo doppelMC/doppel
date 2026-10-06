@@ -135,7 +135,7 @@ pub(crate) fn capture_clean_blobs(
     let protocol = pin.protocol.unwrap_or(0);
     let v = bot::login_capture(
         "127.0.0.1",
-        VANILLA_PORT,
+        port,
         protocol,
         &login,
         &bot::CaptureOpts {
