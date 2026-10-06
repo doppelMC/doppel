@@ -139,6 +139,10 @@ impl MobKind for Spider {
         ATTACK_DAMAGE
     }
 
+    fn display_name(&self) -> &'static str {
+        "Spider"
+    }
+
     fn follow_range(&self) -> f64 {
         FOLLOW_RANGE
     }

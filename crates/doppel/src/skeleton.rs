@@ -303,6 +303,10 @@ impl MobKind for Skeleton {
         ATTACK_DAMAGE
     }
 
+    fn display_name(&self) -> &'static str {
+        "Skeleton"
+    }
+
     fn follow_range(&self) -> f64 {
         FOLLOW_RANGE
     }

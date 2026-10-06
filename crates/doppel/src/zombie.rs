@@ -80,6 +80,10 @@ impl MobKind for Zombie {
         ATTACK_DAMAGE
     }
 
+    fn display_name(&self) -> &'static str {
+        "Zombie"
+    }
+
     fn follow_range(&self) -> f64 {
         FOLLOW_RANGE
     }

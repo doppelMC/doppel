@@ -252,14 +252,8 @@ impl Game {
             });
         }
         for hit in &struck {
-            self.send_within(
-                x,
-                y,
-                z,
-                BROADCAST,
-                PACKET_HURT_ANIMATION,
-                &encode_hurt_animation(hit.player_id, 0.0),
-            );
+            // The reference's order: damage_event, then hurt_animation,
+            // then the health bar (death.rs).
             self.send_within(
                 x,
                 y,
@@ -268,7 +262,26 @@ impl Game {
                 PACKET_DAMAGE_EVENT,
                 &encode_damage_event(hit.player_id, DAMAGE_TYPE_EXPLOSION, source_id, source_id),
             );
-            *self.mobs.player_damage.entry(hit.conn).or_insert(0.0) += hit.damage;
+            self.send_within(
+                x,
+                y,
+                z,
+                BROADCAST,
+                PACKET_HURT_ANIMATION,
+                &encode_hurt_animation(hit.player_id, 0.0),
+            );
+            let killer = self
+                .mobs
+                .mobs
+                .iter()
+                .find(|m| m.body.id == source_id)
+                .map(|m| m.kind.display_name())
+                .unwrap_or("Creeper");
+            self.damage_player(
+                hit.conn,
+                hit.damage,
+                crate::death::KillCause::Explosion(killer),
+            );
         }
         // Mobs take the same shape (the source is excluded).
         let mob_hits: Vec<(usize, f32, (f64, f64, f64))> = self
@@ -434,7 +447,10 @@ mod tests {
             "the struck player sees the damage event"
         );
         assert!(
-            g.mobs.player_damage.get(&0).copied().unwrap_or(0.0) > 0.0,
+            g.players
+                .get(&0)
+                .map(|p| p.health < crate::death::PLAYER_MAX_HEALTH)
+                .unwrap_or(false),
             "the player absorbs explosion damage"
         );
     }

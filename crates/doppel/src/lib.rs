@@ -5,6 +5,7 @@
 pub mod blobs;
 pub mod commands;
 pub mod creeper;
+pub mod death;
 pub mod dig;
 pub mod events;
 pub mod explosion;
@@ -625,6 +626,18 @@ fn chat_command_event(conn: game::ConnId, mut r: Reader) -> Option<game::Inbound
     {
         return Some(game::Inbound::GameRuleNoop { conn });
     }
+    // `gamerule keepInventory <bool>`: the death-path rule (death.rs).
+    if parts.len() == 3 && parts[0] == "gamerule" && parts[1] == "keepInventory" {
+        if let Ok(enabled) = parts[2].parse::<bool>() {
+            return Some(game::Inbound::KeepInventory { conn, enabled });
+        }
+    }
+    // `kill` / `kill @s`: the sender kills themselves (death.rs).
+    if (parts.len() == 1 && parts[0] == "kill")
+        || (parts.len() == 2 && parts[0] == "kill" && parts[1] == "@s")
+    {
+        return Some(game::Inbound::Kill { conn });
+    }
     // --- containers hooks (containers.rs) ---
     // `opencontainer x y z`: the container test driver.
     if parts.len() == 5 && parts[0] == "opencontainer" {
@@ -761,6 +774,16 @@ fn play_event(conn: game::ConnId, id: i32, body: &[u8]) -> Option<game::Inbound>
                 return None;
             }
             Some(game::Inbound::Punch { conn })
+        }
+        // --- death hooks (death.rs) ---
+        // client_command: one action varint (0 = PERFORM_RESPAWN).
+        0x0c => {
+            let action = r.read_varint().ok()?;
+            if r.remaining() != 0 {
+                eprintln!("[doppel] client_command: {} trailing bytes", r.remaining());
+                return None;
+            }
+            Some(game::Inbound::ClientCommand { conn, action })
         }
         _ => None,
     }

@@ -166,6 +166,10 @@ impl MobKind for Creeper {
         ATTACK_DAMAGE
     }
 
+    fn display_name(&self) -> &'static str {
+        "Creeper"
+    }
+
     fn follow_range(&self) -> f64 {
         FOLLOW_RANGE
     }
@@ -398,7 +402,10 @@ mod tests {
             "the creeper leaves without a corpse"
         );
         assert!(
-            g.mobs.player_damage.get(&0).copied().unwrap_or(0.0) > 0.0,
+            g.players
+                .get(&0)
+                .map(|p| p.health < crate::death::PLAYER_MAX_HEALTH)
+                .unwrap_or(false),
             "the player absorbs the blast"
         );
         assert_eq!(

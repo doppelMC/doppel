@@ -41,9 +41,9 @@ pub(crate) struct Player {
     pub(crate) z: f64,
     pub(crate) yaw: f32,
     pub(crate) pitch: f32,
-    center: Option<(i32, i32)>,
+    pub(crate) center: Option<(i32, i32)>,
     sent: std::collections::HashSet<(i32, i32)>,
-    teleport_id: i32,
+    pub(crate) teleport_id: i32,
     pending_keep_alive: Option<(i64, Instant)>,
     /// When the last challenge was answered; spaces the next one an
     /// interval out instead of firing every tick.
@@ -62,6 +62,8 @@ pub(crate) struct Player {
     /// join counter dig progress runs on (vanilla's per-player
     /// game-mode ticks, not world time).
     pub(crate) dig: crate::dig::PlayerDigState,
+    /// The health bar; 0 means dead (death.rs runs the sequence).
+    pub(crate) health: f32,
     /// The highest interaction sequence awaiting its block_changed_ack
     /// (one coalesced ack per listener tick, like the reference).
     pub(crate) ack_block_changes: Option<i32>,
@@ -148,6 +150,10 @@ pub struct Game {
     // --- projectile hooks (projectile.rs) ---
     /// Live arrows.
     pub(crate) projectiles: crate::projectile::ProjectileState,
+    // --- death hooks (death.rs) ---
+    /// `gamerule keepInventory`: true keeps the inventory off the
+    /// ground on death.
+    pub(crate) keep_inventory: bool,
 }
 
 /// One queued piston block event. `event` is vanilla's TRIGGER_* id:
@@ -287,7 +293,14 @@ pub(crate) const PACKET_PLAYER_POSITION: i32 = 0x49;
 
 /// The player_position (0x49) body: teleport id, position, zero deltas,
 /// rotation, absolute flags.
-fn position_sync_body(teleport_id: i32, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Vec<u8> {
+pub(crate) fn position_sync_body(
+    teleport_id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(42);
     doppel_protocol::write_varint(&mut body, teleport_id);
     body.extend_from_slice(&x.to_be_bytes());
@@ -348,6 +361,7 @@ impl Game {
             spawning: Default::default(),
             persistence: Default::default(),
             projectiles: Default::default(),
+            keep_inventory: false,
         };
         // The flat fallback needs the registry pins; build it once here.
         game.flat = game.registry.as_ref().and_then(|r| {
@@ -687,6 +701,10 @@ impl Game {
                 yaw,
                 pitch,
             } => {
+                // A dead player does not move (death.rs owns the bar).
+                if !self.player_acts(conn) {
+                    return;
+                }
                 if let Some(p) = self.players.get_mut(&conn) {
                     p.x = x;
                     p.y = y;
@@ -715,7 +733,9 @@ impl Game {
             | Inbound::TimeSet { .. }
             | Inbound::GameRuleNoop { .. }
             | Inbound::TickStep { .. }
-            | Inbound::TickFreeze { .. } => self.apply_command(event),
+            | Inbound::TickFreeze { .. }
+            | Inbound::Kill { .. }
+            | Inbound::KeepInventory { .. } => self.apply_command(event),
             Inbound::KeepAliveAnswer { conn, id } => {
                 if let Some(p) = self.players.get_mut(&conn) {
                     if let Some((challenge, _)) = p.pending_keep_alive {
@@ -728,8 +748,16 @@ impl Game {
             }
             // --- inventory hooks (inventory.rs) ---
             Inbound::SetCarriedItem { conn, slot } => self.select_hotbar_slot(conn, slot),
-            Inbound::ContainerClick { conn, click } => self.container_clicked(conn, &click),
+            Inbound::ContainerClick { conn, click } => {
+                if !self.player_acts(conn) {
+                    return;
+                }
+                self.container_clicked(conn, &click);
+            }
             Inbound::CreativeSlot { conn, set } => {
+                if !self.player_acts(conn) {
+                    return;
+                }
                 self.creative_slot(conn, set);
             }
             Inbound::PlayerAbilities { conn, flying } => {
@@ -745,6 +773,9 @@ impl Game {
             }
             // --- placement hooks (placement.rs) ---
             Inbound::Rotated { conn, yaw, pitch } => {
+                if !self.player_acts(conn) {
+                    return;
+                }
                 if let Some(p) = self.players.get_mut(&conn) {
                     p.yaw = yaw;
                     p.pitch = pitch;
@@ -760,11 +791,17 @@ impl Game {
                 sequence,
                 ..
             } => {
+                if !self.player_acts(conn) {
+                    return;
+                }
                 self.ack_block_changes(conn, sequence);
                 self.place_from_hand(conn, x, y, z, face, hand);
             }
             // --- breaking hooks (dig.rs) ---
             Inbound::PlayerAction { conn, act } => {
+                if !self.player_acts(conn) {
+                    return;
+                }
                 // Only the dig family carries a sequence the reference
                 // acks (drops, swaps, and the release do not).
                 if (crate::dig::ACTION_START_DESTROY..=crate::dig::ACTION_STOP_DESTROY)
@@ -786,7 +823,18 @@ impl Game {
                 self.client_closed_container(conn, container_id)
             }
             Inbound::Left { conn } => self.handle_left(conn),
+            // --- death hooks (death.rs) ---
+            Inbound::ClientCommand { conn, action } => self.handle_client_command(conn, action),
         }
+    }
+
+    /// Whether the connection's player exists and can act: a dead
+    /// player gets no movement, interaction, dig, or placement
+    /// processing.
+    fn player_acts(&self, conn: ConnId) -> bool {
+        self.players
+            .get(&conn)
+            .is_some_and(crate::death::player_alive)
     }
 
     /// The join event: register the connection, restore saved player
@@ -839,6 +887,7 @@ impl Game {
                 menu: Default::default(),
                 entity_id,
                 dig: Default::default(),
+                health: crate::death::PLAYER_MAX_HEALTH,
                 ack_block_changes: None,
                 uuid,
             },
@@ -2226,7 +2275,7 @@ impl Game {
     /// center, forgets, then one batch of entering chunks. All decisions
     /// happen up front (single &mut borrow); frames and loads are applied
     /// after the borrow ends.
-    fn stream_if_moved(&mut self, conn: ConnId) {
+    pub(crate) fn stream_if_moved(&mut self, conn: ConnId) {
         let Some(p) = self.players.get_mut(&conn) else {
             return;
         };
@@ -2526,6 +2575,7 @@ impl Game {
                 menu: Default::default(),
                 entity_id,
                 dig: Default::default(),
+                health: crate::death::PLAYER_MAX_HEALTH,
                 ack_block_changes: None,
                 uuid: crate::blobs::offline_uuid("bot"),
             },

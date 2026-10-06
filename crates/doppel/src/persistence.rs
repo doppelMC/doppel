@@ -41,7 +41,7 @@ pub(crate) struct Persistence {
     /// True while a drain is in progress between autosave cadences.
     draining: bool,
     /// Spawn point carried from level.dat.
-    spawn: (i32, i32, i32),
+    pub(crate) spawn: (i32, i32, i32),
     /// Chunks whose conversion failed once; silences repeat warnings.
     failed: BTreeSet<(i32, i32)>,
 }
@@ -101,6 +101,11 @@ impl Game {
                 "spawn_mobs" => {
                     if let Ok(enabled) = value.parse::<bool>() {
                         self.spawning.spawn_mobs = enabled;
+                    }
+                }
+                "keepInventory" => {
+                    if let Ok(enabled) = value.parse::<bool>() {
+                        self.keep_inventory = enabled;
                     }
                 }
                 _ => {}
@@ -325,6 +330,7 @@ impl Game {
             "spawn_mobs".to_string(),
             self.spawning.spawn_mobs.to_string(),
         );
+        rules.insert("keepInventory".to_string(), self.keep_inventory.to_string());
         let meta = LevelMeta {
             spawn: self.persistence.spawn,
             day_time: self.day_time,
@@ -716,7 +722,7 @@ mod tests {
         });
         // Menu slot 36 (hotbar 0) gets 1x stone with max_stack_size 16.
         let set = crate::inventory::parse_set_creative_slot(&[
-            0x00, 0x24, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x00,
+            0x00, 0x24, 0x01, 0x01, 0x01, 0x01, 0x10, 0x00,
         ])
         .unwrap();
         g.handle(Inbound::CreativeSlot { conn: 7, set });

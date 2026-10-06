@@ -209,4 +209,19 @@ pub enum Inbound {
     Left {
         conn: ConnId,
     },
+    // --- death hooks (death.rs) ---
+    /// `client_command`: action 0 is PERFORM_RESPAWN (death.rs).
+    ClientCommand {
+        conn: ConnId,
+        action: i32,
+    },
+    /// `kill` / `kill @s`: the sender kills themselves.
+    Kill {
+        conn: ConnId,
+    },
+    /// `gamerule keepInventory <bool>`: the death-drop rule.
+    KeepInventory {
+        conn: ConnId,
+        enabled: bool,
+    },
 }

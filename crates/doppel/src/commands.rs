@@ -161,6 +161,23 @@ impl Game {
                 let what = if frozen { "frozen" } else { "resumed" };
                 self.send_command_feedback(conn, &format!("Tick {what}"));
             }
+            // --- death hooks (death.rs) ---
+            Inbound::Kill { conn } => {
+                self.kill_player(conn, crate::death::KillCause::KillCommand);
+                let name = self
+                    .players
+                    .get(&conn)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                self.send_command_feedback(conn, &format!("Killed {name}"));
+            }
+            Inbound::KeepInventory { conn, enabled } => {
+                self.keep_inventory = enabled;
+                self.send_command_feedback(
+                    conn,
+                    &format!("Gamerule keepInventory is now set to: {enabled}"),
+                );
+            }
             _ => {}
         }
     }

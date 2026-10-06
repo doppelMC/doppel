@@ -79,9 +79,6 @@ pub const ATTR_MOVEMENT_SPEED: i32 = 26;
 pub const ATTR_MAX_HEALTH: i32 = 23;
 /// The max-health attribute's registry default; the pairing omits it.
 const DEFAULT_MAX_HEALTH: f32 = 20.0;
-/// A player's full health bar; mob melee damage beyond it means the
-/// player is down and no longer a target.
-const PLAYER_HEALTH: f32 = 20.0;
 /// `mob_attack` in the damage-type registry (alphabetical order 28).
 /// TODO wire-verify at the gate.
 pub const DAMAGE_TYPE_MOB_ATTACK: i32 = 28;
@@ -412,13 +409,12 @@ impl GoalCtx<'_> {
         self.world.players.get(&conn).map(|p| (p.x, p.y, p.z))
     }
 
-    /// Whether a player has absorbed a full health bar of mob damage.
+    /// Whether a player is dead (health at or below zero; death.rs).
     fn downed(&self, conn: ConnId) -> bool {
         self.world
-            .mobs
-            .player_damage
+            .players
             .get(&conn)
-            .is_some_and(|d| *d >= PLAYER_HEALTH)
+            .is_none_or(|p| p.health <= 0.0)
     }
 }
 
@@ -952,6 +948,8 @@ pub trait MobKind: Send {
     fn base_speed(&self) -> f64;
     /// The attack-damage attribute.
     fn attack_damage(&self) -> f32;
+    /// The display name a player's death message names as the killer.
+    fn display_name(&self) -> &'static str;
     /// The follow-range attribute.
     fn follow_range(&self) -> f64;
     /// Whether the navigator climbs walls.
@@ -1396,9 +1394,6 @@ pub(crate) struct MobState {
     pub mobs: Vec<Mob>,
     /// Seed for the mob RNG splitmix stream.
     pub seed: u64,
-    /// Mob melee damage absorbed per player; at a full health bar the
-    /// player is down and mobs stop targeting it.
-    pub player_damage: std::collections::BTreeMap<ConnId, f32>,
 }
 
 impl Default for MobState {
@@ -1406,7 +1401,6 @@ impl Default for MobState {
         MobState {
             mobs: Vec::new(),
             seed: 0x5eed_0000,
-            player_damage: Default::default(),
         }
     }
 }
@@ -1664,30 +1658,35 @@ impl Game {
             }
         }
         // A melee hit the goal queued: damage_event to the target plus
-        // the shared hurt_animation, and the damage counts toward the
-        // target's health bar.
+        // the shared hurt_animation (the reference's order), then the
+        // health bar moves (death.rs).
         if let Some(conn) = mob.body.pending_hit.take() {
             let (zx, zy, zz, zid) = (mob.body.x, mob.body.y, mob.body.z, mob.body.id);
             let damage = mob.kind.attack_damage();
+            let killer = mob.kind.display_name();
             if let Some(p) = self.players.get(&conn) {
                 let (px, pz, pid) = (p.x, p.z, p.entity_id);
                 let yaw = facing_yaw(zx - px, zz - pz);
-                frames.push(OutFrame {
-                    x: zx,
-                    y: zy,
-                    z: zz,
-                    id: PACKET_HURT_ANIMATION,
-                    body: encode_hurt_animation(pid, yaw),
-                });
-                frames.push(OutFrame {
-                    x: zx,
-                    y: zy,
-                    z: zz,
-                    id: PACKET_DAMAGE_EVENT,
-                    body: encode_damage_event(pid, DAMAGE_TYPE_MOB_ATTACK, zid, zid),
-                });
+                // Sent now, not queued: the death sequence a killing
+                // blow triggers must land after these two frames.
+                self.send_within(
+                    zx,
+                    zy,
+                    zz,
+                    MOB_TRACK_RANGE,
+                    PACKET_DAMAGE_EVENT,
+                    &encode_damage_event(pid, DAMAGE_TYPE_MOB_ATTACK, zid, zid),
+                );
+                self.send_within(
+                    zx,
+                    zy,
+                    zz,
+                    MOB_TRACK_RANGE,
+                    PACKET_HURT_ANIMATION,
+                    &encode_hurt_animation(pid, yaw),
+                );
             }
-            *self.mobs.player_damage.entry(conn).or_insert(0.0) += damage;
+            self.damage_player(conn, damage, crate::death::KillCause::Melee(killer));
         }
         // Look control: the wanted head yaw, else the body yaw, clamped
         // within 75 degrees of the body.

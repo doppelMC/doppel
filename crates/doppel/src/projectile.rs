@@ -336,14 +336,8 @@ impl Game {
             .map(|(&c, p)| (c, p.entity_id))
             .collect();
         for (conn, pid) in struck {
-            self.send_within(
-                at.0,
-                at.1,
-                at.2,
-                ARROW_TRACK_RANGE,
-                PACKET_HURT_ANIMATION,
-                &encode_hurt_animation(pid, yaw),
-            );
+            // The reference's order: damage_event, then hurt_animation,
+            // then the health bar (death.rs).
             self.send_within(
                 at.0,
                 at.1,
@@ -352,7 +346,22 @@ impl Game {
                 PACKET_DAMAGE_EVENT,
                 &encode_damage_event(pid, DAMAGE_TYPE_ARROW, owner, owner),
             );
-            *self.mobs.player_damage.entry(conn).or_insert(0.0) += damage;
+            self.send_within(
+                at.0,
+                at.1,
+                at.2,
+                ARROW_TRACK_RANGE,
+                PACKET_HURT_ANIMATION,
+                &encode_hurt_animation(pid, yaw),
+            );
+            let killer = self
+                .mobs
+                .mobs
+                .iter()
+                .find(|m| m.body.id == owner)
+                .map(|m| m.kind.display_name())
+                .unwrap_or("Skeleton");
+            self.damage_player(conn, damage, crate::death::KillCause::Arrow(killer));
         }
     }
 }
@@ -535,7 +544,7 @@ mod tests {
             "the hit sends the hurt animation"
         );
         assert!(
-            (g.mobs.player_damage[&0] - 4.0).abs() < 0.5,
+            (g.players[&0].health - 16.0).abs() < 0.5,
             "speed-scaled damage"
         );
     }
