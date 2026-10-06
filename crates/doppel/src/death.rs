@@ -9,7 +9,7 @@ use crate::inventory::{
     encode_player_abilities, ItemStack, PACKET_CONTAINER_SET_CONTENT, PACKET_CONTAINER_SET_SLOT,
     PACKET_GAME_EVENT, PACKET_PLAYER_ABILITIES,
 };
-use crate::living::{encode_entity_event, EVENT_DEATH};
+use crate::living::{encode_entity_event, EVENT_DEATH, MOB_TRACK_RANGE};
 use doppel_protocol::write_varint;
 
 /// `set_health`: registration order 107.
@@ -20,8 +20,6 @@ pub const PACKET_PLAYER_COMBAT_KILL: i32 = 0x45;
 pub const PACKET_RESPAWN: i32 = 0x54;
 /// `system_chat`: registration order 125.
 pub const PACKET_SYSTEM_CHAT: i32 = 0x7c;
-/// `set_chunk_cache_center`: registration order 97.
-const PACKET_SET_CHUNK_CACHE_CENTER: i32 = 0x60;
 
 /// The food level every set_health carries; this build has no hunger
 /// model.
@@ -263,10 +261,24 @@ impl Game {
         self.send(conn, crate::game::PACKET_PLAYER_POSITION, &sync);
         let event = encode_game_event(GAME_EVENT_START_LOADING_CHUNKS, 0.0);
         self.send(conn, PACKET_GAME_EVENT, &event);
-        let mut center = Vec::with_capacity(4);
-        write_varint(&mut center, x.floor().div_euclid(16.0) as i32);
-        write_varint(&mut center, z.floor().div_euclid(16.0) as i32);
-        self.send(conn, PACKET_SET_CHUNK_CACHE_CENTER, &center);
+        // The respawned client wiped its world: the mobs in range re-pair
+        // ahead of the inventory and health reset, like the reference's
+        // add_entity flood.
+        let pairings: Vec<Vec<(i32, Vec<u8>)>> = self
+            .mobs
+            .mobs
+            .iter()
+            .filter(|m| {
+                let (dx, dz) = (m.body.x - x, m.body.z - z);
+                dx * dx + dz * dz <= MOB_TRACK_RANGE * MOB_TRACK_RANGE
+            })
+            .map(|m| m.pairing_frames())
+            .collect();
+        for frames in pairings {
+            for (pid, body) in frames {
+                self.send(conn, pid, &body);
+            }
+        }
         let (state_id, slots) = {
             let Some(p) = self.players.get_mut(&conn) else {
                 return;
@@ -279,10 +291,19 @@ impl Game {
         self.send(conn, PACKET_CONTAINER_SET_CONTENT, &content);
         let health = encode_set_health(PLAYER_MAX_HEALTH);
         self.send(conn, PACKET_SET_HEALTH, &health);
-        if let Some(p) = self.players.get_mut(&conn) {
+        // The chunk stream restarts from the spawn view: no cached
+        // center, no already-sent set, so the center packet, the batch,
+        // and every entering chunk go out. Item entities re-pair after
+        // the stream (their pairing rides the sent set).
+        {
+            let Some(p) = self.players.get_mut(&conn) else {
+                return;
+            };
             p.center = None;
+            p.sent.clear();
         }
         self.stream_if_moved(conn);
+        self.track_player_respawned(conn);
         self.track_player_view(conn);
     }
 }
@@ -478,11 +499,24 @@ mod tests {
             PACKET_RESPAWN,
             crate::game::PACKET_PLAYER_POSITION,
             PACKET_GAME_EVENT,
-            PACKET_SET_CHUNK_CACHE_CENTER,
             PACKET_CONTAINER_SET_CONTENT,
             PACKET_SET_HEALTH,
         ];
         assert_eq!(&ids[..head.len()], &head[..], "respawn sequence order");
+        // The chunk restart follows the health reset: the cache center
+        // rides the stream, then the batch and the entering chunks (the
+        // harness has no world store, so the stream carries the center
+        // packet alone; the soak covers the chunk frames).
+        let i_health = ids
+            .iter()
+            .position(|id| *id == PACKET_SET_HEALTH)
+            .expect("set_health");
+        let rest = &ids[i_health + 1..];
+        assert_eq!(
+            rest.first(),
+            Some(&0x60),
+            "set_chunk_cache_center after the health reset: {ids:?}"
+        );
         let health = frames
             .iter()
             .find(|(id, _)| *id == PACKET_SET_HEALTH)

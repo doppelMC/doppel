@@ -205,6 +205,14 @@ impl Game {
         }
     }
 
+    /// A player respawned: the client wiped its world, so every pairing
+    /// is forgotten; the next view pass re-pairs what is in range.
+    pub(crate) fn track_player_respawned(&mut self, conn: ConnId) {
+        for seen in self.tracking.seen.values_mut() {
+            seen.remove(&conn);
+        }
+    }
+
     /// The fixed-phase flush: re-pair entities that crossed a section,
     /// then sync movement per entity. Entities spawned this tick wait for
     /// the next one (the entity pass runs after this phase); entities

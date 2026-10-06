@@ -42,7 +42,7 @@ pub(crate) struct Player {
     pub(crate) yaw: f32,
     pub(crate) pitch: f32,
     pub(crate) center: Option<(i32, i32)>,
-    sent: std::collections::HashSet<(i32, i32)>,
+    pub(crate) sent: std::collections::HashSet<(i32, i32)>,
     pub(crate) teleport_id: i32,
     pending_keep_alive: Option<(i64, Instant)>,
     /// When the last challenge was answered; spaces the next one an
@@ -139,7 +139,7 @@ pub struct Game {
     pub(crate) survival: entities::SurvivalState,
     // --- tracker hooks (tracker.rs) ---
     /// Per-entity sync state and per-player pairing.
-    tracking: tracker::EntityTrackers, // --- mob hooks (living.rs / spawning.rs) ---
+    pub(crate) tracking: tracker::EntityTrackers, // --- mob hooks (living.rs / spawning.rs) ---
     /// Live mobs and their per-tick sync state.
     pub(crate) mobs: crate::living::MobState,
     /// World time and the natural-spawn state.
