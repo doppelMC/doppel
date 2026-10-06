@@ -393,6 +393,7 @@ class Bot {
       return;
     }
     if (name === 'respawn') {
+      this.respawnSeen = true;
       this.dead = false;
       this.stats.health = null;
       return;
@@ -595,21 +596,36 @@ class Bot {
     if (deathSeen && !this.dead && this.stats.health !== null && this.stats.health > 0) {
       deathSeen = await this.waitFor(() => this.dead, 30000, 'health to reach zero');
     }
-    this.setPhase('death');
     this.log(`hits taken: ${this.stats.hits} health: ${this.stats.health}`);
     // The wait poll and a late hit can land together; re-test before
     // calling it a miss.
     if (!deathSeen && (this.dead || this.stats.hits >= DOWNED_HITS)) {
       deathSeen = true;
     }
-    if (!deathSeen) {
-      this.residuals.push(`zombie phase ended without the death signal (${this.stats.hits} hits, dead=${this.dead})`);
+    // The phase label says what the wire carried: a real death signal,
+    // or (doppel) only the server-side damage tally. No signal at all
+    // leaves the phase list honest and the residual tells the story.
+    if (this.dead) {
+      this.setPhase('death');
+    } else if (this.stats.hits >= DOWNED_HITS) {
+      this.setPhase('death(tally)');
+    } else {
+      this.residuals.push(`zombie phase ended without any death signal (${this.stats.hits} hits)`);
     }
 
-    this.setPhase('respawn');
     await sleep(1000);
     this.send(SB.client_command, clientCommandBody(0)); // PERFORM_RESPAWN
-    await this.waitFor(() => !this.dead, 10000, 'respawn');
+    const respawnConfirmed = await this.waitFor(
+      () => this.respawnSeen && !this.dead,
+      10000,
+      'respawn confirmation',
+    );
+    // Doppel never answers a respawn request: the gesture went out, the
+    // wire stayed quiet.
+    this.setPhase(respawnConfirmed ? 'respawn' : 'respawn(sent)');
+    if (!respawnConfirmed) {
+      this.residuals.push('respawn request sent, no respawn packet received');
+    }
     await sleep(1000);
     this.dead = false;
     // A vanilla respawn lands at world spawn; walk-area coordinates only
