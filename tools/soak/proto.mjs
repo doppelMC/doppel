@@ -517,19 +517,20 @@ export function playerAbilitiesBody(flying) {
 }
 
 // set_creative_mode_slot writing a bare stack to a menu slot: i16 slot,
-// presence byte, then the stack (count varint, item varint, empty
-// component patch). Menu numbering: 0 is the crafting result, 36+ the
-// hotbar.
+// then the untrusted stack codec (count varint, 0 = empty; item varint;
+// patch +count/-count). No presence byte. Menu numbering: 0 is the
+// crafting result, 36+ the hotbar.
 export function creativeSetBody(menuSlot, itemId, count) {
   const b = [];
   const slot = Buffer.alloc(2);
   slot.writeInt16BE(menuSlot, 0);
   b.push(...slot);
-  b.push(1); // stack present
   writeVarint(b, count);
-  writeVarint(b, itemId);
-  writeVarint(b, 0); // patch: no added components
-  writeVarint(b, 0); // patch: no removed components
+  if (count > 0) {
+    writeVarint(b, itemId);
+    writeVarint(b, 0); // patch: no added components
+    writeVarint(b, 0); // patch: no removed components
+  }
   return Buffer.from(b);
 }
 

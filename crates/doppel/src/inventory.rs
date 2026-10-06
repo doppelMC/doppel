@@ -840,13 +840,9 @@ pub struct CreativeSlotSet {
 pub fn parse_set_creative_slot(body: &[u8]) -> Result<CreativeSlotSet> {
     let mut r = Reader::new(body);
     let slot = read_i16(&mut r)?;
-    // The nullable stack codec: a presence boolean, then the stack.
-    let present = r.read_u8().context("stack presence")?;
-    let stack = if present != 0 {
-        decode_item_stack(&mut r)?
-    } else {
-        None
-    };
+    // The untrusted optional stack codec: a count varint (0 = empty),
+    // then item and patch. No presence byte.
+    let stack = decode_item_stack(&mut r)?;
     if r.remaining() != 0 {
         bail!("trailing bytes in set_creative_mode_slot");
     }
@@ -2110,7 +2106,7 @@ mod tests {
             mode: crate::game::GameMode::Survival,
         });
         while rx.try_recv().is_ok() {}
-        let survival_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
+        let survival_set = parse_set_creative_slot(&[0, 36, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot {
             conn: 0,
             set: survival_set,
@@ -2126,7 +2122,7 @@ mod tests {
             conn: 0,
             mode: crate::game::GameMode::Creative,
         });
-        let creative_set = parse_set_creative_slot(&[0, 36, 1, 1, 1, 0, 0]).unwrap();
+        let creative_set = parse_set_creative_slot(&[0, 36, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot {
             conn: 0,
             set: creative_set,
@@ -2334,7 +2330,7 @@ mod tests {
             mode: crate::game::GameMode::Creative,
         });
         while rx.try_recv().is_ok() {}
-        let over = parse_set_creative_slot(&[0, 36, 1, 65, 1, 0, 0]).unwrap();
+        let over = parse_set_creative_slot(&[0, 36, 65, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot { conn: 0, set: over });
         assert!(
             g.player_inv_state_for_test(0)
@@ -2344,7 +2340,7 @@ mod tests {
                 .is_none(),
             "over-count push rejected"
         );
-        let zero = parse_set_creative_slot(&[0, 0, 1, 1, 1, 0, 0]).unwrap();
+        let zero = parse_set_creative_slot(&[0, 0, 1, 1, 0, 0]).unwrap();
         g.handle(Inbound::CreativeSlot { conn: 0, set: zero });
         // Slot 0 never writes; nothing observable to check beyond no panic.
     }
