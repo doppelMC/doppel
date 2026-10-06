@@ -597,6 +597,11 @@ class Bot {
     }
     this.setPhase('death');
     this.log(`hits taken: ${this.stats.hits} health: ${this.stats.health}`);
+    // The wait poll and a late hit can land together; re-test before
+    // calling it a miss.
+    if (!deathSeen && (this.dead || this.stats.hits >= DOWNED_HITS)) {
+      deathSeen = true;
+    }
     if (!deathSeen) {
       this.residuals.push(`zombie phase ended without the death signal (${this.stats.hits} hits, dead=${this.dead})`);
     }
