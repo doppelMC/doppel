@@ -1053,6 +1053,31 @@ mod tests {
         let mut foreign = body[..body.len() - 4].to_vec();
         foreign.push(0);
         assert!(rewrite_position(&foreign, [0.0; 3], 0.0, 0.0).is_none());
+        // A real captured reference frame, when the local blob set
+        // exists: hand-built fixtures can inherit the author's
+        // misunderstanding, captured bytes cannot.
+        let blobs =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/vanilla/blobs");
+        if blobs.join("manifest.json").is_file() {
+            let manifest: Vec<serde_json::Value> = serde_json::from_str(
+                &std::fs::read_to_string(blobs.join("manifest.json")).unwrap(),
+            )
+            .unwrap();
+            for e in &manifest {
+                if e["id"].as_i64() != Some(0x49) {
+                    continue;
+                }
+                let file = e["file"].as_str().unwrap();
+                let captured = std::fs::read(blobs.join(file)).unwrap();
+                let rewritten = rewrite_position(&captured, [7.5, -60.0, 9.25], 0.0, 0.0)
+                    .expect("captured form rewrites");
+                assert_eq!(
+                    rewritten.len(),
+                    captured.len(),
+                    "the rewrite must not resize a captured body"
+                );
+            }
+        }
     }
 
     #[test]
