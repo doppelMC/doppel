@@ -35,6 +35,8 @@ class Bot {
     this.stats.hits = 0;
     this.stats.health = null;
     this.stats.deaths = 0;
+    this.stats.afterRespawnPackets = 0;
+    this.stats.movesAfterRespawn = 0;
 
     this.phaseList = [];
     this.lastPackets = [];
@@ -59,6 +61,12 @@ class Bot {
     this.sequence = 100;
     this.flying = false;
     this.residuals = [];
+    // Respawn observation: the frame-order window opens when the
+    // respawn gesture goes out and closes on the health reset.
+    this.awaitingRespawn = false;
+    this.respawnOrder = [];
+    this.respawnDone = false;
+    this.respawnAt = 0;
 
     this.client = new Client(this.host, this.port, 'Doppel');
   }
@@ -201,11 +209,17 @@ class Bot {
       if (this.lookSweep) {
         this.lookSweep();
         this.send(SB.move_player_rot, rotBody(this.yaw, this.pitch, groundFlag(this)));
+        if (this.respawnDone) {
+          this.stats.movesAfterRespawn += 1;
+        }
       } else if (moved) {
         this.send(
           SB.move_player_pos_rot,
           moveBody(this.pos.x, this.pos.y, this.pos.z, this.yaw, this.pitch, groundFlag(this)),
         );
+        if (this.respawnDone) {
+          this.stats.movesAfterRespawn += 1;
+        }
       }
     }
     this.send(SB.client_tick_end, Buffer.alloc(0));
@@ -295,6 +309,12 @@ class Bot {
 
   onPacket(id, name, body) {
     this.recordPacket(name);
+    if (this.respawnDone) {
+      this.stats.afterRespawnPackets += 1;
+    }
+    if (this.awaitingRespawn) {
+      this.respawnOrder.push(name);
+    }
     if (name === 'system_chat') {
       for (const w of this.chatWaiters.splice(0)) {
         clearTimeout(w.timer);
@@ -332,6 +352,26 @@ class Bot {
         this.stats.deaths += 1;
         this.stopMovement();
         this.log('death screen: health 0');
+      }
+      if (this.awaitingRespawn && health > 0) {
+        // The respawn window closes on the health reset; the order of
+        // the frames inside it is the assertion.
+        this.awaitingRespawn = false;
+        this.respawnDone = true;
+        this.respawnAt = now();
+        const order = this.respawnOrder;
+        const iRespawn = order.indexOf('respawn');
+        const iPosition = order.indexOf('player_position');
+        const iHealth = order.indexOf('set_health');
+        if (iRespawn < 0 || iPosition < 0 || iHealth < 0) {
+          this.fail(`respawn sequence incomplete: [${order.join(', ')}]`);
+        } else if (!(iRespawn < iPosition && iPosition < iHealth)) {
+          this.fail(`respawn frame order wrong: respawn@${iRespawn} position@${iPosition} set_health@${iHealth} in [${order.join(', ')}]`);
+        } else if (health < 20) {
+          this.fail(`respawn set health ${health}, not the full bar`);
+        } else {
+          this.log(`respawn frame order ok: [${order.join(', ')}]`);
+        }
       }
       return;
     }
@@ -603,29 +643,27 @@ class Bot {
     if (!deathSeen && (this.dead || this.stats.hits >= DOWNED_HITS)) {
       deathSeen = true;
     }
-    // The phase label says what the wire carried: a real death signal,
-    // or (doppel) only the server-side damage tally. No signal at all
-    // leaves the phase list honest and the residual tells the story.
+    // The death must be on the wire: set_health reaching 0. A tally
+    // without the signal is a broken player path, not a shortfall.
     if (this.dead) {
       this.setPhase('death');
-    } else if (this.stats.hits >= DOWNED_HITS) {
-      this.setPhase('death(tally)');
     } else {
-      this.residuals.push(`zombie phase ended without any death signal (${this.stats.hits} hits)`);
+      this.setPhase('death(tally)');
+      this.fail(`zombie phase ended without set_health 0 (${this.stats.hits} hits, health ${this.stats.health})`);
     }
 
     await sleep(1000);
+    this.awaitingRespawn = true;
+    this.respawnOrder = [];
     this.send(SB.client_command, clientCommandBody(0)); // PERFORM_RESPAWN
     const respawnConfirmed = await this.waitFor(
       () => this.respawnSeen && !this.dead,
       10000,
       'respawn confirmation',
     );
-    // Doppel never answers a respawn request: the gesture went out, the
-    // wire stayed quiet.
     this.setPhase(respawnConfirmed ? 'respawn' : 'respawn(sent)');
     if (!respawnConfirmed) {
-      this.residuals.push('respawn request sent, no respawn packet received');
+      this.fail('respawn request sent, no respawn packet received');
     }
     await sleep(1000);
     this.dead = false;
@@ -656,6 +694,22 @@ class Bot {
       this.digStop(target);
       this.useOn(target.x, -61, target.z);
       await sleep(800);
+    }
+    // Play must continue after respawn: further inbound packets, real
+    // moves, and at least 5 s of it.
+    if (this.respawnDone && !this.red) {
+      const playedS = ((now() - this.respawnAt) / 1000).toFixed(1);
+      this.log(
+        `post-respawn play: ${this.stats.afterRespawnPackets} packets, ` +
+        `${this.stats.movesAfterRespawn} moves, ${playedS}s`,
+      );
+      if (this.stats.afterRespawnPackets === 0) {
+        this.fail('no packets received after respawn');
+      } else if (this.stats.movesAfterRespawn === 0) {
+        this.fail('no moves sent after respawn');
+      } else if (now() - this.respawnAt < 5000) {
+        this.fail(`only ${playedS}s of play after respawn`);
+      }
     }
   }
 

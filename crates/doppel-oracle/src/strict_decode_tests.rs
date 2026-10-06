@@ -67,6 +67,53 @@ fn system_chat_roundtrip() {
 }
 
 #[test]
+fn player_combat_kill_roundtrip() {
+    // The literal-text form Doppel emits: the player's entity id, then
+    // the anonymous-root TAG_String component (no overlay byte).
+    let mut b = Vec::new();
+    write_varint(&mut b, 1);
+    b.push(0x08);
+    let text = b"Doppel was slain by Zombie";
+    b.extend_from_slice(&(text.len() as u16).to_be_bytes());
+    b.extend_from_slice(text);
+    body_ok(Phase::Play, 0x45, &b);
+    // The reference's styled form: an anonymous-root compound with a
+    // "with" list of hover/click compounds and an insertion string.
+    let mut b = Vec::new();
+    write_varint(&mut b, 94);
+    b.push(0x0a);
+    b.extend_from_slice(&[0x09, 0x00, 0x04]);
+    b.extend_from_slice(b"with");
+    b.push(0x0a);
+    b.extend_from_slice(&2i32.to_be_bytes());
+    for text in ["Zombie", "Doppel"] {
+        // List entries are bare compound payloads: no tag id, no name.
+        b.extend_from_slice(&[0x08, 0x00, 0x04]);
+        b.extend_from_slice(b"text");
+        b.extend_from_slice(&(text.len() as u16).to_be_bytes());
+        b.extend_from_slice(text.as_bytes());
+        b.push(0x00);
+    }
+    b.push(0x08);
+    b.extend_from_slice(&[0x00, 0x09]);
+    b.extend_from_slice(b"insertion");
+    b.extend_from_slice(&6u16.to_be_bytes());
+    b.extend_from_slice(b"Doppel");
+    b.push(0x00);
+    body_ok(Phase::Play, 0x45, &b);
+    // Corrupted variants: truncation inside the component, a trailing
+    // byte, and a bad component root tag.
+    body_fails(Phase::Play, 0x45, &b[..b.len() - 2]);
+    let mut padded = b.clone();
+    padded.push(0x00);
+    body_fails(Phase::Play, 0x45, &padded);
+    let mut bad = Vec::new();
+    write_varint(&mut bad, 1);
+    bad.push(0x7f);
+    body_fails(Phase::Play, 0x45, &bad);
+}
+
+#[test]
 fn keep_alive_roundtrip() {
     let b = 0x0064_6f70_7065_6c01i64.to_be_bytes();
     body_ok(Phase::Play, 0x2d, &b);
