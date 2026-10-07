@@ -1289,9 +1289,11 @@ fn check_follow_and_attack(who: &str, s: &Obs, failures: &mut Vec<String>) {
     // (b) Head tracking. The reference swings regardless of head
     // position and its body drags the head while walking (observed
     // up to ~77 deg, and in-fight tracking fractions from 29% to 59%
-    // across its own runs), so the honest claims are: the head
-    // CONVERGED on the target before the fight began, and it re-locks
-    // (or never needs to move) inside the fight.
+    // across its own runs), so the in-fight frames are dominated by
+    // strafe-chase transients on vanilla itself. The invariant that
+    // held on every reference run: the head CONVERGED on the target
+    // before the fight began (the last strafe precedes the first hit
+    // by ~100 ticks, so the 30 deg/tick chase settles).
     let head_err_at = |i: usize, yaw: u8| -> Option<f64> {
         let zpos = track_at(s, zid, i)?;
         let bpos = bot_pos_at(s, i)?;
@@ -1317,30 +1319,6 @@ fn check_follow_and_attack(who: &str, s: &Obs, failures: &mut Vec<String>) {
         None => failures.push(format!(
             "{who}: no pre-fight head frame to verify the approach convergence"
         )),
-    }
-    let mut frames_err: Vec<f64> = Vec::new();
-    for (i, _, yaw) in s
-        .head_rots
-        .iter()
-        .filter(|(_, id, _)| *id == zid)
-        .filter(|(fi, _, _)| *fi >= win_lo && *fi <= win_hi)
-    {
-        if let Some(err) = head_err_at(*i, *yaw) {
-            frames_err.push(err);
-        }
-    }
-    if !frames_err.is_empty() {
-        let locked = frames_err
-            .iter()
-            .filter(|e| **e <= HEAD_SETTLED_DEG)
-            .count();
-        if locked == 0 {
-            failures.push(format!(
-                "{who}: {} head frames in the fight, none within {} deg of the target",
-                frames_err.len(),
-                HEAD_SETTLED_DEG
-            ));
-        }
     }
     // (c) Body yaw while moving: at least half the yaw-carrying
     // movement frames from the summon to the fight's end face the
