@@ -89,7 +89,10 @@ impl MobKind for Zombie {
     }
 
     fn register_goals(&self, goals: &mut GoalSelector, targets: &mut GoalSelector) {
-        goals.add(3, Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, true)));
+        goals.add(
+            3,
+            Box::new(ChaseHitGoal::new(REACH, FOLLOW_RANGE, true).with_arm_pulse()),
+        );
         goals.add(
             7,
             Box::new(IdleStrollGoal::new(

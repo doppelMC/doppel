@@ -165,9 +165,9 @@ const LOOK_SPEED_DEFAULT: f32 = 10.0;
 /// Head-turn speed while the attack goal steers (the melee goal's
 /// setLookAt(target, 30, 30)).
 pub const LOOK_SPEED_ATTACK: f32 = 30.0;
-/// Head-to-body pull per tick while the navigation runs (the look
-/// control's rotateIfNecessary cap).
-const HEAD_BODY_PULL: f32 = 75.0;
+/// The head's freedom from the body while the navigation runs (the
+/// look control's rotateIfNecessary window).
+const HEAD_BODY_WINDOW: f32 = 75.0;
 /// Player eye height above the feet.
 pub const PLAYER_EYE: f64 = 1.62;
 /// The climb rise per tick while pressed against a wall.
@@ -342,9 +342,10 @@ pub fn encode_equipment(entity_id: i32, slots: &[(u8, &crate::inventory::ItemSta
     body
 }
 
-/// Degrees packed to the wire byte: `deg * 256 / 360`.
+/// Degrees packed to the wire byte: floor(deg * 256 / 360) in the
+/// low byte, the reference's packDegrees.
 pub fn pack_degrees(deg: f32) -> u8 {
-    (deg * 256.0 / 360.0) as i8 as u8
+    ((deg * 256.0 / 360.0).floor() as i64 & 0xff) as u8
 }
 
 /// Whether the sight line between two eye points is clear.
@@ -855,6 +856,9 @@ pub(crate) struct ChaseHitGoal {
     target: Option<ConnId>,
     last_path: (f64, f64),
     repath_in: i32,
+    raise_arm_ticks: i32,
+    /// The zombie's per-attack arm pulse on the aggressive datum.
+    pulse_arms: bool,
 }
 
 impl ChaseHitGoal {
@@ -868,12 +872,24 @@ impl ChaseHitGoal {
             target: None,
             last_path: (0.0, 0.0),
             repath_in: 0,
+            raise_arm_ticks: 0,
+            pulse_arms: false,
         }
+    }
+
+    /// The zombie's attack goal pulses its arms per attack cycle.
+    pub(crate) fn with_arm_pulse(mut self) -> ChaseHitGoal {
+        self.pulse_arms = true;
+        self
     }
 }
 
-/// Attack cooldown, in ticks (the 20-tick interval halved).
-const MELEE_COOLDOWN: i32 = 10;
+/// Attack cooldown, in ticks: the reference's resetAttackCooldown
+/// (adjustedTickDelay leaves the 20 unhalted for every-tick goals).
+const MELEE_COOLDOWN: i32 = 20;
+/// The canUse recheck gate, in full-cadence passes (the reference's
+/// 20 game ticks over the two-tick selector cadence).
+const CAN_USE_CHECK_PASSES: i32 = 10;
 
 impl Goal for ChaseHitGoal {
     fn flags(&self) -> GoalFlags {
@@ -885,7 +901,7 @@ impl Goal for ChaseHitGoal {
             self.check_in -= 1;
             return false;
         }
-        self.check_in = MELEE_COOLDOWN;
+        self.check_in = CAN_USE_CHECK_PASSES;
         let Some(conn) = ctx.body.target else {
             return false;
         };
@@ -910,8 +926,11 @@ impl Goal for ChaseHitGoal {
     }
 
     fn start(&mut self, ctx: &mut GoalCtx) {
-        self.cooldown = MELEE_COOLDOWN;
-        ctx.body.melee_active = true;
+        // The reference's start clears the attack cooldown: the first
+        // hit lands as soon as reach and sight allow.
+        self.cooldown = 0;
+        self.raise_arm_ticks = 0;
+        ctx.body.melee_active = !self.pulse_arms;
         if let Some((x, _, z)) = ctx.body.target.and_then(|conn| ctx.player_pos(conn)) {
             self.last_path = (x, z);
             ctx.body.nav.move_to(x, z, 1.0);
@@ -936,16 +955,23 @@ impl Goal for ChaseHitGoal {
         let (look_yaw, look_pitch) =
             look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, (px, py, pz)));
         ctx.body.look = Some((look_yaw, look_pitch, LOOK_SPEED_ATTACK));
+        // The zombie pulses its arms: raised once the raise counter
+        // spends and the cooldown crosses into the interval's second
+        // half, dropped after every swing.
+        self.raise_arm_ticks += 1;
+        if self.pulse_arms {
+            ctx.body.melee_active = self.raise_arm_ticks >= 5 && self.cooldown < MELEE_COOLDOWN / 2;
+        }
         // Re-path when the target moved a block or on the 5% roll,
         // gated by the reference's recalculation window (4 + rand(7)
-        // goal ticks, halved for the every-other-tick cadence).
+        // goal ticks, unhalted for the every-tick goal).
         self.repath_in -= 1;
         let moved = (px - self.last_path.0) * (px - self.last_path.0)
             + (pz - self.last_path.1) * (pz - self.last_path.1);
         if self.repath_in <= 0 && (moved >= 1.0 || ctx.below(20) == 0) {
             self.last_path = (px, pz);
             ctx.body.nav.retarget(px, pz, 1.0);
-            self.repath_in = 2 + ctx.below(4) as i32;
+            self.repath_in = 4 + ctx.below(7) as i32;
         }
         let (dy, horiz) = (
             py + PLAYER_EYE - eye_of(ctx.body).1,
@@ -1438,7 +1464,8 @@ fn step_mob(
     }
 }
 
-/// Chases `want` from `now` by at most `step` degrees on the circle.
+/// Chases `want` from `now` by at most `step` degrees on the circle,
+/// returning a wrapped angle.
 fn rotate_towards(now: f32, want: f32, step: f32) -> f32 {
     let mut diff = (want - now + 180.0).rem_euclid(360.0) - 180.0;
     if diff > step {
@@ -1447,7 +1474,12 @@ fn rotate_towards(now: f32, want: f32, step: f32) -> f32 {
     if diff < -step {
         diff = -step;
     }
-    now + diff
+    (now + diff + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// The absolute angular gap between two angles on the circle.
+fn angle_gap(a: f32, b: f32) -> f32 {
+    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
 }
 
 /// The yaw that faces `dx`, `dz` (the standard packed-degree sense).
@@ -1792,8 +1824,10 @@ impl Game {
         // Look control: the head chases the wanted yaw at the goal's
         // speed, or the body yaw at the default speed when nothing
         // steers; the pitch resets to zero first, the reference's
-        // per-tick reset. While the navigation runs, the head is then
-        // pulled toward the body at 75/tick.
+        // per-tick reset. While the navigation runs, the head then
+        // clamps inside the 75-degree body window (the reference's
+        // rotateIfNecessary: no movement within the window, exactly to
+        // its edge beyond it).
         let (want_yaw, want_pitch, look_speed) =
             mob.body
                 .look
@@ -1819,7 +1853,10 @@ impl Game {
             }
         }
         if mob.body.nav.in_progress() {
-            mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, HEAD_BODY_PULL);
+            let over = angle_gap(mob.body.head_yaw, mob.body.yaw) - HEAD_BODY_WINDOW;
+            if over > 0.0 {
+                mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, over);
+            }
         }
         let half = mob.kind.half_width();
         let height = mob.kind.height();

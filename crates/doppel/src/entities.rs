@@ -129,10 +129,11 @@ pub fn encode_lp_movement(buf: &mut Vec<u8>, x: f64, y: f64, z: f64) {
     }
 }
 
-/// Degrees packed to the wire byte: `deg * 256 / 360`, truncated and
-/// wrapped through the low 8 bits (180 degrees lands on 128, not 127).
+/// Degrees packed to the wire byte: floor(deg * 256 / 360) wrapped
+/// through the low 8 bits (the reference's packDegrees; 180 degrees
+/// lands on 128, not 127).
 fn pack_degrees(deg: f32) -> u8 {
-    ((deg * 256.0 / 360.0) as i64 & 0xff) as u8
+    ((deg * 256.0 / 360.0).floor() as i64 & 0xff) as u8
 }
 
 /// `add_entity`: id, uuid, type, position, movement, rotations, data.

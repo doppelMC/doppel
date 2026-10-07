@@ -398,51 +398,6 @@ fn decode_movement_packet(id: i32, i: usize, raw: &[u8], obs: &mut Obs) {
                 }
             }
         }
-        _ => {}
-    }
-}
-
-/// Decodes the state and event frames: entity data, attributes,
-/// damage, swings, equipment, blasts, block updates, removals.
-fn decode_state_packet(id: i32, i: usize, raw: &[u8], obs: &mut Obs) {
-    let mut o = 0usize;
-    match id {
-        // set_entity_data: id, then entries until the 0xff
-        // terminator. INT values ride as varints; FLOAT as be4.
-        // Entries batch (the creeper's swell follows its flags),
-        // so every entry decodes, not just the leading one.
-        P_SET_ENTITY_DATA => {
-            if let Some(id) = rd_varint(raw, &mut o) {
-                while let Some(&accessor) = raw.get(o) {
-                    if accessor == 0xff {
-                        break;
-                    }
-                    o += 1;
-                    let Some(ser) = rd_varint(raw, &mut o) else {
-                        break;
-                    };
-                    let value = match ser {
-                        3 => rd_f32(raw, &mut o),
-                        1 => rd_varint(raw, &mut o).map(|v| v as f32),
-                        // BYTE and BOOLEAN both ride single bytes.
-                        0 | 8 => raw.get(o).map(|v| {
-                            o += 1;
-                            f32::from(*v)
-                        }),
-                        _ => None,
-                    };
-                    obs.data.push((i, id, accessor, ser, value));
-                }
-            }
-        }
-        // update_attributes: id, then the attribute list.
-        P_UPDATE_ATTRIBUTES => {
-            if let Some(id) = rd_varint(raw, &mut o) {
-                if let Some(attrs) = rd_attrs(raw, &mut o) {
-                    obs.attrs.push((id, attrs));
-                }
-            }
-        }
         // entity_position_sync: id, path kind, pos, yaw, pitch, ...
         P_ENTITY_POSITION_SYNC => {
             if let (Some(id), Some(kind)) = (rd_varint(raw, &mut o), rd_varint(raw, &mut o)) {
@@ -520,6 +475,51 @@ fn decode_state_packet(id: i32, i: usize, raw: &[u8], obs: &mut Obs) {
                 if let (Some(_ground), Some(yaw)) = (raw.get(o), raw.get(o + 1)) {
                     obs.body_yaws.push((i, id, *yaw));
                     obs.deltas.push((i, id, 0.0, 0.0, 0.0, true));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decodes the state and event frames: entity data, attributes,
+/// damage, swings, equipment, blasts, block updates, removals.
+fn decode_state_packet(id: i32, i: usize, raw: &[u8], obs: &mut Obs) {
+    let mut o = 0usize;
+    match id {
+        // set_entity_data: id, then entries until the 0xff
+        // terminator. INT values ride as varints; FLOAT as be4.
+        // Entries batch (the creeper's swell follows its flags),
+        // so every entry decodes, not just the leading one.
+        P_SET_ENTITY_DATA => {
+            if let Some(id) = rd_varint(raw, &mut o) {
+                while let Some(&accessor) = raw.get(o) {
+                    if accessor == 0xff {
+                        break;
+                    }
+                    o += 1;
+                    let Some(ser) = rd_varint(raw, &mut o) else {
+                        break;
+                    };
+                    let value = match ser {
+                        3 => rd_f32(raw, &mut o),
+                        1 => rd_varint(raw, &mut o).map(|v| v as f32),
+                        // BYTE and BOOLEAN both ride single bytes.
+                        0 | 8 => raw.get(o).map(|v| {
+                            o += 1;
+                            f32::from(*v)
+                        }),
+                        _ => None,
+                    };
+                    obs.data.push((i, id, accessor, ser, value));
+                }
+            }
+        }
+        // update_attributes: id, then the attribute list.
+        P_UPDATE_ATTRIBUTES => {
+            if let Some(id) = rd_varint(raw, &mut o) {
+                if let Some(attrs) = rd_attrs(raw, &mut o) {
+                    obs.attrs.push((id, attrs));
                 }
             }
         }

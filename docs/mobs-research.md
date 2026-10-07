@@ -1077,6 +1077,28 @@ doubled as a damage-type probe; second run at midnight, clean):
 - The mob-flags datum (accessor 15, BYTE) flipped 0 -> 4 when the
   attack goal started (before the first hit) and back to 0 when the
   target dropped.
+- The mob-flags datum (accessor 15, BYTE) on the ZOMBIE pulses per
+  attack cycle: the ZombieAttackGoal wrapper drops the arms after
+  every swing and raises them again once raiseArmTicks >= 5 and the
+  cooldown crosses into the interval's second half (the captures
+  show repeated 0 -> 4 -> 0 -> 4 flips through one chase). The
+  melee/bow goals of the other mobs hold the bit for the goal's
+  lifetime. The tier-1 review caught doppel holding the zombie's bit
+  constant; fixed with the per-attack pulse.
+- The melee cooldown is 20 SERVER ticks, not 10:
+  Goal.adjustedTickDelay returns ticks UNCHANGED for every-tick
+  goals (the ceilDiv-2 halving applies only to goals that sleep
+  between full passes), and MeleeAttackGoal requires every tick.
+  The capture's hit spacing (minimum ~21 packets between mob_attack
+  frames, well above a 10-tick gap's packet budget) confirms it.
+  The canUse recheck gate is likewise 20 game ticks, and the re-path
+  window is 4 + rand(7) goal ticks. All three corrected after the
+  tier-1 review.
+- Mth.packDegrees is floor(deg * 256/360) wrapped through the low
+  byte - floor, not truncation; wrapping, not saturation. The stored
+  angles must stay wrapped or multi-revolution movement saturates
+  the packed byte (review finding; rotate_towards now wraps its
+  result, both packers floor).
 - rotate_head (0x55): 19 frames across the chase - only when the
   packed head byte changed, riding interval-3 sync ticks. The head
   converges on the target bearing: errors reach 90+ deg mid-turn
@@ -1131,8 +1153,12 @@ goals every 2nd tick) is longer, so hits swing 1:1.
   pitch cap 40) and the pitch chases likewise, resetting to 0 first
   each tick (`resetXRotOnTick`). With no look set the head chases the
   BODY yaw at 10/tick. While the navigation is not done, the head is
-  then pulled toward the body yaw at up to 75/tick
-  (`rotateIfNecessary`, a step cap, not a window clamp).
+  then clamped INSIDE the 75-degree body window
+  (`Mth.rotateIfNecessary` = target minus clamp(degreesDifference,
+  +/-max): no movement within the window, exactly to its edge beyond
+  it - a window clamp, not a step; a step-based pull snaps the head
+  onto the body whenever the gap is under the cap, which is exactly
+  the staring-past-the-player bug).
 - `BodyRotationControl`: while the entity moves (delta^2 >
   2.5e-7), body yaw snaps to the entity yaw and the head is pulled
   toward the body at 75/tick; idle, the body rotates toward the head
