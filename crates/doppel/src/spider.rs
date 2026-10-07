@@ -375,8 +375,9 @@ mod tests {
         g.flush_connections();
         assert_eq!(g.mobs.mobs[0].kind.type_id(), ENTITY_TYPE_SPIDER);
         let frames = drain(&rx);
-        // The spider's snapshot carries max_health 16 beside the
-        // movement speed: id, count, (attr, f64, no modifiers) pairs.
+        // The spider's snapshot carries movement speed alone: even the
+        // off-default max health (16) stays off the reference's
+        // pairing (id, count, (attr, f64, no modifiers) pairs).
         let attrs = frames
             .iter()
             .find(|(id, _)| *id == crate::living::PACKET_UPDATE_ATTRIBUTES)
@@ -398,7 +399,7 @@ mod tests {
         };
         rd_varint(&attrs, &mut i);
         let count = rd_varint(&attrs, &mut i);
-        assert_eq!(count, 2, "two non-default attributes");
+        assert_eq!(count, 1, "movement speed alone pairs");
         let mut seen = Vec::new();
         for _ in 0..count {
             let attr = rd_varint(&attrs, &mut i);
@@ -410,10 +411,6 @@ mod tests {
             assert_eq!(mods, 0, "no modifiers");
             seen.push((attr, value));
         }
-        assert!(
-            seen.contains(&(crate::living::ATTR_MAX_HEALTH, 16.0)),
-            "max_health 16: {seen:?}"
-        );
         assert!(
             seen.contains(&(crate::living::ATTR_MOVEMENT_SPEED, 0.3)),
             "movement_speed 0.3: {seen:?}"

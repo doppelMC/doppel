@@ -16,37 +16,52 @@ use doppel_protocol::write_varint;
 // Wire packet ids (clientbound play state)
 // ---------------------------------------------------------------------
 
-/// `damage_event`: registration order 26. TODO wire-verify at the gate.
+/// `damage_event`: registration order 26. Wire-verified by the
+/// follow-and-attack capture (mob_attack hits land typed 28).
 pub const PACKET_DAMAGE_EVENT: i32 = 0x19;
-/// `entity_event`: registration order 35. TODO wire-verify at the gate.
+/// `entity_event`: registration order 35. Wire-verified by the
+/// follow-and-attack capture (the burn and death events flow 0x22).
 pub const PACKET_ENTITY_EVENT: i32 = 0x22;
-/// `hurt_animation`: registration order 44. TODO wire-verify at the gate.
+/// `hurt_animation`: registration order 44. Wire-verified by the
+/// follow-and-attack capture (one frame per landed hit).
 pub const PACKET_HURT_ANIMATION: i32 = 0x2b;
+/// `swing_animation`: registration order 124. Wire-verified by the
+/// follow-and-attack capture: one frame per landed melee hit, sent
+/// before the damage frames, hand 0, WHACK, duration 6.
+pub const PACKET_SWING_ANIMATION: i32 = 0x7b;
+/// The bare-hand swing animation type (WHACK in the animation enum).
+const SWING_ANIM_WHACK: i32 = 1;
+/// The bare-hand swing duration, in ticks.
+const SWING_DURATION: i32 = 6;
 /// `move_entity_rot`: registration order 58. Body: id, on-ground bool,
 /// packed yaw, packed pitch (the reference's Rot codec order).
+/// Verified: the summon capture's rotation-only frames.
 pub const PACKET_MOVE_ENTITY_ROT: i32 = 0x39;
-/// `rotate_head`: registration order 86. TODO wire-verify at the gate.
+/// `rotate_head`: registration order 86. Verified: the
+/// follow-and-attack capture's head frames.
 pub const PACKET_ROTATE_HEAD: i32 = 0x55;
 /// `set_equipment`: registration order 105. Bare mobs send none (the
-/// packet only carries non-empty slots).
+/// packet only carries non-empty slots). Verified: the summon capture
+/// pairs only the skeleton's bow.
 pub const PACKET_SET_EQUIPMENT: i32 = 0x68;
 /// Equipment slot ordinals (declaration order): main hand.
 pub const EQUIP_MAIN_HAND: u8 = 0;
-/// `update_attributes`: registration order 135. TODO wire-verify at the
-/// gate.
+/// `update_attributes`: registration order 135. Verified: pairing
+/// frames carry the movement-speed attribute (the mobs gate asserts
+/// it).
 pub const PACKET_UPDATE_ATTRIBUTES: i32 = 0x86;
 
 /// `minecraft:zombie` in the entity-type registry (registration order
-/// 155, 0-based). TODO wire-verify at the gate.
+/// 155, 0-based). Verified: the follow-and-attack capture's add frame.
 pub const ENTITY_TYPE_ZOMBIE: i32 = 154;
-/// `minecraft:skeleton` (registration order 119, 0-based).
-/// TODO wire-verify at the gate.
+/// `minecraft:skeleton` (registration order 119, 0-based). Verified:
+/// the summon capture's add frame.
 pub const ENTITY_TYPE_SKELETON: i32 = 118;
-/// `minecraft:creeper` (registration order 33, 0-based).
-/// TODO wire-verify at the gate.
+/// `minecraft:creeper` (registration order 33, 0-based). Verified:
+/// the summon capture's add frame.
 pub const ENTITY_TYPE_CREEPER: i32 = 32;
-/// `minecraft:spider` (registration order 128, 0-based).
-/// TODO wire-verify at the gate.
+/// `minecraft:spider` (registration order 128, 0-based). Verified:
+/// the summon capture's add frame.
 pub const ENTITY_TYPE_SPIDER: i32 = 127;
 
 // ---------------------------------------------------------------------
@@ -59,8 +74,14 @@ pub const SER_BYTE: i32 = 0;
 pub const SER_INT: i32 = 1;
 /// Entity-data serializer ids (registration order): FLOAT.
 pub const SER_FLOAT: i32 = 3;
+/// Entity-data serializer id (registration order): BOOLEAN. The
+/// registration block registers it ninth, before ROTATIONS; the field
+/// declaration order in the reference differs.
+pub const SER_BOOLEAN: i32 = 8;
 /// The base entity flags accessor; bit 0x01 = on fire.
 pub const DATA_ENTITY_FLAGS: u8 = 0;
+/// The living flags accessor; bit 0x01 = using an item (the bow draw).
+pub const DATA_LIVING_FLAGS: u8 = 8;
 /// The health accessor on the living hierarchy (serializer FLOAT).
 pub const DATA_LIVING_HEALTH: u8 = 9;
 /// The mob flags accessor; bit 0x04 = aggressive.
@@ -72,16 +93,16 @@ pub const DATA_CLIMBING_FLAGS: u8 = 16;
 pub const DATA_SWELL_DIR: u8 = 16;
 
 /// `movement_speed` in the attribute registry (alphabetical
-/// registration); wire-verified: the reference's zombie snapshot carries
-/// it alone (default-valued attributes are omitted).
+/// registration); wire-verified: the reference's mob snapshots carry
+/// it alone, the spider's off-default max health included on the
+/// omission.
 pub const ATTR_MOVEMENT_SPEED: i32 = 26;
-/// `max_health` in the attribute registry (alphabetical registration).
-/// TODO wire-verify at the gate.
+/// `max_health` in the attribute registry (alphabetical registration,
+/// decompile count). Never rides this build's wire: the reference's
+/// mob pairings carry movement speed alone.
 pub const ATTR_MAX_HEALTH: i32 = 23;
-/// The max-health attribute's registry default; the pairing omits it.
-const DEFAULT_MAX_HEALTH: f32 = 20.0;
 /// `mob_attack` in the damage-type registry (alphabetical order 28).
-/// TODO wire-verify at the gate.
+/// Verified: the follow-and-attack capture's melee hits arrive typed 28.
 pub const DAMAGE_TYPE_MOB_ATTACK: i32 = 28;
 
 /// The entity-data entries a bare mob pairs with: only health sits off
@@ -113,6 +134,9 @@ const JUMP_DELAY: i32 = 10;
 pub const MOB_TRACK_RANGE: f64 = 128.0;
 /// Movement sync cadence: the tracker updateInterval for mob types.
 const SYNC_INTERVAL: i64 = 3;
+/// A position packet rides at least this often, moving or not (the
+/// reference's tickCount % 60 heartbeat).
+const HEARTBEAT_INTERVAL: i64 = 60;
 /// Ticks without a full sync before the next movement sends as one.
 const TELEPORT_DELAY_MAX: i64 = 400;
 /// Movement deltas are 1/4096-block shorts.
@@ -135,6 +159,15 @@ const DESPAWN_ROLL: u64 = 800;
 const DEATH_TICKS: i32 = 20;
 /// Body-yaw turn cap per tick (the move control's 90 degrees).
 const TURN_RATE: f32 = 90.0;
+/// Head-turn speed while a plain look goal steers (the look control's
+/// default head rotation speed).
+const LOOK_SPEED_DEFAULT: f32 = 10.0;
+/// Head-turn speed while the attack goal steers (the melee goal's
+/// setLookAt(target, 30, 30)).
+pub const LOOK_SPEED_ATTACK: f32 = 30.0;
+/// Head-to-body pull per tick while the navigation runs (the look
+/// control's rotateIfNecessary cap).
+const HEAD_BODY_PULL: f32 = 75.0;
 /// Player eye height above the feet.
 pub const PLAYER_EYE: f64 = 1.62;
 /// The climb rise per tick while pressed against a wall.
@@ -154,9 +187,6 @@ pub fn encode_float_data(entity_id: i32, accessor: u8, value: f32) -> Vec<u8> {
     body.push(0xff);
     body
 }
-
-/// Entity-data serializer ids (registration order): BOOLEAN.
-pub const SER_BOOLEAN: i32 = 8;
 
 /// `set_entity_data` for an int entry (the swell direction). Int
 /// values ride the entity-data channel as varints.
@@ -285,6 +315,17 @@ pub fn encode_damage_event(entity_id: i32, damage_type: i32, cause: i32, direct:
     write_varint(&mut body, direct + 1);
     // No source position.
     body.push(0);
+    body
+}
+
+/// `swing_animation`: the attacker, main hand, the bare-hand WHACK
+/// animation, its 6-tick duration.
+pub fn encode_swing_animation(entity_id: i32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8);
+    write_varint(&mut body, entity_id);
+    write_varint(&mut body, 0);
+    write_varint(&mut body, SWING_ANIM_WHACK);
+    write_varint(&mut body, SWING_DURATION);
     body
 }
 
@@ -662,7 +703,8 @@ impl Goal for WatchPlayerGoal {
         self.remaining -= 1;
         if let Some(conn) = self.conn {
             if let Some(pos) = ctx.player_pos(conn) {
-                ctx.body.look = Some(look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, pos)));
+                let (yaw, pitch) = look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, pos));
+                ctx.body.look = Some((yaw, pitch, LOOK_SPEED_DEFAULT));
             }
         }
     }
@@ -715,7 +757,7 @@ impl Goal for GlanceGoal {
 
     fn tick(&mut self, ctx: &mut GoalCtx) {
         self.remaining -= 1;
-        ctx.body.look = Some(self.want);
+        ctx.body.look = Some((self.want.0, self.want.1, LOOK_SPEED_DEFAULT));
     }
 }
 
@@ -812,6 +854,7 @@ pub(crate) struct ChaseHitGoal {
     cooldown: i32,
     target: Option<ConnId>,
     last_path: (f64, f64),
+    repath_in: i32,
 }
 
 impl ChaseHitGoal {
@@ -824,6 +867,7 @@ impl ChaseHitGoal {
             cooldown: 0,
             target: None,
             last_path: (0.0, 0.0),
+            repath_in: 0,
         }
     }
 }
@@ -889,24 +933,33 @@ impl Goal for ChaseHitGoal {
         let Some((px, py, pz)) = ctx.player_pos(conn) else {
             return;
         };
-        ctx.body.look = Some(look_angles(
-            eye_of(ctx.body),
-            eye_at(PLAYER_EYE, (px, py, pz)),
-        ));
-        // Re-path when the target moved a block or on the 5% roll.
+        let (look_yaw, look_pitch) =
+            look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, (px, py, pz)));
+        ctx.body.look = Some((look_yaw, look_pitch, LOOK_SPEED_ATTACK));
+        // Re-path when the target moved a block or on the 5% roll,
+        // gated by the reference's recalculation window (4 + rand(7)
+        // goal ticks, halved for the every-other-tick cadence).
+        self.repath_in -= 1;
         let moved = (px - self.last_path.0) * (px - self.last_path.0)
             + (pz - self.last_path.1) * (pz - self.last_path.1);
-        if moved >= 1.0 || ctx.below(20) == 0 {
+        if self.repath_in <= 0 && (moved >= 1.0 || ctx.below(20) == 0) {
             self.last_path = (px, pz);
             ctx.body.nav.retarget(px, pz, 1.0);
-        }
-        if !self.hits || self.cooldown > 0 {
-            return;
+            self.repath_in = 2 + ctx.below(4) as i32;
         }
         let (dy, horiz) = (
             py + PLAYER_EYE - eye_of(ctx.body).1,
             ((px - ctx.body.x) * (px - ctx.body.x) + (pz - ctx.body.z) * (pz - ctx.body.z)).sqrt(),
         );
+        // The reference's path ends inside the melee window and the
+        // navigation completes there: the attacker stands at reach,
+        // which also frees the head from the walk's body drag.
+        if horiz < self.reach * 0.95 {
+            ctx.body.nav.stop();
+        }
+        if self.cooldown > 0 {
+            return;
+        }
         if horiz >= self.reach || dy.abs() > 2.5 {
             return;
         }
@@ -917,7 +970,13 @@ impl Goal for ChaseHitGoal {
         ) {
             return;
         }
-        ctx.body.pending_hit = Some(conn);
+        // The approach-only variant swings without landing damage (the
+        // creeper's overridden attack).
+        if self.hits {
+            ctx.body.pending_hit = Some(conn);
+        } else {
+            ctx.body.pending_swing = true;
+        }
         self.cooldown = MELEE_COOLDOWN;
     }
 
@@ -1010,14 +1069,21 @@ pub struct MobBody {
     pub jump_cooldown: i32,
     /// The current navigation.
     pub nav: crate::pathing::Nav,
-    /// The wanted look yaw/pitch, when a goal steers the head.
-    pub look: Option<(f32, f32)>,
+    /// The wanted look yaw/pitch plus the head-turn speed, when a goal
+    /// steers the head.
+    pub look: Option<(f32, f32, f32)>,
+    /// Whether an item use is in progress (the living flags' using
+    /// bit; the skeleton's bow draw).
+    pub using_item: bool,
     /// The targeted player connection.
     pub target: Option<ConnId>,
     /// Whether the melee goal holds the move lock.
     pub melee_active: bool,
     /// A melee hit awaiting the wire send.
     pub pending_hit: Option<ConnId>,
+    /// A swing without damage awaiting the wire send (the creeper's
+    /// approach).
+    pub pending_swing: bool,
     /// A bow shot awaiting the spawn: the target and the draw power.
     pub pending_shot: Option<(ConnId, f64)>,
     /// A detonation awaiting the blast: the radius.
@@ -1062,9 +1128,11 @@ impl MobBody {
             jump_cooldown: 0,
             nav: crate::pathing::Nav::new(),
             look: None,
+            using_item: false,
             target: None,
             melee_active: false,
             pending_hit: None,
+            pending_swing: false,
             pending_shot: None,
             pending_blast: None,
             horiz_collided: false,
@@ -1100,6 +1168,8 @@ pub struct Mob {
     sync_phase: i64,
     /// The last sent entity/mob flag bytes.
     sent_flags: (u8, u8),
+    /// The last sent living flags byte.
+    sent_living: u8,
     /// The last sent climbing state.
     sent_climbing: bool,
     /// The last sent swell direction.
@@ -1144,6 +1214,7 @@ impl Mob {
             teleport_delay: 0,
             sync_phase: 0,
             sent_flags: (0, 0),
+            sent_living: 0,
             sent_climbing: false,
             sent_swell: -1,
         }
@@ -1159,13 +1230,11 @@ impl Mob {
     }
 
     /// The spawn pairing: add_entity, the health datum, the attribute
-    /// snapshot (the reference omits default-valued attributes), then
-    /// the equipment a kind carries.
+    /// snapshot, then the equipment a kind carries. The reference's
+    /// mobs pair movement speed alone (wire-verified: the zombie, and
+    /// the spider whose 16.0 max health still stays off the snapshot).
     pub fn pairing_frames(&self) -> Vec<(i32, Vec<u8>)> {
-        let mut attrs = vec![(ATTR_MOVEMENT_SPEED, self.kind.base_speed())];
-        if self.kind.max_health() != DEFAULT_MAX_HEALTH {
-            attrs.push((ATTR_MAX_HEALTH, self.kind.max_health() as f64));
-        }
+        let attrs = vec![(ATTR_MOVEMENT_SPEED, self.kind.base_speed())];
         let mut frames = vec![
             (
                 PACKET_ADD_ENTITY,
@@ -1658,6 +1727,19 @@ impl Game {
                 mob.rand = seed;
             }
         }
+        // A swing without damage the goal queued (the creeper's
+        // approach attack).
+        if std::mem::take(&mut mob.body.pending_swing) {
+            let (zx, zy, zz, zid) = (mob.body.x, mob.body.y, mob.body.z, mob.body.id);
+            self.send_within(
+                zx,
+                zy,
+                zz,
+                MOB_TRACK_RANGE,
+                PACKET_SWING_ANIMATION,
+                &encode_swing_animation(zid),
+            );
+        }
         // A melee hit the goal queued: damage_event to the target plus
         // the shared hurt_animation (the reference's order), then the
         // health bar moves (death.rs).
@@ -1676,7 +1758,17 @@ impl Game {
                     let (px, pz, pid) = (p.x, p.z, p.entity_id);
                     let yaw = facing_yaw(zx - px, zz - pz);
                     // Sent now, not queued: the death sequence a killing
-                    // blow triggers must land after these two frames.
+                    // blow triggers must land after these frames. The
+                    // swing leads the damage pair, the reference's
+                    // attack order (swingForAttack then doHurtTarget).
+                    self.send_within(
+                        zx,
+                        zy,
+                        zz,
+                        MOB_TRACK_RANGE,
+                        PACKET_SWING_ANIMATION,
+                        &encode_swing_animation(zid),
+                    );
                     self.send_within(
                         zx,
                         zy,
@@ -1697,17 +1789,17 @@ impl Game {
                 self.damage_player(conn, damage, crate::death::KillCause::Melee(killer));
             }
         }
-        // Look control: the wanted head yaw, else the body yaw, clamped
-        // within 75 degrees of the body.
-        let (want_yaw, want_pitch) = mob.body.look.unwrap_or((mob.body.yaw, 0.0));
-        mob.body.head_yaw = rotate_towards(mob.body.head_yaw, want_yaw, 30.0);
-        mob.body.pitch = rotate_towards(mob.body.pitch, want_pitch, 30.0);
-        let over = (mob.body.head_yaw - mob.body.yaw)
-            .rem_euclid(360.0)
-            .min((mob.body.yaw - mob.body.head_yaw).rem_euclid(360.0));
-        if over > 75.0 {
-            mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, over - 75.0);
-        }
+        // Look control: the head chases the wanted yaw at the goal's
+        // speed, or the body yaw at the default speed when nothing
+        // steers; the pitch resets to zero first, the reference's
+        // per-tick reset. While the navigation runs, the head is then
+        // pulled toward the body at 75/tick.
+        let (want_yaw, want_pitch, look_speed) =
+            mob.body
+                .look
+                .unwrap_or((mob.body.yaw, 0.0, LOOK_SPEED_DEFAULT));
+        mob.body.head_yaw = rotate_towards(mob.body.head_yaw, want_yaw, look_speed);
+        mob.body.pitch = rotate_towards(0.0, want_pitch, look_speed);
         // Move control: run the navigation housekeeping, face the
         // wanted waypoint, walk forward.
         let (bx, by, bz, bground) = (mob.body.x, mob.body.y, mob.body.z, mob.body.on_ground);
@@ -1726,6 +1818,9 @@ impl Game {
                 mob.body.nav.stop();
             }
         }
+        if mob.body.nav.in_progress() {
+            mob.body.head_yaw = rotate_towards(mob.body.head_yaw, mob.body.yaw, HEAD_BODY_PULL);
+        }
         let half = mob.kind.half_width();
         let height = mob.kind.height();
         let base_speed = mob.kind.base_speed();
@@ -1741,9 +1836,14 @@ impl Game {
     }
 }
 
-/// The tracker-side per-tick sync: interval-3 movement (delta packets;
-/// full sync on ground flips, out-of-range deltas, and the 400-tick
-/// resync), rotate_head on packed-byte change, and dirty entity data.
+/// The tracker-side per-tick sync, the reference's sendChanges shape:
+/// the sync block runs on the interval-3 cadence, on forced full
+/// syncs, or while entity data sits dirty. Inside, the move packet
+/// first (a full entity_position_sync on ground flips, out-of-range
+/// deltas, and the 400-tick resync; else a delta when the position
+/// moved or the 60-tick heartbeat came due, pos_rot when the packed
+/// yaw/pitch bytes changed, rot-only otherwise), then dirty entity
+/// data, then rotate_head when the packed head byte changed.
 fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
     let qx = (mob.body.x * DELTA_SCALE).round() as i64;
     let qy = (mob.body.y * DELTA_SCALE).round() as i64;
@@ -1764,6 +1864,21 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
     let (dx, dy, dz) = (qx - mob.sent.0, qy - mob.sent.1, qz - mob.sent.2);
     let delta_ok = !out_of_range(dx) && !out_of_range(dy) && !out_of_range(dz);
     let on_cadence = mob.sync_phase % SYNC_INTERVAL == 0;
+    let heartbeat = mob.sync_phase % HEARTBEAT_INTERVAL == 0;
+    let flags = if mob.body.fire_ticks > 0 { 0x01 } else { 0x00 };
+    let mob_flags = if mob.body.melee_active { 0x04 } else { 0x00 };
+    let living_flags = if mob.body.using_item { 0x01 } else { 0x00 };
+    let climb_changed = mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing;
+    let data_dirty = flags != mob.sent_flags.0
+        || mob_flags != mob.sent_flags.1
+        || living_flags != mob.sent_living
+        || mob.body.health.to_bits() != mob.sent_health
+        || mob.body.swell_dir != mob.sent_swell
+        || climb_changed;
+    if !(on_cadence || data_dirty || ground_flip || over_delay || !delta_ok) {
+        return;
+    }
+    // The move packet.
     if ground_flip || over_delay || !delta_ok {
         frames.push(OutFrame {
             x: mob.body.x,
@@ -1781,12 +1896,13 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
             ),
         });
         mob.sent = (qx, qy, qz);
-        mob.sent_rot = rot;
+        mob.sent_rot.0 = rot.0;
+        mob.sent_rot.1 = rot.1;
         mob.sent_ground = mob.body.on_ground;
-        mob.sent_health = u32::MAX; // the full sync re-pairs the data
         mob.teleport_delay = 0;
-    } else if on_cadence && (moved || rot_changed) {
-        if moved && rot_changed {
+    } else {
+        let send_position = moved || heartbeat;
+        if send_position && rot_changed {
             frames.push(OutFrame {
                 x: mob.body.x,
                 y: mob.body.y,
@@ -1802,8 +1918,9 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                     mob.body.on_ground,
                 ),
             });
-            mob.sent_rot = (rot.0, rot.1, mob.sent_rot.2);
-        } else if moved {
+            mob.sent_rot.0 = rot.0;
+            mob.sent_rot.1 = rot.1;
+        } else if send_position {
             frames.push(OutFrame {
                 x: mob.body.x,
                 y: mob.body.y,
@@ -1811,7 +1928,7 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                 id: PACKET_MOVE_ENTITY_POS,
                 body: encode_move_pos(mob.body.id, dx, dy, dz, mob.body.on_ground),
             });
-        } else {
+        } else if rot_changed {
             frames.push(OutFrame {
                 x: mob.body.x,
                 y: mob.body.y,
@@ -1819,13 +1936,80 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
                 id: PACKET_MOVE_ENTITY_ROT,
                 body: encode_move_rot(mob.body.id, rot.0, rot.1, mob.body.on_ground),
             });
-            mob.sent_rot = (rot.0, rot.1, mob.sent_rot.2);
+            mob.sent_rot.0 = rot.0;
+            mob.sent_rot.1 = rot.1;
         }
-        mob.sent = (qx, qy, qz);
+        if send_position {
+            mob.sent = (qx, qy, qz);
+        }
         mob.sent_ground = mob.body.on_ground;
     }
-    // Head rotation follows its own packed-byte change.
-    if head_changed && (on_cadence || rot_changed || moved) {
+    // Dirty entity data, after the move packet.
+    if flags != mob.sent_flags.0 {
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_byte_data(mob.body.id, DATA_ENTITY_FLAGS, flags),
+        });
+        mob.sent_flags.0 = flags;
+    }
+    if mob_flags != mob.sent_flags.1 {
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_byte_data(mob.body.id, DATA_MOB_FLAGS, mob_flags),
+        });
+        mob.sent_flags.1 = mob_flags;
+    }
+    if living_flags != mob.sent_living {
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_byte_data(mob.body.id, DATA_LIVING_FLAGS, living_flags),
+        });
+        mob.sent_living = living_flags;
+    }
+    if mob.body.health.to_bits() != mob.sent_health {
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_float_data(mob.body.id, DATA_LIVING_HEALTH, mob.body.health),
+        });
+        mob.sent_health = mob.body.health.to_bits();
+    }
+    // The creeper's swell direction rides its own accessor.
+    if mob.body.swell_dir != mob.sent_swell {
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_int_data(mob.body.id, DATA_SWELL_DIR, mob.body.swell_dir),
+        });
+        mob.sent_swell = mob.body.swell_dir;
+    }
+    // The wall-crawler's climbing bit rides its own accessor.
+    if mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing {
+        let value = if mob.body.climbing { 0x01 } else { 0x00 };
+        frames.push(OutFrame {
+            x: mob.body.x,
+            y: mob.body.y,
+            z: mob.body.z,
+            id: PACKET_SET_ENTITY_DATA,
+            body: encode_byte_data(mob.body.id, DATA_CLIMBING_FLAGS, value),
+        });
+        mob.sent_climbing = mob.body.climbing;
+    }
+    // rotate_head closes the sync block.
+    if head_changed {
         frames.push(OutFrame {
             x: mob.body.x,
             y: mob.body.y,
@@ -1834,68 +2018,6 @@ fn mob_sync(mob: &mut Mob, frames: &mut Vec<OutFrame>) {
             body: encode_rotate_head(mob.body.id, rot.2),
         });
         mob.sent_rot.2 = rot.2;
-    }
-    // Entity data: the fire bit, the aggressive bit, and health when
-    // they sit off what was last sent.
-    let flags = if mob.body.fire_ticks > 0 { 0x01 } else { 0x00 };
-    let mob_flags = if mob.body.melee_active { 0x04 } else { 0x00 };
-    if flags != mob.sent_flags.0
-        || mob_flags != mob.sent_flags.1
-        || mob.body.health.to_bits() != mob.sent_health
-    {
-        if flags != mob.sent_flags.0 {
-            frames.push(OutFrame {
-                x: mob.body.x,
-                y: mob.body.y,
-                z: mob.body.z,
-                id: PACKET_SET_ENTITY_DATA,
-                body: encode_byte_data(mob.body.id, DATA_ENTITY_FLAGS, flags),
-            });
-            mob.sent_flags.0 = flags;
-        }
-        if mob_flags != mob.sent_flags.1 {
-            frames.push(OutFrame {
-                x: mob.body.x,
-                y: mob.body.y,
-                z: mob.body.z,
-                id: PACKET_SET_ENTITY_DATA,
-                body: encode_byte_data(mob.body.id, DATA_MOB_FLAGS, mob_flags),
-            });
-            mob.sent_flags.1 = mob_flags;
-        }
-        if mob.body.health.to_bits() != mob.sent_health {
-            frames.push(OutFrame {
-                x: mob.body.x,
-                y: mob.body.y,
-                z: mob.body.z,
-                id: PACKET_SET_ENTITY_DATA,
-                body: encode_float_data(mob.body.id, DATA_LIVING_HEALTH, mob.body.health),
-            });
-            mob.sent_health = mob.body.health.to_bits();
-        }
-        // The creeper's swell direction rides its own accessor.
-        if mob.body.swell_dir != mob.sent_swell {
-            frames.push(OutFrame {
-                x: mob.body.x,
-                y: mob.body.y,
-                z: mob.body.z,
-                id: PACKET_SET_ENTITY_DATA,
-                body: encode_int_data(mob.body.id, DATA_SWELL_DIR, mob.body.swell_dir),
-            });
-            mob.sent_swell = mob.body.swell_dir;
-        }
-        // The wall-crawler's climbing bit rides its own accessor.
-        if mob.kind.can_climb() && mob.body.climbing != mob.sent_climbing {
-            let value = if mob.body.climbing { 0x01 } else { 0x00 };
-            frames.push(OutFrame {
-                x: mob.body.x,
-                y: mob.body.y,
-                z: mob.body.z,
-                id: PACKET_SET_ENTITY_DATA,
-                body: encode_byte_data(mob.body.id, DATA_CLIMBING_FLAGS, value),
-            });
-            mob.sent_climbing = mob.body.climbing;
-        }
     }
 }
 

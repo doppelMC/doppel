@@ -7,7 +7,7 @@ use crate::inventory::{item_id, ItemStack};
 use crate::living::{
     brightness, eye_at, eye_of, look_angles, visible, GlanceGoal, Goal, GoalCtx, GoalFlags,
     GoalSelector, IdleStrollGoal, MobKind, NearestPlayerTargetGoal, WatchPlayerGoal,
-    EQUIP_MAIN_HAND, FIRE_IGNITE_TICKS, PLAYER_EYE,
+    EQUIP_MAIN_HAND, FIRE_IGNITE_TICKS, LOOK_SPEED_ATTACK, PLAYER_EYE,
 };
 use crate::projectile::{mob_base_damage, shot_velocity};
 use crate::spawning::monsters_burn;
@@ -130,6 +130,7 @@ impl Goal for BowFireGoal {
     fn stop(&mut self, ctx: &mut GoalCtx) {
         ctx.body.melee_active = false;
         ctx.body.look = None;
+        ctx.body.using_item = false;
         ctx.body.nav.stop();
         self.see_time = 0;
         self.attack_time = 0;
@@ -159,10 +160,9 @@ impl Goal for BowFireGoal {
         } else {
             self.see_time - 1
         };
-        ctx.body.look = Some(look_angles(
-            eye_of(ctx.body),
-            eye_at(PLAYER_EYE, (px, py, pz)),
-        ));
+        let (look_yaw, look_pitch) =
+            look_angles(eye_of(ctx.body), eye_at(PLAYER_EYE, (px, py, pz)));
+        ctx.body.look = Some((look_yaw, look_pitch, LOOK_SPEED_ATTACK));
         // Chase into the radius or while the target stays unseen;
         // otherwise hold position and strafe.
         if d2 > ATTACK_RADIUS_SQ || self.see_time < SEE_TIME_HOLD {
@@ -204,7 +204,9 @@ impl Goal for BowFireGoal {
             ctx.body.nav.retarget(tx, tz, 1.0);
         }
         // The draw: start when the cooldown is spent and the target
-        // seen; release at full draw.
+        // seen; release at full draw. The draw drives the using-item
+        // bit on the living flags datum (the aim pose).
+        ctx.body.using_item = self.draw.is_some();
         if let Some(t) = self.draw {
             if !seen && self.see_time < UNSEEN_FLOOR {
                 self.draw = None;
