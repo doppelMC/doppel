@@ -227,6 +227,107 @@ fn login_finished_and_config_packets() {
 }
 
 #[test]
+fn animate_and_swing_animation_roundtrip() {
+    // animate: entity id varint plus the action byte (0 wake, 1 crit,
+    // 2 magic crit).
+    let mut b = Vec::new();
+    write_varint(&mut b, 94);
+    b.push(1);
+    body_ok(Phase::Play, 0x02, &b);
+    body_fails(Phase::Play, 0x02, &b[..1]);
+    let mut padded = b.clone();
+    padded.push(0);
+    body_fails(Phase::Play, 0x02, &padded);
+    let mut bad = b.clone();
+    bad[1] = 3;
+    body_fails(Phase::Play, 0x02, &bad);
+    // swing_animation: entity, hand 0, type 1 (WHACK), duration 6.
+    let mut s = Vec::new();
+    write_varint(&mut s, 94);
+    write_varint(&mut s, 0);
+    write_varint(&mut s, 1);
+    write_varint(&mut s, 6);
+    body_ok(Phase::Play, 0x7b, &s);
+    body_fails(Phase::Play, 0x7b, &s[..3]);
+    let mut bad_hand = s.clone();
+    bad_hand[1] = 2;
+    body_fails(Phase::Play, 0x7b, &bad_hand);
+    let mut padded = s.clone();
+    padded.push(0);
+    body_fails(Phase::Play, 0x7b, &padded);
+}
+
+#[test]
+fn rotate_head_and_move_rot_roundtrip() {
+    // rotate_head: entity id plus the packed head yaw byte.
+    let mut b = Vec::new();
+    write_varint(&mut b, 7);
+    b.push(0x40);
+    body_ok(Phase::Play, 0x55, &b);
+    body_fails(Phase::Play, 0x55, &b[..1]);
+    let mut padded = b.clone();
+    padded.push(0);
+    body_fails(Phase::Play, 0x55, &padded);
+    // move_entity_rot: id, on-ground bool, yaw, pitch.
+    let mut r = Vec::new();
+    write_varint(&mut r, 7);
+    r.push(1);
+    r.push(0x80);
+    r.push(0x00);
+    body_ok(Phase::Play, 0x39, &r);
+    body_fails(Phase::Play, 0x39, &r[..2]);
+    let mut padded = r.clone();
+    padded.push(0);
+    body_fails(Phase::Play, 0x39, &padded);
+}
+
+#[test]
+fn vanilla_captured_frames_strict_decode() {
+    // A spider melee swing from the live summon capture: entity 3,
+    // main hand, WHACK, 6-tick duration.
+    let swing = include_bytes!("../fixtures/strict_decode/swing-animation-vanilla.bin");
+    assert_eq!(&swing[..], &[0x03, 0x00, 0x01, 0x06]);
+    body_ok(Phase::Play, 0x7b, swing);
+    body_fails(Phase::Play, 0x7b, &swing[..3]);
+    // The spider's head rotation: entity 3, packed yaw 0xea.
+    let head = include_bytes!("../fixtures/strict_decode/rotate-head-vanilla.bin");
+    assert_eq!(&head[..], &[0x03, 0xea]);
+    body_ok(Phase::Play, 0x55, head);
+    // A rotation-only movement frame: entity 3, on ground, yaw 0x60,
+    // pitch 0.
+    let rot = include_bytes!("../fixtures/strict_decode/move-rot-vanilla.bin");
+    assert_eq!(&rot[..], &[0x03, 0x01, 0x60, 0x00]);
+    body_ok(Phase::Play, 0x39, rot);
+}
+
+#[test]
+fn vanilla_explode_frame_strict_decodes_with_values() {
+    // The creeper detonation frame from the live capture: center
+    // (98.64, -60, 98.64), radius 3.0, 321 destroyed blocks, the
+    // struck bot's own 3D knockback, then the particle/sound tail.
+    let b = include_bytes!("../fixtures/strict_decode/explode-vanilla.bin");
+    assert_eq!(b.len(), 82);
+    body_ok(Phase::Play, 0x24, b);
+    let mut c = Cursor::new(b);
+    let x = c.f64("x").unwrap();
+    let y = c.f64("y").unwrap();
+    let z = c.f64("z").unwrap();
+    assert!((x - 98.64).abs() < 0.01 && y == -60.0 && (z - 98.64).abs() < 0.01);
+    assert_eq!(c.f32("radius").unwrap(), 3.0);
+    assert_eq!(c.i32("count").unwrap(), 321);
+    assert!(c.bool("has player knockback").unwrap());
+    let kx = c.f64("knockback x").unwrap();
+    let ky = c.f64("knockback y").unwrap();
+    let kz = c.f64("knockback z").unwrap();
+    assert!((kx - 0.337).abs() < 0.01, "{kx}");
+    assert!((ky - 0.288).abs() < 0.01, "{ky}");
+    assert!((kz - 0.337).abs() < 0.01, "{kz}");
+    // Truncation anywhere past the center must fail.
+    body_fails(Phase::Play, 0x24, &b[..40]);
+    body_fails(Phase::Play, 0x24, &b[..b.len() - 1]);
+}
+
+#[test]
 fn unknown_id_and_gap_fail() {
     let f = body_fails(Phase::Play, 0x90, &[]);
     assert!(f.reason.contains("unknown id"), "{}", f.reason);
