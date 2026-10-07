@@ -451,7 +451,10 @@ Three escalation consults (keypool purpose mobs-research-1/2/3).
 Open wire TODOs until the gate observes vanilla: zombie type id 154,
 attribute registry ids (max_health 23), the packet ids 0x68/0x2b/
 0x19/0x22/0x55/0x86/0x39, and the exact update_attributes entry set
-at pairing (predicted: only max_health 20.0).
+at pairing (predicted: only max_health 20.0). (Wave 3 update: all of
+these are now wire-verified; see sections 22-25. The pairing rule
+that held: the mob snapshots carry movement_speed alone - max_health
+never rides them, even the spider's off-default 16.0.)
 
 # Wave 2 research: skeleton, creeper, spider, arrows, explosions
 
@@ -993,3 +996,309 @@ zombie, skeleton, creeper and spider modules import them.
   reference default for mob arrows); no ground pickup modeling.
 - The skeleton's freeze conversion (stray) accessor stays at its
   default; no powder snow exists.
+
+# Wave 3 research: melee swing, facing, metadata audit, blast values
+
+Facts below come from the decompiled 26.3 reference under
+`scratch/vanilla-decomp/game/net/minecraft/` plus the
+follow-and-attack capture (section 22).
+
+## 21. Serializer ids: registration order, not declaration order
+
+The static block in `network/syncher/EntityDataSerializers.java`
+registers in an order that DIFFERS from the field declaration order
+(the wave 1/2 tables above followed the declarations and are wrong
+from slot 8 on). The wire ids:
+
+| id | serializer |
+|----|-----------|
+| 0 | BYTE |
+| 1 | INT |
+| 2 | LONG |
+| 3 | FLOAT |
+| 4 | STRING |
+| 5 | COMPONENT |
+| 6 | OPTIONAL_COMPONENT |
+| 7 | ITEM_STACK |
+| 8 | BOOLEAN |
+| 9 | ROTATIONS |
+| 10 | BLOCK_POS |
+| 11 | OPTIONAL_BLOCK_POS |
+| 12 | DIRECTION |
+| 13 | OPTIONAL_LIVING_ENTITY_REFERENCE |
+| 14 | BLOCK_STATE |
+| 15 | OPTIONAL_BLOCK_STATE |
+| 16 | PARTICLE |
+| 17 | PARTICLES |
+| 18 | VILLAGER_DATA |
+| 19 | OPTIONAL_UNSIGNED_INT |
+| 20 | POSE |
+| 21..=32 | variant holders (cat, cow, wolf, frog, pig, chicken, ...) |
+| 33 | OPTIONAL_GLOBAL_POS |
+| 34 | PAINTING_VARIANT |
+| 35..=38 | sniffer, armadillo, copper golem, weathering states |
+| 39 | VECTOR3 |
+| 40 | QUATERNION |
+| 41 | RESOLVABLE_PROFILE |
+| 42 | HUMANOID_ARM |
+| 43 | DYE_COLOR |
+
+So BOOLEAN = 8 (engine `SER_BOOLEAN` was already right), BLOCK_POS
+10, ROTATIONS 9, POSE 20. Corrections to the tables in sections 2
+and 11: living effect-ambient (accessor 11), zombie baby (16) and
+drowned conversion (18), creeper powered (17) and ignited (18),
+skeleton stray conversion (16) all serialize with id 8 (BOOLEAN).
+
+## 22. The follow-and-attack capture (vanilla-only run)
+
+Scenario: flat world at spawn, bot teleported to (100.5, -60, 100.5),
+one zombie summoned 8 blocks east at (108.5, -60, 100.5), clock set
+to midnight, frozen, and the bot strafed +2z / -4z / +2z between
+80/50/50/100-tick step barriers. The capture records the attack's
+wire rhythm.
+
+Observed (first run, daylight variant - the zombie burned, which
+doubled as a damage-type probe; second run at midnight, clean):
+
+- 10 swing_animation (0x7b) frames from the zombie for 10 landed
+  hits, payload hand0/anim1/dur6 every time: main hand, WHACK,
+  6-tick duration, the bare-hand default. The swing lands 1-2 frames
+  before each hit's damage_event, every time.
+- 0 animate (0x02) frames from the zombie in the whole session; the
+  single 0x02 frame in the histogram targets the player (id 1). Mobs
+  never send animate.
+- Every mob_attack (damage type 28) hit on the bot carried a swing
+  1-2 frames earlier (same tick, swing sent before doHurtTarget's
+  damage_event). Wire-verifies damage type mob_attack = 28.
+- The zombie's burn (first run) sent entity flags datum (accessor 0,
+  BYTE) = 1 (fire bit) and fire damage events typed 31 (on_fire)
+  every 20 ticks; health datum (accessor 9, FLOAT) followed each burn
+  tick. Damage type 31 = on_fire is thereby wire-verified.
+- The mob-flags datum (accessor 15, BYTE) flipped 0 -> 4 when the
+  attack goal started (before the first hit) and back to 0 when the
+  target dropped.
+- rotate_head (0x55): 19 frames across the chase - only when the
+  packed head byte changed, riding interval-3 sync ticks. The head
+  converges on the target bearing: errors reach 90+ deg mid-turn
+  (the body drag at 75/tick while walking) and settle to 0-2 deg
+  once the zombie stands at the target. Every landed hit can arrive
+  while the head still lags; the swing does not wait for the head.
+- Movement packets while walking: 0x36 (pos) and 0x37 (pos_rot)
+  both flow, chosen per sync by whether the packed yaw byte changed;
+  0x39 (rot-only) appears when a mob turns in place (one frame in
+  the summon leg).
+- Body yaw while turning lags the movement direction by up to 180
+  deg (turn-in-then-walk); while settled it faces the approach.
+- Idle sync heartbeat: none observed inside the short window (the
+  60-tick zero-delta move fires once per second per entity; the
+  session's still stretches were under that).
+- The summon leg: the spider swung 7 times for its melee hits; the
+  skeleton and creeper never swung (the bow goal does not swing; the
+  creeper's swell preempts the approach before reach).
+
+## 23. The melee swing: swing_animation 0x7b, not animate 0x02
+
+`MeleeAttackGoal.checkAndPerformAttack` (the zombie's attack goal
+wraps it): resetAttackCooldown, `mob.swingForAttack(MAIN_HAND)`, then
+`mob.doHurtTarget`. The swing path:
+
+- `LivingEntity.swing` builds `ClientboundSwingAnimationPacket`
+  (packet `swing_animation`, id 0x7b in the registration chain) and
+  sends it via `sendToTrackingPlayers` (NOT to self; the swinging
+  entity is the mob).
+- Payload: entityId VAR_INT, hand VAR_INT (MAIN_HAND 0), SwingAnimation
+  VAR_INT (NONE 0, WHACK 1, STAB 2), duration VAR_INT. A bare hand
+  (empty item) uses SwingAnimation.DEFAULT = (WHACK, 6): hand 0,
+  type 1, duration 6.
+- `ClientboundAnimatePacket` (id 0x02 `animate`, entity varint +
+  action byte 0/1/2 wake-up/crit/magic-crit) is ONLY sent by
+  ServerPlayer (player attack crit particles). Mobs never send it.
+- Order per landed hit: swing_animation (from the attacker) arrives
+  BEFORE the target's damage_event (0x19) and hurt_animation (0x2b),
+  same tick.
+
+The swing state re-arms only after the 6-tick swing duration, and the
+attack cooldown (adjustedTickDelay(20) = 10 ticks for a mob ticking
+goals every 2nd tick) is longer, so hits swing 1:1.
+
+## 24. Facing: look control, body rotation, tracker thresholds
+
+- `MoveControl` MOVE_TO turns the ENTITY yaw (the yaw move packets
+  carry) toward the wanted position at up to 90 deg/tick.
+- `LookControl`: `setLookAt(target, 30, 30)` from the melee goal sets
+  a 2-tick cooldown; while it is > 0 the head yaw chases the wanted
+  yaw at the given speed (30/tick melee; default look speed 10,
+  pitch cap 40) and the pitch chases likewise, resetting to 0 first
+  each tick (`resetXRotOnTick`). With no look set the head chases the
+  BODY yaw at 10/tick. While the navigation is not done, the head is
+  then pulled toward the body yaw at up to 75/tick
+  (`rotateIfNecessary`, a step cap, not a window clamp).
+- `BodyRotationControl`: while the entity moves (delta^2 >
+  2.5e-7), body yaw snaps to the entity yaw and the head is pulled
+  toward the body at 75/tick; idle, the body rotates toward the head
+  at 75/tick after the head stabilizes 10 ticks (>15 deg moves reset
+  the stable timer).
+- `ServerEntity.sendChanges` runs the sync block on interval-3 ticks
+  (or forced syncs / dirty entity data): rotation counts as changed
+  when the packed degree byte differs by >= 1; the move packet is a
+  full `entity_position_sync` on precise-position need /
+  teleportDelay > 400 / riding / ground flip, else a delta packet
+  when the position changed (>= 7.63e-6 squared) or tickCount % 60
+  == 0 (a 60-tick zero-delta heartbeat for idle entities);
+  `move_entity_pos_rot` when the yaw/pitch bytes changed,
+  `move_entity_pos` otherwise, `move_entity_rot` when only rotation
+  changed. `rotate_head` follows the move packet whenever the packed
+  head byte differs by >= 1, inside the same sync block.
+
+## 25. Metadata audit: the four mobs
+
+Serializer ids per section 21 (registration order: BOOLEAN 8). Every
+"sent" moment observed in the follow-and-attack and summon captures
+or pinned by the decompile's define/set paths.
+
+### Zombie (entity type 154)
+
+| accessor | ser | default | vanilla sends it when | doppel |
+|----------|-----|---------|----------------------|--------|
+| 0 flags BYTE | 0 | 0 | bit 0x01 while burning | yes, fire bit |
+| 6 pose | 20 | STANDING | death (DYING) | no (entity_event 3 carries the visual; listed unmodeled) |
+| 8 living flags BYTE | 0 | 0 | using an item (zombies never do) | no (never set; correct) |
+| 9 health FLOAT | 3 | 1.0 | pairing (20.0) and every change | yes |
+| 15 mob flags BYTE | 0 | 0 | bit 0x04 while the attack goal runs (capture: flips 0 -> 4 before the first hit, back after) | yes |
+| 16 baby BOOLEAN | 8 | false | baby zombies | no (adults only) |
+| 17 special type INT | 1 | 0 | villager conversion | no |
+| 18 drowned conversion BOOLEAN | 8 | false | converting | no |
+
+### Creeper (32)
+
+| accessor | ser | default | vanilla sends it when | doppel |
+|----------|-----|---------|----------------------|--------|
+| 9 health FLOAT | 3 | 1.0 | pairing | yes |
+| 15 mob flags BYTE | 0 | 0 | bit 0x04 while the approach goal runs | yes |
+| 16 swell dir INT | 1 | -1 | flips +1 inside 3 blocks / -1 past 7 or unseen (capture: one flip per approach) | yes |
+| 17 powered BOOLEAN | 8 | false | lightning charge | no (no lightning) |
+| 18 ignited BOOLEAN | 8 | false | flint and steel | no (no item use on mobs) |
+
+### Skeleton (118)
+
+| accessor | ser | default | vanilla sends it when | doppel |
+|----------|-----|---------|----------------------|--------|
+| 8 living flags BYTE | 0 | 0 | bit 0x01 while drawing the bow (the aim pose) | yes |
+| 9 health FLOAT | 3 | 1.0 | pairing | yes |
+| 15 mob flags BYTE | 0 | 0 | bit 0x04 while the bow goal runs | yes |
+| 16 stray conversion BOOLEAN | 8 | false | powder snow | no |
+
+The skeleton also pairs set_equipment main hand (bow) and its
+movement_speed attribute.
+
+### Spider (127)
+
+| accessor | ser | default | vanilla sends it when | doppel |
+|----------|-----|---------|----------------------|--------|
+| 9 health FLOAT | 3 | 1.0 | pairing | yes |
+| 15 mob flags BYTE | 0 | 0 | bit 0x04 while the attack goal runs | yes |
+| 16 climbing BYTE | 0 | 0 | bit 0x01 while pressed against a wall, every tick | yes |
+
+All four mobs pair movement speed ALONE in update_attributes - the
+spider's off-default max health (16.0) stays off the snapshot too
+(wire-verified in the summon capture; the wave-2 prediction of a
+second max-health entry was wrong).
+
+### States vanilla sets that doppel never models
+
+- Zombie baby (16), special type (17), drowned conversion (18).
+- Creeper powered (17), ignited (18).
+- Skeleton stray conversion (16).
+- The pose datum (6) on death (DYING); doppel's death path sends
+  entity_event 3 and 60 only.
+- Arrow pickup/disallow and in-ground item frames ride item
+  entities, out of this audit's scope.
+
+### Player hurt-rhythm divergence (out of scope, unchanged)
+
+The reference's melee on a PLAYER target sends the damage_event
+(0x19) to the victim's trackers AND the victim
+(sendToTrackingPlayersAndSelf), while the hurt_animation (0x2b) goes
+ONLY to the victim itself (ServerPlayer.indicateDamage sends to its
+own connection; mobs' indicateDamage is empty, so a hurt MOB sends
+no hurt_animation at all). Doppel broadcasts both to every player in
+tracking range of the attacker. The victim's own view is equivalent;
+other players see one extra hurt_animation per hit. Left unchanged
+per the wave plan; knockback for players (the victim's
+set_entity_motion from markHurt's velocity sync) is likewise out of
+scope.
+
+## 26. The detonation by value (three reference captures)
+
+The summon scenario's creeper detonation, measured across three
+vanilla runs:
+
+- The packet: center (98.64, -60.00, 98.64) every run (the walk is
+  deterministic from the summon point); radius 3.0 exactly; the
+  destroyed-block count 321 / 332 / 338 - the count is the FULL ray
+  sphere including air cells (the reference adds every cell a ray
+  leaves with power, air costs no resistance and joins like any
+  other); the struck bot's own knockback (0.337..0.338, 0.288..0.294,
+  0.337..0.338) - the 3D unit vector from the CENTER to the victim's
+  EYE (the y share is real), scaled by (1 - dist) * exposure with
+  dist measured from the FEET position over the doubled radius.
+- The tail: particle 29 (explosion_emitter), sound holder varint 704,
+  two weighted block-particle entries (poof 0.5/1.0/weight 1, smoke
+  1.0/1.0/weight 1), play-sound byte 1.
+- The crater (cells that turned to air, from the section_blocks_update
+  stream): 38 / 46 / 46 cells across runs, layers -63..-61, x/z
+  96..100; the 38-cell run was a strict subset of the 46-cell run
+  (Jaccard 0.826) - the fringe is the per-ray power roll noise.
+- Gate tolerances (parity_mobs.rs): center 2.0 per axis, radius exact,
+  count 15% relative, crater Jaccard 0.6 on center-relative cells -
+  each below the observed variance with margin. The knockback is a
+  per-side physics check (the vector must equal the unit ray from
+  the side's own center to the victim's eye, scaled by
+  (1 - feet distance / doubled radius); magnitude within 0.05,
+  direction within 5 deg - the reference's own frames land within
+  0.001 and 1 deg of the formula), because the two walks stop at
+  different points inside the swell window (observed 1.8 blocks
+  apart across servers) and any cross-comparison of absolute vectors
+  would read the walk, not the blast.
+- Wire-verified damage types along the way: arrow 0 (the skeleton's
+  hit), mob_attack 28 (melee), on_fire 31 (the burn run),
+  entity-attributed explosion 35 (the blast).
+
+The engine changes this pinned: the destroyed set now counts air
+cells (the packet's count), the knockback gained its y share and the
+feet-distance basis, the sound holder moved 672 -> 704, and the
+block-particle weights both read 1.
+
+A cross-server run of the final gate: vanilla center
+(98.64, -60.00, 98.64) count 324 crater 47; doppel center
+(100.41, -60.00, 97.67) count 325 crater 44 - the counts 0.3% apart,
+both radii exactly 3.0, both damage-type histograms identical
+(arrow 0, melee 28, explosion 35), and the center-relative crater
+plus the per-side knockback physics both inside their bounds.
+
+## 27. Wire-verify burn-down (wave 3)
+
+Every `TODO wire-verify` that stood in living.rs and explosion.rs at
+the wave's start, with its source:
+
+| constant | value | source |
+|----------|-------|--------|
+| PACKET_DAMAGE_EVENT | 0x19 | capture: the per-hit frames |
+| PACKET_ENTITY_EVENT | 0x22 | capture: burn/death event frames |
+| PACKET_HURT_ANIMATION | 0x2b | capture: one per landed hit |
+| PACKET_MOVE_ENTITY_ROT | 0x39 | capture: the summon leg's rot-only frame |
+| PACKET_ROTATE_HEAD | 0x55 | capture: the head-tracking frames |
+| PACKET_SET_EQUIPMENT | 0x68 | capture: the skeleton's bow pairing |
+| PACKET_UPDATE_ATTRIBUTES | 0x86 | gate: the pairing attribute frames |
+| ENTITY_TYPE_ZOMBIE/SKELETON/CREEPER/SPIDER | 154/118/32/127 | capture: the add frames |
+| ATTR_MAX_HEALTH | 23 | decompile registry count; never on the wire (the reference's mob snapshots carry movement_speed alone) |
+| ATTR_MOVEMENT_SPEED | 26 | prior gate + capture |
+| DAMAGE_TYPE_MOB_ATTACK | 28 | capture: melee hits typed 28 |
+| DAMAGE_TYPE_EXPLOSION | 35 | capture: the blast hit typed 35 |
+| explode packet id | 0x24 | capture: the detonation frame |
+| swing_animation | 0x7b | capture: 10 frames per 10 hits |
+
+Also verified, outside this wave's file set (noted for the next
+wave): the arrow damage type id 0 (the skeleton's landed arrow read
+type 0 in the summon capture; projectile.rs's marker can flip with
+this citation). Nothing remains unconfirmable.
