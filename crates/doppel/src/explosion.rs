@@ -13,7 +13,8 @@ use doppel_protocol::write_varint;
 /// by the same registration-chain count.
 pub const PACKET_EXPLODE: i32 = 0x24;
 /// The entity-attributed explosion damage type (alphabetical registry).
-/// TODO wire-verify at the gate.
+/// Verified: the detonation capture's blast damage frame arrives typed
+/// 35.
 pub const DAMAGE_TYPE_EXPLOSION: i32 = 35;
 /// The ray grid edge: 16 cells per axis, the surface casts.
 const GRID: i32 = 16;
@@ -34,10 +35,13 @@ const BROADCAST: f64 = 64.0;
 /// The large-explosion particle type id (registration order).
 const PARTICLE_EXPLOSION_EMITTER: i32 = 29;
 /// The block-particle list entries: (particle id, scaling, speed,
-/// weight).
-const BLOCK_PARTICLES: [(i32, f32, f32, i32); 2] = [(69, 0.5, 1.0, 0), (72, 1.0, 1.0, 1)];
-/// The explosion sound's registry id + 1 (reference-holder encoding).
-const SOUND_EXPLODE: i32 = 672;
+/// weight). Verified: the detonation capture carries poof and smoke
+/// both at weight 1.
+const BLOCK_PARTICLES: [(i32, f32, f32, i32); 2] = [(69, 0.5, 1.0, 1), (72, 1.0, 1.0, 1)];
+/// The explosion sound's holder varint (registry id 703 plus the
+/// reference-holder offset). Verified: the detonation capture's sound
+/// varint decodes 704.
+const SOUND_EXPLODE: i32 = 704;
 /// The ray power roll bounds.
 const POWER_LO: f64 = 0.7;
 const POWER_SPAN: f64 = 0.6;
@@ -193,8 +197,11 @@ impl Game {
     /// damage and knockback, the blocks become air, and the packet
     /// reaches every player within 64 blocks.
     pub(crate) fn explode_at(&mut self, x: f64, y: f64, z: f64, radius: f64, source_id: i32) {
-        // 1. The ray grid.
+        // 1. The ray grid. Every cell a ray leaves with power joins the
+        // destroyed set, air included (the reference's count reports the
+        // full sphere; only the solid cells produce block updates).
         let mut destroyed: std::collections::BTreeSet<(i32, i32, i32)> = Default::default();
+        let mut solid_cells: Vec<(i32, i32, i32)> = Vec::new();
         for (dx, dy, dz) in ray_directions() {
             let roll = (self.mobs.next() % 1000) as f64 / 1000.0;
             let mut power = radius * (POWER_LO + roll * POWER_SPAN);
@@ -210,8 +217,11 @@ impl Game {
                     .is_some_and(|(name, _)| name != "minecraft:air");
                 if solid {
                     power -= (RESISTANCE + RESIST_ADD) * RESIST_SCALE;
-                    if power > 0.0 {
-                        destroyed.insert(cell);
+                }
+                if power > 0.0 {
+                    destroyed.insert(cell);
+                    if solid {
+                        solid_cells.push(cell);
                     }
                 }
                 px += dx * STEP;
@@ -229,8 +239,11 @@ impl Game {
             if !crate::death::player_alive(p) {
                 continue;
             }
+            // The distance reads the feet position; the knockback
+            // direction reads the eye, both per the reference's
+            // explosion loop.
             let (dist, exposure) = {
-                let (ddx, ddy, ddz) = (p.x - x, p.y + 0.9 - y, p.z - z);
+                let (ddx, ddy, ddz) = (p.x - x, p.y - y, p.z - z);
                 let dist = (ddx * ddx + ddy * ddy + ddz * ddz).sqrt() / double_radius;
                 let ex = exposure(
                     self,
@@ -245,14 +258,14 @@ impl Game {
             }
             let p_pow = (1.0 - dist) * exposure;
             let damage = ((p_pow * p_pow + p_pow) / 2.0 * DAMAGE_GAIN * double_radius + 1.0) as f32;
-            let (ddx, ddz) = (p.x - x, p.z - z);
-            let dl = (ddx * ddx + ddz * ddz).sqrt().max(1.0e-4);
+            let (edx, edy, edz) = (p.x - x, p.y + crate::living::PLAYER_EYE - y, p.z - z);
+            let el = (edx * edx + edy * edy + edz * edz).sqrt().max(1.0e-4);
             let knock = (1.0 - dist) * exposure;
             struck.push(Struck {
                 conn,
                 player_id: p.entity_id,
                 damage,
-                knock: (ddx / dl * knock, 0.0, ddz / dl * knock),
+                knock: (edx / el * knock, edy / el * knock, edz / el * knock),
             });
         }
         for hit in &struck {
@@ -287,7 +300,8 @@ impl Game {
                 crate::death::KillCause::Explosion(killer),
             );
         }
-        // Mobs take the same shape (the source is excluded).
+        // Mobs take the same shape (the source is excluded): feet
+        // distance, eye direction.
         let mob_hits: Vec<(usize, f32, (f64, f64, f64))> = self
             .mobs
             .mobs
@@ -295,7 +309,7 @@ impl Game {
             .enumerate()
             .filter(|(_, m)| m.body.id != source_id)
             .filter_map(|(i, m)| {
-                let (ddx, ddy, ddz) = (m.body.x - x, m.body.y + m.body.eye - y, m.body.z - z);
+                let (ddx, ddy, ddz) = (m.body.x - x, m.body.y - y, m.body.z - z);
                 let dist = (ddx * ddx + ddy * ddy + ddz * ddz).sqrt() / double_radius;
                 if dist > 1.0 {
                     return None;
@@ -309,10 +323,14 @@ impl Game {
                 let p_pow = (1.0 - dist) * ex;
                 let damage =
                     ((p_pow * p_pow + p_pow) / 2.0 * DAMAGE_GAIN * double_radius + 1.0) as f32;
-                let (hx, hz) = (m.body.x - x, m.body.z - z);
-                let hl = (hx * hx + hz * hz).sqrt().max(1.0e-4);
+                let (hx, hy, hz) = (m.body.x - x, m.body.y + m.body.eye - y, m.body.z - z);
+                let hl = (hx * hx + hy * hy + hz * hz).sqrt().max(1.0e-4);
                 let knock = (1.0 - dist) * ex;
-                Some((i, damage, (hx / hl * knock, 0.0, hz / hl * knock)))
+                Some((
+                    i,
+                    damage,
+                    (hx / hl * knock, hy / hl * knock, hz / hl * knock),
+                ))
             })
             .collect();
         for (i, damage, knock) in mob_hits {
@@ -322,8 +340,8 @@ impl Game {
             m.body.vx += kx;
             m.body.vz += kz;
         }
-        // 3. The blocks become air through the update path.
-        for (bx, by, bz) in &destroyed {
+        // 3. The solid blocks become air through the update path.
+        for (bx, by, bz) in &solid_cells {
             self.set_block(*bx, *by, *bz, 0, true);
         }
         // 4. The packet, per player, with the struck player's own
