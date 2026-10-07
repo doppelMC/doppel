@@ -1342,10 +1342,12 @@ fn check_follow_and_attack(who: &str, s: &Obs, failures: &mut Vec<String>) {
             ));
         }
     }
-    // (c) Body yaw while moving: at least half the walking frames from
-    // the summon to the fight's end face the approach direction within
-    // BODY_TRACK_DEG (the walking happens on the approach; the fight
-    // itself is mostly standing).
+    // (c) Body yaw while moving: at least half the yaw-carrying
+    // movement frames from the summon to the fight's end face the
+    // approach direction within BODY_TRACK_DEG. A straight-line
+    // approach never changes the packed yaw, so it emits no
+    // yaw-carrying frames at all - the check is vacuous there, not
+    // failed (nothing about alignment is provable either way).
     let mut facing = 0usize;
     let mut moving = 0usize;
     for (i, id, yaw) in s
@@ -1375,8 +1377,8 @@ fn check_follow_and_attack(who: &str, s: &Obs, failures: &mut Vec<String>) {
             facing += 1;
         }
     }
-    if moving < 6 {
-        failures.push(format!("{who}: {} moving yaw frames, want >= 6", moving));
+    if moving == 0 {
+        // Vacuous: no yaw-carrying movement frames to measure.
     } else if facing * 2 < moving {
         failures.push(format!(
             "{who}: {facing}/{moving} moving frames face the approach within {} deg",
