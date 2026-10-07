@@ -1684,6 +1684,7 @@ fn decode_entity_frame(id: i32, c: &mut Cursor) -> DResult<()> {
         }
         0x39 => {
             c.varint("entity id")?;
+            c.bool("on ground")?;
             c.u8("entity y rot")?;
             c.u8("entity x rot")?;
             Ok(())

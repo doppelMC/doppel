@@ -22,7 +22,8 @@ pub const PACKET_DAMAGE_EVENT: i32 = 0x19;
 pub const PACKET_ENTITY_EVENT: i32 = 0x22;
 /// `hurt_animation`: registration order 44. TODO wire-verify at the gate.
 pub const PACKET_HURT_ANIMATION: i32 = 0x2b;
-/// `move_entity_rot`: registration order 58. TODO wire-verify at the gate.
+/// `move_entity_rot`: registration order 58. Body: id, on-ground bool,
+/// packed yaw, packed pitch (the reference's Rot codec order).
 pub const PACKET_MOVE_ENTITY_ROT: i32 = 0x39;
 /// `rotate_head`: registration order 86. TODO wire-verify at the gate.
 pub const PACKET_ROTATE_HEAD: i32 = 0x55;
@@ -239,11 +240,11 @@ pub fn encode_move_pos_rot(
     body
 }
 
-/// `move_entity_rot`: id, packed yaw, packed pitch. No on-ground byte.
+/// `move_entity_rot`: id, on-ground bool, packed yaw, packed pitch.
 pub fn encode_move_rot(entity_id: i32, yaw: u8, pitch: u8, on_ground: bool) -> Vec<u8> {
-    let _ = on_ground;
     let mut body = Vec::with_capacity(6);
     write_varint(&mut body, entity_id);
+    body.push(u8::from(on_ground));
     body.push(yaw);
     body.push(pitch);
     body
@@ -1911,6 +1912,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
+
+    #[test]
+    fn move_rot_carries_the_reference_shape() {
+        let body = encode_move_rot(2, 0x00, 0x0f, true);
+        assert_eq!(body, vec![0x02, 0x01, 0x00, 0x0f]);
+        let airborne = encode_move_rot(2, 0x00, 0x0f, false);
+        assert_eq!(airborne, vec![0x02, 0x00, 0x00, 0x0f]);
+    }
 
     /// A bare game: no chunks, no players (selector tests need none).
     fn bare_game() -> Game {
